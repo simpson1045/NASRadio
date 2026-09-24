@@ -1,0 +1,30 @@
+# Every push and pull request: the app analyzes and its widget tests pass, the
+# backend byte-compiles. Cheap enough to run on everything.
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with: { channel: stable, cache: true }
+      - run: flutter pub get
+        working-directory: frontend
+      - run: flutter analyze --no-fatal-infos --no-fatal-warnings
+        working-directory: frontend
+      - run: flutter test
+        working-directory: frontend
+
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m compileall -q backend/app backend/run.py backend/manage_users.py

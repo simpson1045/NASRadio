@@ -58,6 +58,13 @@ exercised outside that one install, and please report them.
 Prowlarr, Transmission, Lidarr, Spotify and the other integrations are optional
 and are configured from inside the app.
 
+## Download
+
+Prebuilt apps are on the [Releases page](https://github.com/simpson1045/NASRadio/releases):
+`nasradio-android.apk` for phones and Android TV, `nasradio-windows.zip` for
+Windows (unzip, run `nasradio.exe`), and `nasradio-server-<version>.zip` with
+the Docker files for the server. The bundle zip has all three.
+
 ## Quick start (Docker)
 
 ```bash

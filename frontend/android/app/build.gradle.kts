@@ -31,11 +31,31 @@ android {
         versionName = flutter.versionName
     }
 
+    // Release signing: android/key.properties (gitignored) names a keystore
+    // and its passwords; CI writes it from secrets. Without it, release builds
+    // are signed with the debug key: they install, but Android refuses to
+    // update an install that was signed with a different key.
+    val keyProps = java.util.Properties().apply {
+        val f = rootProject.file("key.properties")
+        if (f.exists()) f.inputStream().use { load(it) }
+    }
+    val hasReleaseKey = keyProps.getProperty("storeFile") != null
+
+    signingConfigs {
+        if (hasReleaseKey) {
+            create("release") {
+                storeFile = file(keyProps.getProperty("storeFile"))
+                storePassword = keyProps.getProperty("storePassword")
+                keyAlias = keyProps.getProperty("keyAlias")
+                keyPassword = keyProps.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Create a release keystore for production distribution
-            // For now, using debug keys since this is personal-use only
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (hasReleaseKey) signingConfigs.getByName("release")
+                            else signingConfigs.getByName("debug")
         }
     }
 }

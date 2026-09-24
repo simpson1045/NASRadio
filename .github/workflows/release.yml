@@ -1,0 +1,120 @@
+# Build the app for Android and Windows and attach everything to a GitHub
+# Release whenever a version tag is pushed (v1.4.16), or on demand.
+#
+# Artifacts (names match what the in-app updater expects):
+#   nasradio-android.apk        Android app
+#   nasradio-windows.zip        Windows desktop app (unzip and run nasradio.exe)
+#   version.json                version, build number, date, sizes
+#   nasradio-server-<ver>.zip   docker-compose.yml + .env.example + README (the server, Docker edition)
+#   nasradio-bundle-<ver>.zip   all of the above in one download
+#
+# Android signing: with the four ANDROID_* secrets set, the APK is signed with
+# your release key (required for in-place updates); without them it falls back
+# to the debug key, which installs fine but cannot update an existing install.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          line=$(grep -E '^version:' frontend/pubspec.yaml | awk '{print $2}')
+          echo "version=${line%%+*}" >> "$GITHUB_OUTPUT"
+          echo "build=${line##*+}" >> "$GITHUB_OUTPUT"
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: subosito/flutter-action@v2
+        with: { channel: stable, cache: true }
+      - name: Release keystore (optional)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        working-directory: frontend/android
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > app/release.keystore
+          cat > key.properties <<EOT
+          storeFile=release.keystore
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOT
+      - run: flutter pub get
+        working-directory: frontend
+      - run: flutter build apk --release
+        working-directory: frontend
+      - run: cp frontend/build/app/outputs/flutter-apk/app-release.apk nasradio-android.apk
+      - uses: actions/upload-artifact@v4
+        with: { name: android, path: nasradio-android.apk }
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with: { channel: stable, cache: true }
+      - run: flutter pub get
+        working-directory: frontend
+      - run: flutter build windows --release
+        working-directory: frontend
+      - run: Compress-Archive -Path frontend\build\windows\x64\runner\Release\* -DestinationPath nasradio-windows.zip
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: nasradio-windows.zip }
+
+  release:
+    needs: [version, android, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: version.json + server + bundle zips
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          BUILD: ${{ needs.version.outputs.build }}
+        run: |
+          cd dist
+          python3 - <<'PY'
+          import json, os, datetime
+          j = {"version": os.environ["VERSION"], "build_number": int(os.environ["BUILD"]),
+               "released_at": datetime.date.today().isoformat(),
+               "android_size": os.path.getsize("nasradio-android.apk"),
+               "windows_size": os.path.getsize("nasradio-windows.zip")}
+          json.dump(j, open("version.json", "w"), indent=2)
+          print(j)
+          PY
+          mkdir server && cp ../docker-compose.yml ../.env.example ../README.md server/
+          (cd server && zip -qr "../nasradio-server-$VERSION.zip" .)
+          zip -q "nasradio-bundle-$VERSION.zip" nasradio-android.apk nasradio-windows.zip version.json "nasradio-server-$VERSION.zip"
+          ls -la
+      - name: Changelog excerpt for the release notes
+        run: |
+          awk 'BEGIN{n=0} /^## /{n++} n==1' CHANGELOG.md > notes.md || true
+          [ -s notes.md ] || echo "See CHANGELOG.md" > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.version.outputs.version) }}
+          name: NASRadio ${{ needs.version.outputs.version }}
+          body_path: notes.md
+          files: |
+            dist/nasradio-android.apk
+            dist/nasradio-windows.zip
+            dist/version.json
+            dist/nasradio-server-*.zip
+            dist/nasradio-bundle-*.zip
