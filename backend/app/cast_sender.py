@@ -220,7 +220,23 @@ class HeadlessCastSession:
         # What we're playing and where in it — persisted by _save_state so
         # "resume" works after a stop, a dropped session or a backend restart.
         self.label = None            # "simpson1045's Mix", "5150 — Van Halen", ...
-        self.kind = None             # album | playlist | song | station
+        self.kind = None             # album | playlist | song | station | party
+        # Where the queue came from and whether it was shuffled, so status
+        # can answer "is this shuffled?" and hand back the source's order.
+        self.source = None           # {"type": "album"|"playlist"|"party", "id", "name"}
+        self.shuffled = False
+        # Wedge detection (see _wedged / _heal): when the receiver went IDLE
+        # and why, plus the recent self-heal attempts.
+        self.idle_since = None
+        self.idle_reason = None
+        self.last_active_state = None  # last non-IDLE playerState (PLAYING/PAUSED/...)
+        self._our_session_id = None    # receiver sessionId of the app WE launched
+        self.app_running = None        # is our receiver app in the latest RECEIVER_STATUS?
+        self.taken_over = False        # a different sender launched a new session
+        self._receiver_status_at = 0.0
+        self._heal_times = []
+        self._healing = False
+        self._heal_gave_up = False
         self.station_query = None
         self.position = 0.0          # media currentTime at position_at
         self.position_at = time.time()
@@ -280,6 +296,7 @@ class HeadlessCastSession:
                 eventlet.sleep(0.2)
             if not self.transport_id:
                 return False
+            self._our_session_id = self.session_id
         # Open the virtual connection to the app itself.
         self._send(NS_CONNECTION, {"type": "CONNECT"})
         if self.joined:
@@ -321,10 +338,13 @@ class HeadlessCastSession:
                 # playhead is (answer lands in _on_frame) and write the
                 # state file, so a crash loses at most ten seconds.
                 if (self._hb_ticks % 2 == 0 and not self.joined
-                        and self.media_session_id is not None):
+                        and (self.media_session_id is not None or self.queue)):
                     self._send(NS_MEDIA, {"type": "GET_STATUS",
                                           "requestId": self._next_req()})
                     _save_state(self)
+                if not self._healing and _wedged(self):
+                    self._healing = True
+                    eventlet.spawn_n(_heal, self)
             except Exception:
                 break
             eventlet.sleep(5)
@@ -372,17 +392,36 @@ class HeadlessCastSession:
                 pass
         elif ns == NS_RECEIVER and t == "RECEIVER_STATUS":
             self._receiver_status_seen = True
+            self._receiver_status_at = time.time()
             apps = (payload.get("status") or {}).get("applications") or []
-            for a in apps:
-                if a.get("appId") == config.CAST_RECEIVER_APP_ID:
-                    self.transport_id = a.get("transportId")
-                    self.session_id = a.get("sessionId")
+            ours = [a for a in apps if a.get("appId") == config.CAST_RECEIVER_APP_ID]
+            self.app_running = bool(ours)
+            for a in ours:
+                self.transport_id = a.get("transportId")
+                self.session_id = a.get("sessionId")
+            if (self._our_session_id and self.session_id
+                    and self.session_id != self._our_session_id):
+                self.taken_over = True
         elif ns == NS_MEDIA and t == "MEDIA_STATUS":
             statuses = payload.get("status") or []
+            if not statuses and not self.joined and self.queue:
+                # No media session at all on a queue we own: the receiver
+                # dropped the media (the 2026-09-23 wedge looked like this).
+                self.media_session_id = None
+                self.player_state = "IDLE"
             if statuses:
                 st = statuses[0]
                 self.media_session_id = st.get("mediaSessionId")
                 self.player_state = st.get("playerState") or self.player_state
+                self.idle_reason = st.get("idleReason") if self.player_state == "IDLE" else None
+            if self.player_state == "IDLE":
+                self.idle_since = self.idle_since or time.time()
+            else:
+                self.idle_since = None
+                if self.player_state not in ("UNKNOWN", None):
+                    self.last_active_state = self.player_state
+            if statuses:
+                st = statuses[0]
                 if isinstance(st.get("currentTime"), (int, float)):
                     self.position = float(st["currentTime"])
                     self.position_at = time.time()
@@ -579,6 +618,7 @@ def _save_state(s, stopped=False):
                      "current_song_id": s.current_song_id,
                      "position": round(max(0.0, s.position_now()), 1)}
         state.update({"host": s.host, "label": s.label,
+                      "source": s.source, "shuffled": bool(s.shuffled),
                       "player_state": s.player_state,
                       "stopped": bool(stopped), "updated_at": time.time()})
         tmp = CAST_STATE_PATH + ".tmp"
@@ -649,6 +689,7 @@ def _restore_cast(host, wake=True):
     session = _get_session(host, wake=wake)
     session.queue = songs
     session.kind, session.label = st.get("kind"), st.get("label")
+    session.source, session.shuffled = st.get("source"), bool(st.get("shuffled"))
     session._station_poll_gen += 1
     song = _load_queue_index(session, idx, current_time=pos)
     session.position, session.position_at = pos, time.time()
@@ -707,7 +748,11 @@ def _get_session(host, wake=True):
     first — its owner is about to lose the TV anyway."""
     s = _sessions.get(host)
     if s and s.alive and s.transport_id and not s.joined:
-        return s
+        if not _looks_frozen(s):
+            return s
+        print(f"📺 [cast-sender] session on {host} has sat IDLE with no media "
+              f"for {int(time.time() - s.idle_since)}s — relaunching the receiver")
+        _kill_receiver_app(s)
     if s is not None:
         try:
             s.close()
@@ -770,7 +815,9 @@ def _reclaim_if_ours(s):
         return False
     s.queue = songs
     s.kind, s.label = st.get("kind"), st.get("label")
+    s.source, s.shuffled = st.get("source"), bool(st.get("shuffled"))
     s.joined = False
+    s._our_session_id = s.session_id
     print(f"📺 [cast-sender] reclaimed our cast on {s.host}: "
           f"{s.label or 'queue'}, {len(songs)} tracks, on song {s.current_song_id}")
     eventlet.spawn_n(s._refill_up_next)
@@ -800,6 +847,119 @@ def _reattach_loop(host, dead, tries=30, every=20):
             # A receiver is up but it isn't playing our queue (the phone took
             # over, or it went idle). Nothing to reclaim; leave it alone.
             return
+
+
+# ── Self-heal for a frozen receiver ────────────────────────────────────
+# 2026-09-23: the receiver stayed connected but sat IDLE at 0:00, fetched no
+# streams, and "resume" only moved the pointer; a backend restart + fresh
+# play fixed it. Now the sender notices and fixes it itself:
+#   1st attempt  reload the current track at the saved position
+#   2nd attempt  STOP the receiver app on the TV (kills the frozen instance),
+#                relaunch it and restore the queue at the same song/second
+#   then         give up for HEAL_WINDOW_SEC and log it - never loops.
+IDLE_HEAL_AFTER_SEC = 45
+FROZEN_FOR_PLAY_SEC = 20
+HEAL_WINDOW_SEC = 600
+HEAL_MAX_IN_WINDOW = 2
+
+
+def _legitimately_idle(s):
+    """IDLE that is not a fault: user stop or pause, a station, the end of the
+    queue, the TV switched away from the cast app, or another sender took over."""
+    if s.joined or not s.queue or s.kind == "station":
+        return True
+    if s.taken_over or s.app_running is False:
+        return True
+    if s.last_active_state == "PAUSED":
+        return True
+    ids = [q["id"] for q in s.queue]
+    if s.idle_reason == "FINISHED" and ids and s.current_song_id == ids[-1]:
+        return True
+    st = _load_state()
+    return bool(st and st.get("stopped"))
+
+
+def _wedged(s):
+    return (s.player_state == "IDLE" and s.idle_since is not None
+            and time.time() - s.idle_since >= IDLE_HEAL_AFTER_SEC
+            and not _legitimately_idle(s))
+
+
+def _looks_frozen(s):
+    """For play: an owned session idle for a while is not worth reusing."""
+    return (s.player_state == "IDLE" and s.idle_since is not None
+            and time.time() - s.idle_since >= FROZEN_FOR_PLAY_SEC)
+
+
+def _kill_receiver_app(s):
+    """Stop the NASRadio receiver app on the TV so the next LAUNCH starts a
+    fresh instance instead of re-attaching to a frozen one."""
+    try:
+        s.stop_media()
+    except Exception:
+        pass
+    try:
+        s.stop_receiver()
+    except Exception:
+        pass
+    eventlet.sleep(2)
+
+
+def _heal(s):
+    try:
+        # Fresh look at what the TV is running before touching anything: if
+        # the user switched inputs / opened another app, or another sender
+        # launched over us, this is not ours to fix.
+        asked = time.time()
+        s._send(NS_RECEIVER, {"type": "GET_STATUS", "requestId": s._next_req()},
+                dest="receiver-0")
+        deadline = asked + 4
+        while time.time() < deadline and s._receiver_status_at < asked and s.alive:
+            eventlet.sleep(0.2)
+        if s._receiver_status_at < asked or _legitimately_idle(s) or not _wedged(s):
+            if s._receiver_status_at < asked:
+                print(f"📺 [cast-sender] self-heal skipped on {s.host}: TV did not answer a status check")
+            return
+        now = time.time()
+        s._heal_times = [t for t in s._heal_times if now - t < HEAL_WINDOW_SEC]
+        if len(s._heal_times) >= HEAL_MAX_IN_WINDOW:
+            if not s._heal_gave_up:
+                s._heal_gave_up = True
+                print(f"📺 [cast-sender] self-heal: {len(s._heal_times)} attempts in "
+                      f"{HEAL_WINDOW_SEC // 60} min on {s.host} and still IDLE - giving up")
+            return
+        s._heal_times.append(now)
+        attempt = len(s._heal_times)
+        ids = [q["id"] for q in s.queue]
+        idx = ids.index(s.current_song_id) if s.current_song_id in ids else 0
+        pos = max(0.0, s.position_now() - 2.0)
+        idle_for = int(now - (s.idle_since or now))
+        if attempt == 1:
+            print(f"📺 [cast-sender] self-heal 1/2: IDLE for {idle_for}s mid-queue on "
+                  f"{s.host} - reloading track {idx + 1} of {len(ids)} at {int(pos)}s")
+            s.idle_since = None
+            _load_queue_index(s, idx, current_time=pos)
+            s.position, s.position_at = pos, time.time()
+            _save_state(s)
+        else:
+            print(f"📺 [cast-sender] self-heal 2/2: still IDLE on {s.host} - stopping the "
+                  f"receiver app and relaunching at track {idx + 1}, {int(pos)}s")
+            s.position, s.position_at = pos, time.time()
+            _save_state(s)
+            _kill_receiver_app(s)
+            host = s.host
+            s.close()
+            if _sessions.get(host) is s:
+                _sessions.pop(host, None)
+            out = _restore_cast(host, wake=False)
+            fresh = _sessions.get(host)
+            if fresh is not None:
+                fresh._heal_times = list(s._heal_times)
+            print(f"📺 [cast-sender] self-heal: relaunched - {out.get('now_playing')}")
+    except Exception as e:
+        print(f"📺 [cast-sender] self-heal failed on {s.host}: {e}")
+    finally:
+        s._healing = False
 
 
 # ── Wake choreography ──────────────────────────────────────────────────
@@ -1089,6 +1249,9 @@ def resolve_query(q, kind="auto"):
                 if songs:
                     return {"kind": "album",
                             "label": f"{album['title']} — {album['artist_name']}",
+                            "source": {"type": "album", "id": album["id"],
+                                       "name": album["title"],
+                                       "artist": album["artist_name"]},
                             "songs": songs}
 
         if kind in ("auto", "playlist"):
@@ -1111,6 +1274,8 @@ def resolve_query(q, kind="auto"):
                 if songs:
                     return {"kind": "playlist",
                             "label": pl["name"],
+                            "source": {"type": "playlist", "id": pl["id"],
+                                       "name": pl["name"]},
                             "songs": songs}
 
         if kind in ("auto", "song"):
@@ -1138,6 +1303,10 @@ def resolve_query(q, kind="auto"):
                 start = ids.index(hit["id"]) if hit["id"] in ids else 0
                 return {"kind": "song",
                         "label": f"{hit['title']} — {hit['artist_name']}",
+                        "source": {"type": "album", "id": hit["album_id"],
+                                   "name": hit.get("album_title"),
+                                   "artist": hit["artist_name"],
+                                   "start_song_id": hit["id"]},
                         "songs": album_songs[start:]}
 
         if kind in ("auto", "station"):
@@ -1179,9 +1348,11 @@ def _party_shuffle_songs(limit=25):
 
 # ── Cast operations ────────────────────────────────────────────────────
 
-def _cast_songs(session, songs, label=None, kind=None):
+def _cast_songs(session, songs, label=None, kind=None, source=None, shuffled=False):
     session.queue = list(songs)
     session.label, session.kind, session.station_query = label, kind, None
+    session.source, session.shuffled = source, bool(shuffled)
+    session._heal_times, session._heal_gave_up = [], False
     session._station_poll_gen += 1  # songs playing → any station poll dies
     song = _load_queue_index(session, 0)
     _save_state(session)
@@ -1311,6 +1482,7 @@ def cast_play():
     if resolved["kind"] == "station":
         session.kind, session.label, session.station_query = "station", resolved["label"], q
         session.queue = []
+        session.source, session.shuffled = None, False
         _cast_station(session, resolved["station"])
         _save_state(session)
         print(f"📺 [cast-sender] Casting station {resolved['label']} → {host}")
@@ -1318,7 +1490,9 @@ def cast_play():
                         "kind": "station", "device": host})
 
     first = _cast_songs(session, resolved["songs"],
-                        label=resolved["label"], kind=resolved["kind"])
+                        label=resolved["label"], kind=resolved["kind"],
+                        source=resolved.get("source"),
+                        shuffled=bool(data.get("shuffle")))
     print(f"📺 [cast-sender] Casting {resolved['label']} "
           f"({len(resolved['songs'])} tracks) → {host}")
     return jsonify({
@@ -1335,7 +1509,7 @@ def cast_party():
     wake = data.get("wake", True)
 
     # Party session (same SQL as party.py's start — one active per host user).
-    from app.party import _ensure_tables, PARTY_BASE_URL, _new_code
+    from app.party import _ensure_tables, _base_url as _party_base_url, _new_code
     _ensure_tables()
     db = _get_db()
     conn = db.get_connection()
@@ -1360,15 +1534,16 @@ def cast_party():
 
     songs = _party_shuffle_songs()
     if songs:
-        _cast_songs(session, songs)
+        _cast_songs(session, songs, label="Party mode", kind="party",
+                    source={"type": "party"}, shuffled=True)
     session.send_custom({
         "type": "PARTY_MODE", "active": True,
-        "qrUrl": f"{PARTY_BASE_URL}/api/party/qr/{code}.png",
+        "qrUrl": f"{_party_base_url()}/api/party/qr/{code}.png",
         "code": code,
     })
     print(f"🎉 [cast-sender] PARTY TIME on {host} — code {code}")
     return jsonify({"ok": True, "party_code": code,
-                    "join_url": f"{PARTY_BASE_URL}/party/{code}",
+                    "join_url": f"{_party_base_url()}/party/{code}",
                     "opening_track": songs[0]["title"] if songs else None,
                     "device": host})
 
@@ -1710,6 +1885,8 @@ def cast_status():
                             for u in (st.get("upNext") or [])[:5]],
                 "queue_length": None,
                 "queue_position": None,
+                "shuffled": None,   # the phone owns this queue; unknown here
+                "source": None,
                 "owner": "receiver" if st.get("headless") else "phone",
                 "uptime_sec": int(time.time() - s.started_at),
                 "last_error": s.last_error,
@@ -1735,7 +1912,77 @@ def cast_status():
             "up_next": up_next,
             "queue_length": len(ids),
             "queue_position": qpos,
+            "label": s.label,
+            "kind": s.kind,
+            "shuffled": bool(s.shuffled),
+            "source": s.source,
+            "idle_for_sec": int(time.time() - s.idle_since) if s.idle_since else None,
+            "self_heals_recent": len([x for x in s._heal_times
+                                      if time.time() - x < HEAL_WINDOW_SEC]),
             "uptime_sec": int(time.time() - s.started_at),
             "last_error": s.last_error,
         }
+    return jsonify(out)
+
+
+def _source_tracks(source):
+    """The source album/playlist in its OWN order (not the cast's order)."""
+    if not source or source.get("type") not in ("album", "playlist"):
+        return None
+    db = _get_db()
+    conn = db.get_connection()
+    try:
+        cur = db.get_cursor(conn)
+        if source["type"] == "album":
+            cur.execute(
+                """SELECT s.id, s.title, ar.name AS artist_name FROM songs s
+                   JOIN artists ar ON ar.id = s.artist_id
+                   WHERE s.album_id = %s AND s.source_type = 'local'
+                   ORDER BY s.disc_number NULLS FIRST, s.track_number, s.id""",
+                (source["id"],))
+        else:
+            cur.execute(
+                """SELECT s.id, s.title, ar.name AS artist_name FROM playlist_songs ps
+                   JOIN songs s ON s.id = ps.song_id
+                   JOIN artists ar ON ar.id = s.artist_id
+                   WHERE ps.playlist_id = %s AND s.source_type = 'local'
+                   ORDER BY ps.position""", (source["id"],))
+        return [{"position": i + 1, "song_id": r["id"], "title": r["title"],
+                 "artist": r["artist_name"]} for i, r in enumerate(cur.fetchall())]
+    finally:
+        conn.close()
+
+
+@cast_api.route("/api/cast/queue", methods=["GET"])
+def cast_queue_list():
+    """The whole cast queue in play order, plus the source album/playlist in
+    its own order, so a caller can see at a glance whether it is shuffled
+    and what comes when. ?source=0 skips the source list."""
+    host = _resolve_host(request.args.get("device"))
+    s = _sessions.get(host)
+    if not s or not s.alive:
+        s = _guest_session(host)
+    if not s or not s.alive:
+        return jsonify({"error": "no cast running"}), 404
+    if s.joined:
+        st = s.request_custom({"type": "STATE_REQUEST"}, timeout=4) or {}
+        return jsonify({"mode": "guest", "shuffled": None, "source": None,
+                        "note": "the phone owns this queue; only up-next is visible",
+                        "up_next": [{"song_id": u.get("songId"), "title": u.get("title"),
+                                     "artist": u.get("artist")}
+                                    for u in (st.get("upNext") or [])]})
+    ids = [q["id"] for q in s.queue]
+    cur_pos = ids.index(s.current_song_id) + 1 if s.current_song_id in ids else None
+    queue = [{"position": i + 1, "song_id": q["id"], "title": q.get("title"),
+              "artist": q.get("artist_name"), "album": q.get("album_title"),
+              "now": (i + 1) == cur_pos} for i, q in enumerate(s.queue)]
+    out = {"mode": "owner", "label": s.label, "kind": s.kind,
+           "shuffled": bool(s.shuffled), "source": s.source,
+           "queue_position": cur_pos, "queue_length": len(ids), "queue": queue}
+    if request.args.get("source", "1") != "0":
+        src = _source_tracks(s.source)
+        if src is not None:
+            out["source_tracks"] = src
+            src_ids = [x["song_id"] for x in src]
+            out["matches_source_order"] = ids == src_ids[:len(ids)] or ids == src_ids[-len(ids):]
     return jsonify(out)

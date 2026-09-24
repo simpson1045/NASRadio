@@ -159,7 +159,9 @@ def force_restart_essentia(timeout_s=120):
     Returns a dict suitable for jsonify(): {success, message, kill_result,
     elapsed_seconds, error?}.
     """
-    from app.audio_analysis import check_essentia_service, ESSENTIA_SERVICE_URL
+    from app.audio_analysis import check_essentia_service
+    from app.config import Config
+    ESSENTIA_SERVICE_URL = Config.ESSENTIA_SERVICE_URL
 
     # If Essentia is REMOTE (the NAS container), we don't manage its lifecycle —
     # it self-heals via Docker. The WSL2 kill/spawn below only applies to a local

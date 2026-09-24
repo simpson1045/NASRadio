@@ -17,10 +17,12 @@ want to pick one up.
   (who may add downloads) are not.
 
 ## Cast
-- Expose shuffle and repeat state and the source (album or playlist) in the
-  cast status, and a way to fetch the source track list.
-- The headless cast sender should detect a receiver stuck idle with no media
-  loaded and relaunch itself instead of needing a backend restart.
+- Done: cast status reports shuffle and the source album or playlist, and
+  `GET /api/cast/queue` returns the full queue next to the source's own order.
+- Done: the headless sender heals a receiver stuck idle mid-queue (reload the
+  track, then relaunch the receiver app), and never fights a pause, an input
+  switch or another sender.
+- Repeat modes for headless casts.
 - Gapless and crossfade on bitstream (surround) casts.
 
 ## Library
