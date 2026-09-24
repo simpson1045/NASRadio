@@ -49,7 +49,7 @@ jobs:
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "17" }
       - uses: subosito/flutter-action@v2
-        with: { channel: stable, cache: true }
+        with: { channel: stable, flutter-version: 3.44.x, cache: true }
       - name: Release keystore (optional)
         if: env.KEYSTORE_B64 != ''
         working-directory: frontend/android
@@ -69,7 +69,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
-        with: { channel: stable, cache: true }
+        with: { channel: stable, flutter-version: 3.44.x, cache: true }
       - run: flutter pub get
         working-directory: frontend
       - run: flutter build windows --release
