@@ -65,7 +65,11 @@ jobs:
         with: { name: android, path: nasradio-android.apk }
 
   windows:
-    runs-on: windows-latest
+    # windows-2022 = Visual Studio 2022, the toolchain the project builds with.
+    # windows-latest (VS 2026) hard-errors on the deprecated coroutine header
+    # two plugins still use, and its CMake refuses to extract smtc_windows'
+    # bundled archive through Flutter's plugin symlink.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
