@@ -1,0 +1,9 @@
+# Pinned to the versions running on the proven WSL2 Essentia service
+# (Ubuntu 24.04, Python 3.12). essentia-tensorflow vendors its own libtensorflow
+# for the TensorflowPredict* algorithms (only needs numpy/pyyaml/six), and the
+# service never imports the standalone `tensorflow` package — so it's omitted
+# here, saving ~500MB-1GB of image and avoiding a needless build-time conflict.
+essentia-tensorflow==2.1b6.dev1389
+numpy==2.3.5
+flask==3.1.2
+requests

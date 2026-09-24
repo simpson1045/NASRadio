@@ -1,0 +1,5 @@
+# models/ is ~32MB of TensorFlow .pb files, copied in at build time - not tracked.
+# app.py used to be ignored too ("copied in from the WSL2 service"). That service
+# was retired in July 2026, which left the live Essentia code with no version
+# history at all; it is tracked here as of 2026-09-20.
+models/

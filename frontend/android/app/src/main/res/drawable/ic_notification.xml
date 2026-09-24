@@ -1,0 +1,41 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    
+    <!-- Radio tower -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M11,2 L13,2 L14,12 L15,12 L15,13 L14.2,13 L15,22 L13,22 L12.5,13 L11.5,13 L11,22 L9,22 L9.8,13 L9,13 L9,12 L10,12 Z"/>
+    
+    <!-- Tower cross beam 1 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M10,15 L14,15 L14,16 L10,16 Z"/>
+    
+    <!-- Tower cross beam 2 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M10.5,18 L13.5,18 L13.5,19 L10.5,19 Z"/>
+    
+    <!-- Left inner wave -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M8,5 L7,5.5 Q5.5,8 7,10.5 L8,11 Q6,8 8,5 Z"/>
+    
+    <!-- Left outer wave -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M6,3.5 L5,4 Q2.5,8 5,12 L6,12.5 Q3,8 6,3.5 Z"/>
+    
+    <!-- Right inner wave -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M16,5 L17,5.5 Q18.5,8 17,10.5 L16,11 Q18,8 16,5 Z"/>
+    
+    <!-- Right outer wave -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M18,3.5 L19,4 Q21.5,8 19,12 L18,12.5 Q21,8 18,3.5 Z"/>
+</vector>

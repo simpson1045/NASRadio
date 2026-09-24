@@ -1,0 +1,96 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+backend/lib/
+backend/lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# Database
+*.db
+nasradio.db
+
+# yt-dlp YouTube auth cookies (contains active session credentials)
+youtube_cookies.txt
+
+# Artwork and media (don't commit large files)
+artwork/
+artist_images/
+
+# Claude Code ephemeral agent worktrees + locks (never commit)
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+# Note: We're keeping .vscode/ so workspace settings are shared
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+backend/.cache
+
+# Generated/cached data (regenerable)
+backend/data/waveforms/
+backend/recommender/data/
+*.mp3
+
+# Release binaries (served by /api/update/download, not tracked in git)
+backend/updates/*.apk
+backend/updates/*.zip
+
+# Temp files / screenshots (root dir only)
+/phone_screen*
+/podcast_art.*
+/*.png
+/*.jpg
+
+# Database dumps
+*.dump
+
+# Logs
+*.log
+
+# Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+# scratch one-off NAS deploy helper (uses .env creds; not for the repo)
+backend/_nas_deploy.py
+backend/_opus_migrate.py
+
+# Per-install runtime data: secret_key, caches, staging, SQLite leftovers, dumps.
+# (waveforms/ was already ignored; the whole folder is now.)
+backend/data/
+!backend/data/rematch_paths.py

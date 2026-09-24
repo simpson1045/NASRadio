@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NASRadio</title>
+  <link rel="stylesheet" href="/cast/receiver.css?v=21">
+</head>
+<body>
+  <!-- Background layers -->
+  <div id="bg-image"></div>
+  <div id="bg-overlay"></div>
+
+  <!-- Main content: "now playing" view -->
+  <div id="content">
+    <!-- Left side: artwork + song info -->
+    <div id="left-panel">
+      <!-- Album artwork -->
+      <div id="artwork-container">
+        <img id="artwork" src="" alt="Album Art">
+        <div id="artwork-placeholder">
+          <svg viewBox="0 0 24 24" width="80" height="80" fill="rgba(255,255,255,0.15)">
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 14.5c-2.49 0-4.5-2.01-4.5-4.5S9.51 7.5 12 7.5s4.5 2.01 4.5 4.5-2.01 4.5-4.5 4.5zm0-5.5c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1z"/>
+          </svg>
+        </div>
+      </div>
+
+      <!-- Song info -->
+      <div id="song-info">
+        <div id="title">NASRadio</div>
+        <div id="artist">Waiting for music...</div>
+        <div id="album"></div>
+        <!-- Format + Atmos/Surround + HDCD + Explicit badges -->
+        <div id="badges">
+          <span id="format-badge" class="badge hidden"></span>
+          <span id="ddplus-badge" class="badge ddplus hidden"><img id="ddplus-logo" src="/cast/ddplus_logo.svg?v=1" alt="Dolby Digital Plus"></span>
+          <span id="atmos-badge" class="badge atmos hidden"><img id="atmos-logo" src="/cast/dolby_atmos_logo.svg?v=1" alt="Dolby Atmos"></span>
+          <span id="surround-badge" class="badge surround hidden"></span>
+          <span id="hdcd-badge" class="badge hdcd hidden">HDCD</span>
+          <span id="explicit-badge" class="badge explicit hidden">E</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Full-screen lyrics view (hidden by default, toggled from phone) -->
+  <div id="lyrics-view">
+    <div id="lyrics-header">
+      <div id="lyrics-artwork-small-container">
+        <img id="lyrics-artwork-small" src="" alt="">
+      </div>
+      <div id="lyrics-song-info">
+        <div id="lyrics-title"></div>
+        <div id="lyrics-artist"></div>
+      </div>
+    </div>
+    <div id="lyrics-body">
+      <div id="lyrics-container"></div>
+    </div>
+  </div>
+
+  <!-- Waveform progress bar (bottom of screen, visible in both views) -->
+  <div id="waveform-container">
+    <canvas id="waveform-canvas"></canvas>
+    <div id="time-display">
+      <span id="current-time">0:00</span>
+      <span id="live-pill" class="hidden"><span id="live-dot"></span>LIVE</span>
+      <span id="total-time">0:00</span>
+    </div>
+  </div>
+
+  <!-- Idle state (shown when nothing is playing).
+       Radio-signal rings radiate outward from behind the logo —
+       fits the logo's radio-tower motif. Gradient background
+       matches the dark cyan tones used elsewhere on the receiver. -->
+  <div id="idle-screen">
+    <div id="idle-backdrop"></div>
+    <div id="idle-rings" aria-hidden="true">
+      <span class="idle-ring"></span>
+      <span class="idle-ring"></span>
+      <span class="idle-ring"></span>
+      <span class="idle-ring"></span>
+    </div>
+    <div id="idle-logo-wrap">
+      <img id="idle-logo-img" src="/cast/nasradio_logo.svg?v=1" alt="NASRadio">
+      <div id="idle-wordmark">NASRadio</div>
+      <div id="idle-tagline">Ready to cast</div>
+    </div>
+  </div>
+
+  <!-- Bottom-right card stack: queue-add toast + "Up Next" countdown card.
+       Sits just above the waveform bar; cards fade independently. -->
+  <div id="tv-cards">
+    <div id="queue-toast" class="tv-card">
+      <div id="queue-toast-bg"><img id="queue-toast-bgimg" src="" alt=""></div>
+      <img id="queue-toast-art" src="" alt="">
+      <div id="queue-toast-info">
+        <div id="queue-toast-label">ADDED TO QUEUE</div>
+        <div id="queue-toast-title"></div>
+        <div id="queue-toast-sub"><span id="queue-toast-artist"></span><span id="queue-toast-by-pre"></span><b id="queue-toast-by"></b></div>
+      </div>
+      <div id="queue-toast-plus">+</div>
+    </div>
+    <div id="upnext-card" class="tv-card">
+      <img id="upnext-art" src="" alt="">
+      <div id="upnext-info">
+        <div id="upnext-label">UP NEXT</div>
+        <div id="upnext-title"></div>
+        <div id="upnext-artist"></div>
+      </div>
+      <div id="upnext-ring"><span id="upnext-secs"></span></div>
+    </div>
+  </div>
+
+  <!-- Top-right info bar -->
+  <div id="top-right-bar">
+    <div id="sleep-timer" class="hidden">
+      <span id="sleep-icon">🌙</span>
+      <span id="sleep-countdown"></span>
+    </div>
+    <div id="clock"></div>
+  </div>
+
+  <!-- Party mode: QR + join code (top-left, toggled by PARTY_MODE msg) -->
+  <div id="party-overlay">
+    <img id="party-qr" src="" alt="">
+    <div id="party-label">Scan to add songs</div>
+    <div id="party-code"></div>
+  </div>
+
+  <!-- Black screen overlay (for sleep/bedtime mode — OLED pixels off) -->
+  <div id="black-screen"></div>
+
+  <!-- Hidden audio element — fed to the CAF SDK as the media element so we
+       get native codec support (FLAC) without the default cast-media-player UI -->
+  <audio id="castMediaElement"></audio>
+
+  <!-- CAF Receiver SDK -->
+  <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <script src="/cast/receiver.js?v=38"></script>
+</body>
+</html>

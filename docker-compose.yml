@@ -1,0 +1,120 @@
+# NASRadio - self-hosted stack.
+#
+#   cp .env.example .env      # set MUSIC_DIR (and anything else you want)
+#   docker compose up -d      # Postgres + backend
+#   docker compose --profile analysis up -d    # ... plus the Essentia + transcode sidecars
+#
+# Then open the app, point it at http://<this host>:5002, and follow the
+# first-run setup (create the admin account, then the wizard).
+#
+# Everything host-specific comes from .env. The backend's own settings
+# (download client, indexer, API keys, cast device ...) can also be set from
+# the app under Settings > Integrations once you are signed in as admin.
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: nasradio-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nasradio}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nasradio}
+      POSTGRES_DB: ${POSTGRES_DB:-nasradio}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nasradio}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Uncomment to reach Postgres from the host (psql, DBeaver, backups):
+    # ports:
+    #   - "5432:5432"
+
+  backend:
+    build: ./backend
+    image: nasradio-backend:latest
+    container_name: nasradio-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${NASRADIO_PORT:-5002}:5002"
+    env_file:
+      - .env
+    environment:
+      # Wired here; do not set these in .env
+      DATABASE_URL: postgresql://${POSTGRES_USER:-nasradio}:${POSTGRES_PASSWORD:-nasradio}@postgres:5432/${POSTGRES_DB:-nasradio}
+      MUSIC_LIBRARY_PATH: /music
+      DOWNLOADS_NASRADIO: /downloads/complete/nasradio
+      DOWNLOADS_LIDARR: /downloads/complete/lidarr
+      ESSENTIA_SERVICE_URL: http://essentia:5005
+      NASRADIO_TRANSCODE_URL: http://transcode:5006
+    volumes:
+      # Your music. Read-write: imports, podcasts and the transcode cache land here.
+      - "${MUSIC_DIR:?Set MUSIC_DIR in .env to your music folder}:/music"
+      # Finished downloads from Transmission/Lidarr, if you use them.
+      - "${DOWNLOADS_DIR:-./downloads}:/downloads"
+      # Per-install state: artwork, artist images, generated secret key, logs.
+      - artwork:/app/artwork
+      - artist_images:/app/artist_images
+      - updates:/app/updates
+      - backend_data:/app/data
+      - backend_logs:/app/logs
+
+  # ---- Optional sidecars (docker compose --profile analysis up -d) ----------
+
+  # Essentia: genres, mood, BPM, key and ReplayGain per track. x86-64 only.
+  # Model files are downloaded from Essentia's public model zoo at build time.
+  essentia:
+    profiles: ["analysis"]
+    build: ./backend/docker/essentia
+    image: nasradio-essentia:latest
+    container_name: nasradio-essentia
+    restart: unless-stopped
+    volumes:
+      - "${MUSIC_DIR:?Set MUSIC_DIR in .env to your music folder}:/mnt/music:ro"
+    environment:
+      TF_CPP_MIN_LOG_LEVEL: "3"
+    # TensorFlow loads whole tracks; cap it so one odd file cannot OOM the host.
+    mem_limit: ${ESSENTIA_MEM_LIMIT:-3g}
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:5005/health',timeout=5)\""]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  # Transcode: pre-bakes AAC copies for mobile playback into <music>/.transcode_cache.
+  # Without it the backend transcodes on demand with ffmpeg.
+  transcode:
+    profiles: ["analysis"]
+    build: ./backend/docker/transcode
+    image: nasradio-transcode:latest
+    container_name: nasradio-transcode
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - "${MUSIC_DIR:?Set MUSIC_DIR in .env to your music folder}:/mnt/music"
+      - "${MUSIC_DIR}/.transcode_cache:/mnt/transcode_cache"
+    environment:
+      TRANSCODE_DB_HOST: postgres
+      TRANSCODE_DB_PORT: "5432"
+      TRANSCODE_DB_NAME: ${POSTGRES_DB:-nasradio}
+      TRANSCODE_DB_USER: ${POSTGRES_USER:-nasradio}
+      TRANSCODE_DB_PASS: ${POSTGRES_PASSWORD:-nasradio}
+      # Song rows store /music/... (the backend's mount); this service reads /mnt/music
+      TRANSCODE_DB_PATH_PREFIX: /music
+      TRANSCODE_MUSIC_DIR: /mnt/music
+      TRANSCODE_CACHE_DIR: /mnt/transcode_cache
+    mem_limit: ${TRANSCODE_MEM_LIMIT:-2g}
+
+volumes:
+  pgdata:
+  artwork:
+  artist_images:
+  updates:
+  backend_data:
+  backend_logs:

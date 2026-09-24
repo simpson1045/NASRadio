@@ -1,0 +1,8 @@
+# Don't bloat the build context with the WSL2 service's runtime cruft if it
+# gets copied in alongside app.py / models.
+*.log
+*.bak.*
+__pycache__/
+*.pyc
+cuda-keyring*.deb
+start.sh

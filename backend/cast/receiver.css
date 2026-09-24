@@ -1,0 +1,967 @@
+/* NASRadio Custom Cast Receiver */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* Hidden audio element used by CAF SDK */
+#castMediaElement {
+  display: none;
+}
+
+body {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: #000;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #fff;
+}
+
+/* Background image (album art, blurred) */
+#bg-image {
+  position: fixed;
+  top: -40px;
+  left: -40px;
+  right: -40px;
+  bottom: -40px;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  filter: blur(30px) saturate(1.2);
+  transition: background-image 1s ease-in-out;
+  z-index: 0;
+}
+
+/* Dark overlay on top of blurred background */
+#bg-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 1;
+}
+
+/* ─── Now Playing View ──────────────────────────────────────────── */
+
+#content {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  height: calc(100% - 80px); /* Leave room for waveform bar */
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 60px;
+  opacity: 0;
+  transition: opacity 0.8s ease-in-out;
+}
+
+#content.visible {
+  opacity: 1;
+}
+
+/* Center the artwork + info */
+#left-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  max-width: 600px;
+}
+
+/* Album artwork */
+#artwork-container {
+  position: relative;
+  width: 42vh;
+  height: 42vh;
+  max-width: 480px;
+  max-height: 480px;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5), 0 0 80px rgba(0, 0, 0, 0.3);
+  background: #1a2332;
+  flex-shrink: 0;
+}
+
+#artwork {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: none;
+}
+
+#artwork.loaded {
+  display: block;
+}
+
+#artwork-placeholder {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1a2332;
+}
+
+#artwork.loaded + #artwork-placeholder {
+  display: none;
+}
+
+/* Song info */
+#song-info {
+  text-align: center;
+  margin-top: 28px;
+  padding: 0 20px;
+  max-width: 100%;
+}
+
+/* Title / artist / album are ONE line each. Text that doesn't fit scrolls
+   (setScrollingText in receiver.js wraps it in a .marquee-track); text
+   that fits stays centred and still. line-height + padding-bottom give
+   descenders room under overflow:hidden — the TV's font was losing the
+   tails of g/y/p to the default line box. */
+#title {
+  font-size: 30px;
+  font-weight: 700;
+  color: #fff;
+  line-height: 1.35;
+  padding-bottom: 0.1em;
+  white-space: nowrap;
+  overflow: hidden;
+  transition: opacity 0.5s ease;
+}
+
+/* The scrolling strip: two copies of the text, each followed by a gap,
+   slid left by exactly one copy's width so the loop is seamless.
+   transform-only, so webOS composites it without repainting (the idle-ring
+   lesson). --marquee-dist and the duration are set per element in JS. */
+.marquee-track {
+  display: inline-block;
+  white-space: nowrap;
+  will-change: transform;
+  animation: nasradio-marquee linear infinite;
+  animation-delay: 1.5s;
+}
+.marquee-track > span {
+  display: inline-block;
+}
+@keyframes nasradio-marquee {
+  0%, 12% { transform: translateX(0); }
+  100% { transform: translateX(var(--marquee-dist)); }
+}
+
+#artist {
+  font-size: 20px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.7);
+  margin-top: 6px;
+  line-height: 1.35;
+  padding-bottom: 0.1em;
+  white-space: nowrap;
+  overflow: hidden;
+  transition: opacity 0.5s ease;
+}
+
+#album {
+  font-size: 15px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.38);
+  margin-top: 4px;
+  line-height: 1.35;
+  padding-bottom: 0.1em;
+  white-space: nowrap;
+  overflow: hidden;
+  transition: opacity 0.5s ease;
+}
+
+/* Badges (FLAC, HDCD) */
+#badges {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.badge {
+  display: inline-block;
+  padding: 4px 12px;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  border-radius: 5px;
+  border: 1.5px solid;
+}
+
+.badge.hidden {
+  display: none;
+}
+
+/* FLAC / format badge — cyan by default, overridden by format-specific colors */
+#format-badge {
+  color: #00d4ff;
+  border-color: #00d4ff;
+  background: rgba(0, 212, 255, 0.15);
+}
+
+/* Format-specific colors */
+#format-badge.fmt-mp3 {
+  color: #FF9800;
+  border-color: #FF9800;
+  background: rgba(255, 152, 0, 0.15);
+}
+
+#format-badge.fmt-aac, #format-badge.fmt-m4a {
+  color: #9C27B0;
+  border-color: #9C27B0;
+  background: rgba(156, 39, 176, 0.15);
+}
+
+#format-badge.fmt-ogg, #format-badge.fmt-opus {
+  color: #4CAF50;
+  border-color: #4CAF50;
+  background: rgba(76, 175, 80, 0.15);
+}
+
+#format-badge.fmt-wav, #format-badge.fmt-wave {
+  color: #2196F3;
+  border-color: #2196F3;
+  background: rgba(33, 150, 243, 0.15);
+}
+
+#format-badge.fmt-dsd, #format-badge.fmt-dsf, #format-badge.fmt-dff {
+  color: #FFD700;
+  border-color: #FFD700;
+  background: rgba(255, 215, 0, 0.15);
+}
+
+#format-badge.fmt-wv {
+  color: #9C27B0;
+  border-color: #9C27B0;
+  background: rgba(156, 39, 176, 0.15);
+}
+
+#format-badge.fmt-ape {
+  color: #8BC34A;
+  border-color: #8BC34A;
+  background: rgba(139, 195, 74, 0.15);
+}
+
+#format-badge.fmt-aiff, #format-badge.fmt-aif {
+  color: #03A9F4;
+  border-color: #03A9F4;
+  background: rgba(3, 169, 244, 0.15);
+}
+
+#format-badge.fmt-alac {
+  color: #03A9F4;
+  border-color: #03A9F4;
+  background: rgba(3, 169, 244, 0.15);
+}
+
+/* HDCD badge — gold */
+#hdcd-badge {
+  color: #FFD700;
+  border-color: #FFD700;
+  background: rgba(255, 215, 0, 0.15);
+}
+
+/* Dolby Atmos badge — official wordmark (PD typography), forced white to
+   match the badge row on the dark receiver */
+#atmos-badge {
+  border-color: #4FC3F7;
+  background: rgba(30, 100, 180, 0.35);
+  display: inline-flex;
+  align-items: center;
+}
+/* The ID rule above outranks the generic .hidden class — restate it at ID
+   specificity or the badge can never hide once shown. */
+#atmos-badge.hidden {
+  display: none;
+}
+
+/* Dolby Digital Plus badge — official wordmark, replaces the text format
+   pill on DD+ streams (sidecar/eac3 casts) */
+#ddplus-badge {
+  border-color: #4FC3F7;
+  background: rgba(30, 100, 180, 0.35);
+  display: inline-flex;
+  align-items: center;
+}
+#ddplus-badge.hidden {
+  display: none;
+}
+#ddplus-logo {
+  height: 21px;
+  display: block;
+  filter: brightness(0) invert(1);
+}
+#atmos-logo {
+  height: 19px;
+  display: block;
+  filter: brightness(0) invert(1);
+}
+
+/* Surround badge (5.0 / 5.1 / 7.1) — teal */
+#surround-badge {
+  color: #4DD0E1;
+  border-color: #4DD0E1;
+  background: rgba(77, 208, 225, 0.15);
+}
+
+/* Explicit badge — grey */
+#explicit-badge {
+  color: #9E9E9E;
+  border-color: #9E9E9E;
+  background: rgba(158, 158, 158, 0.15);
+  min-width: 20px;
+  text-align: center;
+}
+
+/* ─── Lyrics View (full-screen overlay, toggled from phone) ───── */
+
+#lyrics-view {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 80px; /* above waveform bar */
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  padding: 40px 80px;
+  background: rgba(0, 0, 0, 0.85);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.5s ease-in-out;
+}
+
+#lyrics-view.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Small artwork + info header at top of lyrics view */
+#lyrics-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 30px;
+  flex-shrink: 0;
+}
+
+#lyrics-artwork-small-container {
+  width: 64px;
+  height: 64px;
+  border-radius: 8px;
+  overflow: hidden;
+  flex-shrink: 0;
+  background: #1a2332;
+}
+
+#lyrics-artwork-small {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+#lyrics-song-info {
+  overflow: hidden;
+}
+
+#lyrics-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: #fff;
+  line-height: 1.35;
+  padding-bottom: 0.1em;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+#lyrics-artist {
+  font-size: 15px;
+  color: rgba(255, 255, 255, 0.6);
+  margin-top: 2px;
+  line-height: 1.35;
+  padding-bottom: 0.1em;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* Lyrics body — scrollable area */
+#lyrics-body {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  position: relative;
+  /* Hide scrollbar but keep scrolling */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+#lyrics-body::-webkit-scrollbar {
+  display: none;
+}
+
+#lyrics-container {
+  width: 100%;
+  max-width: 800px;
+  text-align: center;
+  margin: 0 auto;
+  /* Padding so first/last lines can be scrolled to center */
+  padding-top: 40vh;
+  padding-bottom: 40vh;
+}
+
+.lyric-line {
+  font-size: 28px;
+  line-height: 1.9;
+  color: rgba(255, 255, 255, 0.25);
+  transition: color 0.3s ease, transform 0.3s ease, text-shadow 0.3s ease;
+  padding: 2px 0;
+}
+
+.lyric-line.active {
+  color: #00d4ff;
+  transform: scale(1.08);
+  text-shadow: 0 0 25px rgba(0, 212, 255, 0.4);
+}
+
+.lyric-line.past {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+/* Fade gradients on lyrics body */
+#lyrics-body::before,
+#lyrics-body::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 80px;
+  z-index: 3;
+  pointer-events: none;
+}
+
+#lyrics-body::before {
+  top: 0;
+  background: linear-gradient(to bottom, rgba(0,0,0,0.7), transparent);
+}
+
+#lyrics-body::after {
+  bottom: 0;
+  background: linear-gradient(to top, rgba(0,0,0,0.7), transparent);
+}
+
+/* ─── Waveform Progress Bar (bottom of screen, always visible) ── */
+
+#waveform-container {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 80px;
+  z-index: 10;
+  padding: 10px 60px 14px;
+  background: linear-gradient(to top, rgba(0,0,0,0.8), transparent);
+  overflow: hidden;
+}
+
+#waveform-canvas {
+  width: 100%;
+  height: 36px;
+  display: block;
+}
+
+#time-display {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.54);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Live-stream mode (radio stations) ─────────────────────────────
+   body.live-mode is toggled by setLiveMode() when streamType=LIVE.
+   No scrubber (duration is Infinity); elapsed listen time on the left,
+   pulsing LIVE pill on the right where the total time normally sits. */
+
+body.live-mode #waveform-canvas {
+  visibility: hidden; /* keep layout height so time-display doesn't jump */
+}
+
+#live-pill {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: #ff5a5a;
+}
+
+#live-pill.hidden {
+  display: none;
+}
+
+#total-time.hidden {
+  display: none;
+}
+
+#live-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #ff5a5a;
+  box-shadow: 0 0 8px rgba(255, 90, 90, 0.8);
+  animation: live-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* ─── Idle Screen ───────────────────────────────────────────────── */
+
+#idle-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 50% 45%, rgba(0, 212, 255, 0.08) 0%, transparent 60%),
+    linear-gradient(180deg, #0d1b2a 0%, #050a14 100%);
+  transition: opacity 0.8s ease-in-out;
+}
+
+#idle-screen.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Subtle vignette layered over the gradient so the centre pops. */
+#idle-backdrop {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(circle at 50% 45%, transparent 55%, rgba(0, 0, 0, 0.55) 100%);
+}
+
+/* Concentric "radio waves" pulsing outward from behind the logo.
+   Each ring is offset in the animation so one is always near centre
+   and another is fading at the edge — matches the radio-tower logo. */
+#idle-rings {
+  position: absolute;
+  top: 45%;
+  left: 50%;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.idle-ring {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 240px;
+  height: 240px;
+  margin: -120px 0 0 -120px;
+  border-radius: 50%;
+  border: 2px solid rgba(0, 212, 255, 0.55);
+  opacity: 0;
+  transform: scale(0.3);
+  animation: idlePulse 4.8s cubic-bezier(0.15, 0.8, 0.3, 1) infinite;
+  /* Only transform + opacity animate, so the compositor owns these rings
+     and they run at the webview's full refresh with no per-frame repaint.
+     The old border-color tween forced a main-thread repaint of a 240px
+     circle every frame, which is what read as a low frame rate. */
+  will-change: transform, opacity;
+  backface-visibility: hidden;
+}
+
+.idle-ring:nth-child(2) { animation-delay: 1.2s; }
+.idle-ring:nth-child(3) { animation-delay: 2.4s; }
+.idle-ring:nth-child(4) { animation-delay: 3.6s; }
+
+@keyframes idlePulse {
+  0%   { transform: scale(0.3); opacity: 0; }
+  10%  { opacity: 0.85; }
+  70%  { opacity: 0.15; }
+  100% { transform: scale(3.2); opacity: 0; }
+}
+
+#idle-logo-wrap {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  animation: idleBreathe 4.8s ease-in-out infinite;
+  will-change: transform;
+}
+
+#idle-logo-img {
+  width: 220px;
+  height: 220px;
+  filter: drop-shadow(0 0 32px rgba(0, 212, 255, 0.55));
+}
+
+#idle-wordmark {
+  font-size: 56px;
+  font-weight: 700;
+  color: #00d4ff;
+  letter-spacing: 6px;
+  text-transform: uppercase;
+  text-shadow: 0 0 16px rgba(0, 212, 255, 0.55);
+}
+
+#idle-tagline {
+  font-size: 18px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.6);
+  letter-spacing: 4px;
+  text-transform: uppercase;
+}
+
+@keyframes idleBreathe {
+  0%, 100% { transform: translateY(0) scale(1); }
+  50%      { transform: translateY(-4px) scale(1.015); }
+}
+
+/* ─── Sleep Timer Countdown ──────────────────────────────────────── */
+
+#top-right-bar {
+  position: fixed;
+  top: 24px;
+  right: 32px;
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+#clock {
+  font-size: 28px;
+  color: rgba(255, 255, 255, 0.7);
+  font-weight: bold;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.7);
+}
+
+#sleep-timer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  font-size: 16px;
+  color: rgba(255, 255, 255, 0.6);
+  font-variant-numeric: tabular-nums;
+  transition: opacity 0.5s ease;
+}
+
+#sleep-timer.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#sleep-icon {
+  font-size: 14px;
+}
+
+/* ─── Black Screen (sleep/bedtime mode) ─────────────────────────── */
+
+#black-screen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  z-index: 100;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 1.5s ease-in-out;
+}
+
+#black-screen.active {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* ─── Animations ────────────────────────────────────────────────── */
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in {
+  animation: fadeInUp 0.6s ease-out forwards;
+}
+
+/* ─── Party Mode Overlay ─────────────────────────────────────────── */
+/* QR + join code, top-left. Toggled by the PARTY_MODE custom message. */
+
+#party-overlay {
+  position: fixed;
+  top: 28px;
+  left: 28px;
+  background: rgba(13, 27, 42, 0.88);
+  border: 1px solid rgba(0, 212, 255, 0.35);
+  border-radius: 18px;
+  padding: 16px 16px 12px;
+  text-align: center;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  pointer-events: none;
+  z-index: 40;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+}
+
+#party-overlay.visible {
+  opacity: 1;
+}
+
+#party-qr {
+  width: 180px;
+  height: 180px;
+  border-radius: 10px;
+  display: block;
+}
+
+#party-label {
+  color: #9fb3c8;
+  font-size: 15px;
+  margin-top: 10px;
+}
+
+#party-code {
+  color: #00d4ff;
+  font-weight: bold;
+  font-size: 22px;
+  letter-spacing: 4px;
+  margin-top: 2px;
+}
+
+/* ── Bottom-right card stack: queue toast + Up Next countdown ─────────
+   Ports the desktop fullscreen "UP NEXT" card (now_playing_screen.dart)
+   to the TV: same navy/cyan palette as the party overlay. */
+#tv-cards {
+  position: fixed;
+  right: 60px;               /* aligns with waveform bar padding */
+  bottom: 100px;             /* just above the 80px waveform bar */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 14px;
+  z-index: 40;
+}
+
+/* Show/hide contract (see showCard/hideCard in receiver.js):
+   .visible enters layout, .shown fades in a beat later — so hidden
+   cards take ZERO space and can't shove their siblings up the screen. */
+.tv-card {
+  display: none;
+  align-items: center;
+  gap: 16px;
+  width: 470px;
+  padding: 14px 16px;
+  background: linear-gradient(135deg, rgba(16, 32, 50, 0.95),
+                                      rgba(8, 17, 28, 0.92));
+  border: 1px solid rgba(0, 212, 255, 0.4);
+  border-radius: 18px;
+  box-shadow: 0 10px 36px rgba(0, 0, 0, 0.55),
+              0 0 28px rgba(0, 212, 255, 0.12);
+  opacity: 0;
+  transform: translateX(28px);
+  transition: opacity 0.45s ease, transform 0.45s cubic-bezier(0.2, 0.9, 0.3, 1);
+  pointer-events: none;
+}
+
+.tv-card.visible {
+  display: flex;
+}
+
+.tv-card.shown {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+#upnext-art, #queue-toast-art {
+  width: 74px;
+  height: 74px;
+  border-radius: 12px;
+  object-fit: cover;
+  background: #16273a;
+  flex-shrink: 0;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+}
+
+#upnext-info, #queue-toast-info {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Label as a small cyan pill chip, matching the format badges */
+#upnext-label, #queue-toast-label {
+  display: inline-block;
+  color: #00d4ff;
+  background: rgba(0, 212, 255, 0.12);
+  border: 1px solid rgba(0, 212, 255, 0.25);
+  border-radius: 999px;
+  padding: 2px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 2px;
+}
+
+#upnext-title {
+  color: #fff;
+  font-size: 20px;
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#upnext-artist {
+  color: #9fb2c4;
+  font-size: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Queue toast: artist image (or album art) fills the card behind a
+   left-to-right scrim — text lives on the dark side, image breathes
+   through on the right. */
+#queue-toast {
+  position: relative;
+  overflow: hidden;
+}
+
+#queue-toast-bg {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+#queue-toast-bg img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* Slight overscale hides the blur's soft edges at the card border */
+  transform: scale(1.15);
+  filter: blur(3px) saturate(1.1);
+}
+
+#queue-toast-bg::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, rgba(8, 17, 28, 0.97) 0%,
+                                     rgba(10, 21, 34, 0.88) 55%,
+                                     rgba(10, 21, 34, 0.45) 100%);
+}
+
+#queue-toast-art, #queue-toast-info, #queue-toast-plus {
+  position: relative;
+  z-index: 1;
+}
+
+#queue-toast-title {
+  color: #fff;
+  font-size: 21px;
+  font-weight: 600;
+  margin-top: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#queue-toast-sub {
+  color: #9fb2c4;
+  font-size: 16px;
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#queue-toast-sub b {
+  color: #00d4ff;
+  font-weight: 600;
+}
+
+/* Right-side anchor: glowing + ring, mirroring the countdown ring */
+#queue-toast-plus {
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  border: 2px solid rgba(0, 212, 255, 0.6);
+  background: rgba(0, 212, 255, 0.1);
+  color: #00d4ff;
+  font-size: 32px;
+  font-weight: 300;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  box-shadow: 0 0 18px rgba(0, 212, 255, 0.25);
+}
+
+/* Countdown ring — conic fill drains with the remaining seconds */
+#upnext-ring {
+  position: relative;
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: conic-gradient(#00d4ff calc(var(--pct, 1) * 360deg),
+                             rgba(255, 255, 255, 0.18) 0);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#upnext-ring::before {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  background: #0c1826;
+}
+
+#upnext-secs {
+  position: relative;
+  color: #fff;
+  font-size: 18px;
+  font-weight: 500;
+}
