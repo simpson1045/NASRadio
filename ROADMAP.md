@@ -19,9 +19,10 @@ want to pick one up.
 ## Cast
 - Done: cast status reports shuffle and the source album or playlist, and
   `GET /api/cast/queue` returns the full queue next to the source's own order.
-- Done: the headless sender heals a receiver stuck idle mid-queue (reload the
-  track, then relaunch the receiver app), and never fights a pause, an input
-  switch or another sender.
+- Done: casts no longer stall mid-queue. The cause was a Postgres lock convoy
+  (schema migrations run from helper processes); migrations now run only at
+  startup and never take locks on a current schema. A single gentle track
+  reload remains as a safety net.
 - Repeat modes for headless casts.
 - Gapless and crossfade on bitstream (surround) casts.
 

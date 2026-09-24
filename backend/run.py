@@ -50,7 +50,7 @@ def main():
 
     # Initialize database
     print("🎵 NASRadio Backend Starting...")
-    db = Database(config.DATABASE_URL)
+    db = Database(config.DATABASE_URL, migrate=True)  # the one place the schema is migrated
 
     # Note: SQLite backup disabled - PostgreSQL uses pg_dump for backups
     # backup = DatabaseBackup(config.DATABASE_PATH)

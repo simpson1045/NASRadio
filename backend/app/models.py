@@ -1,10 +1,12 @@
 import itertools
 import os
+import re
 import sys
 import time
 import traceback
 
 import psycopg2
+import psycopg2.errors
 import psycopg2.extras
 import psycopg2.pool
 from datetime import datetime
@@ -127,6 +129,89 @@ def _dump_holders_on_exhaustion():
         )
 
 
+# ── Long-held connection watchdog ─────────────────────────────────────
+# A pooled connection that stays checked out holds an open transaction
+# ("idle in transaction" in pg_stat_activity). On its own that only wastes
+# a connection; combined with any DDL it froze the whole backend on
+# 2026-09-23 (see HANDOFF "lock convoy"). Log who is holding one so the
+# next leak names itself.
+LEASE_WARN_AFTER_SEC = 120
+_lease_warned = set()
+
+
+def start_lease_watchdog(interval=60):
+    import eventlet
+
+    def _loop():
+        while True:
+            eventlet.sleep(interval)
+            try:
+                live = set()
+                for h in get_pool_holders():
+                    live.add(h["lease_id"])
+                    if h["held_for_s"] >= LEASE_WARN_AFTER_SEC and h["lease_id"] not in _lease_warned:
+                        _lease_warned.add(h["lease_id"])
+                        print(f"🟠 DB connection held {int(h['held_for_s'])}s by {h['caller']} "
+                              f"({h['endpoint'] or 'background job'} {h['path'] or ''}) - "
+                              f"its transaction stays open the whole time")
+                _lease_warned.intersection_update(live)
+            except Exception as e:
+                print(f"⚠️ lease watchdog: {e}")
+
+    eventlet.spawn_n(_loop)
+    print(f"🩺 DB lease watchdog started - warns on connections held > {LEASE_WARN_AFTER_SEC}s")
+
+
+# ── Schema migration without the lock convoy ──────────────────────────
+# Postgres takes ACCESS EXCLUSIVE for "ALTER TABLE .. ADD COLUMN IF NOT
+# EXISTS" (and a SHARE lock for CREATE INDEX IF NOT EXISTS) BEFORE it checks
+# whether the column/index exists, and init_db holds every lock until its
+# final commit. So a no-op migration behind one slow reader stalled every
+# query on songs/albums/users. This cursor skips DDL whose target already
+# exists (catalog lookup, no table locks), and lock_timeout makes anything
+# that does need a lock fail fast and retry instead of queueing.
+MIGRATION_LOCK_TIMEOUT = "3s"
+MIGRATION_ATTEMPTS = 5
+
+
+class _MigrationCursor:
+    _ALTER = re.compile(r"^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)", re.I)
+    _TABLE = re.compile(r"^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)", re.I)
+    _INDEX = re.compile(r"^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)", re.I)
+
+    def __init__(self, cur):
+        self._cur = cur
+        self.ran = 0
+        self.skipped = 0
+        cur.execute(f"SET LOCAL lock_timeout = '{MIGRATION_LOCK_TIMEOUT}'")
+        cur.execute("SELECT table_name, column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema()")
+        self._cols = {(r["table_name"].lower(), r["column_name"].lower()) for r in cur.fetchall()}
+        self._tables = {tn for tn, _ in self._cols}
+        cur.execute("SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()")
+        self._indexes = {r["indexname"].lower() for r in cur.fetchall()}
+
+    def execute(self, sql, params=None):
+        s = sql if isinstance(sql, str) else str(sql)
+        m = self._ALTER.match(s)
+        if m and (m.group(1).lower(), m.group(2).lower()) in self._cols:
+            self.skipped += 1
+            return None
+        m = self._TABLE.match(s)
+        if m and m.group(1).lower() in self._tables:
+            self.skipped += 1
+            return None
+        m = self._INDEX.match(s)
+        if m and m.group(1).lower() in self._indexes:
+            self.skipped += 1
+            return None
+        self.ran += 1
+        return self._cur.execute(sql) if params is None else self._cur.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
 class PooledConnection:
     """Wrapper that returns connection to pool on close() instead of closing"""
 
@@ -175,10 +260,14 @@ class Database:
     _initialized = False
     _pool = None
 
-    def __init__(self, db_url):
+    def __init__(self, db_url, migrate=False):
+        """migrate=True only from the backend's startup (run.py) and the
+        manage_users CLI. Every other Database() - request handlers, jobs,
+        token mints run with `docker exec`, scripts - just connects."""
         self.db_url = db_url
         self._init_pool()
-        self.init_db()
+        if migrate:
+            self.init_db()
 
     def _init_pool(self):
         """Initialize connection pool (once).
@@ -214,12 +303,29 @@ class Database:
         return raw_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     def init_db(self):
-        """Initialize database with tables"""
+        """Create/upgrade the schema. Once per process, only when asked
+        (Database(url, migrate=True)). Retries if a needed lock is busy."""
         if Database._initialized:
             return
+        for attempt in range(1, MIGRATION_ATTEMPTS + 1):
+            self._mig_conn = None
+            try:
+                self._run_migrations()
+                return
+            except psycopg2.errors.LockNotAvailable as e:
+                print(f"⚠️ schema migration: lock busy for > {MIGRATION_LOCK_TIMEOUT} "
+                      f"(attempt {attempt}/{MIGRATION_ATTEMPTS}): {str(e).strip()[:120]}")
+                time.sleep(3 * attempt)
+            finally:
+                if self._mig_conn is not None:
+                    self._mig_conn.close()
+        raise RuntimeError("schema migration could not get its locks - another session "
+                           "is holding a transaction on these tables")
 
+    def _run_migrations(self):
         conn = self.get_connection()
-        cursor = self.get_cursor(conn)
+        self._mig_conn = conn
+        cursor = _MigrationCursor(self.get_cursor(conn))
 
         # Artists table
         cursor.execute(
@@ -952,4 +1058,5 @@ class Database:
         conn.commit()
         conn.close()
         Database._initialized = True
-        print("✅ Database initialized successfully!")
+        print(f"✅ Database initialized successfully! "
+              f"({cursor.ran} statements run, {cursor.skipped} already in place)")

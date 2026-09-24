@@ -136,6 +136,14 @@ def create_app():
         except Exception as e:
             print(f"⚠️ Could not start SMB keepalive: {e}")
 
+        # Log any pooled DB connection held open for minutes (lock-convoy guard)
+        try:
+            from app.models import start_lease_watchdog
+
+            start_lease_watchdog()
+        except Exception as e:
+            print(f"⚠️ Could not start DB lease watchdog: {e}")
+
         # Bound podcast download storage (delete completed + size cap)
         try:
             from app.routes import start_podcast_cleanup_scheduler

@@ -748,11 +748,7 @@ def _get_session(host, wake=True):
     first — its owner is about to lose the TV anyway."""
     s = _sessions.get(host)
     if s and s.alive and s.transport_id and not s.joined:
-        if not _looks_frozen(s):
-            return s
-        print(f"📺 [cast-sender] session on {host} has sat IDLE with no media "
-              f"for {int(time.time() - s.idle_since)}s — relaunching the receiver")
-        _kill_receiver_app(s)
+        return s
     if s is not None:
         try:
             s.close()
@@ -849,18 +845,17 @@ def _reattach_loop(host, dead, tries=30, every=20):
             return
 
 
-# ── Self-heal for a frozen receiver ────────────────────────────────────
-# 2026-09-23: the receiver stayed connected but sat IDLE at 0:00, fetched no
-# streams, and "resume" only moved the pointer; a backend restart + fresh
-# play fixed it. Now the sender notices and fixes it itself:
-#   1st attempt  reload the current track at the saved position
-#   2nd attempt  STOP the receiver app on the TV (kills the frozen instance),
-#                relaunch it and restore the queue at the same song/second
-#   then         give up for HEAL_WINDOW_SEC and log it - never loops.
+# ── Self-heal for a stalled queue ───────────────────────────────────────
+# If a queue we own sits IDLE mid-queue for 45 s, reload the current track
+# at its saved position once. That is all: the 2026-09-23 "wedge" turned out
+# to be a Postgres lock convoy in the backend (fixed in models.py), not the
+# receiver, so there is no relaunching or closing of the cast here. One
+# reload per 10 minutes; it never acts on a pause, the end of the queue, a
+# user stop, a station, a guest session, the TV leaving the cast app, or
+# another sender taking over, and it re-checks the TV before acting.
 IDLE_HEAL_AFTER_SEC = 45
-FROZEN_FOR_PLAY_SEC = 20
 HEAL_WINDOW_SEC = 600
-HEAL_MAX_IN_WINDOW = 2
+HEAL_MAX_IN_WINDOW = 1
 
 
 def _legitimately_idle(s):
@@ -885,31 +880,8 @@ def _wedged(s):
             and not _legitimately_idle(s))
 
 
-def _looks_frozen(s):
-    """For play: an owned session idle for a while is not worth reusing."""
-    return (s.player_state == "IDLE" and s.idle_since is not None
-            and time.time() - s.idle_since >= FROZEN_FOR_PLAY_SEC)
-
-
-def _kill_receiver_app(s):
-    """Stop the NASRadio receiver app on the TV so the next LAUNCH starts a
-    fresh instance instead of re-attaching to a frozen one."""
-    try:
-        s.stop_media()
-    except Exception:
-        pass
-    try:
-        s.stop_receiver()
-    except Exception:
-        pass
-    eventlet.sleep(2)
-
-
 def _heal(s):
     try:
-        # Fresh look at what the TV is running before touching anything: if
-        # the user switched inputs / opened another app, or another sender
-        # launched over us, this is not ours to fix.
         asked = time.time()
         s._send(NS_RECEIVER, {"type": "GET_STATUS", "requestId": s._next_req()},
                 dest="receiver-0")
@@ -921,41 +893,23 @@ def _heal(s):
                 print(f"📺 [cast-sender] self-heal skipped on {s.host}: TV did not answer a status check")
             return
         now = time.time()
-        s._heal_times = [t for t in s._heal_times if now - t < HEAL_WINDOW_SEC]
+        s._heal_times = [x for x in s._heal_times if now - x < HEAL_WINDOW_SEC]
         if len(s._heal_times) >= HEAL_MAX_IN_WINDOW:
             if not s._heal_gave_up:
                 s._heal_gave_up = True
-                print(f"📺 [cast-sender] self-heal: {len(s._heal_times)} attempts in "
-                      f"{HEAL_WINDOW_SEC // 60} min on {s.host} and still IDLE - giving up")
+                print(f"📺 [cast-sender] self-heal: already reloaded once in the last "
+                      f"{HEAL_WINDOW_SEC // 60} min on {s.host} and it is IDLE again - leaving it")
             return
         s._heal_times.append(now)
-        attempt = len(s._heal_times)
         ids = [q["id"] for q in s.queue]
         idx = ids.index(s.current_song_id) if s.current_song_id in ids else 0
         pos = max(0.0, s.position_now() - 2.0)
-        idle_for = int(now - (s.idle_since or now))
-        if attempt == 1:
-            print(f"📺 [cast-sender] self-heal 1/2: IDLE for {idle_for}s mid-queue on "
-                  f"{s.host} - reloading track {idx + 1} of {len(ids)} at {int(pos)}s")
-            s.idle_since = None
-            _load_queue_index(s, idx, current_time=pos)
-            s.position, s.position_at = pos, time.time()
-            _save_state(s)
-        else:
-            print(f"📺 [cast-sender] self-heal 2/2: still IDLE on {s.host} - stopping the "
-                  f"receiver app and relaunching at track {idx + 1}, {int(pos)}s")
-            s.position, s.position_at = pos, time.time()
-            _save_state(s)
-            _kill_receiver_app(s)
-            host = s.host
-            s.close()
-            if _sessions.get(host) is s:
-                _sessions.pop(host, None)
-            out = _restore_cast(host, wake=False)
-            fresh = _sessions.get(host)
-            if fresh is not None:
-                fresh._heal_times = list(s._heal_times)
-            print(f"📺 [cast-sender] self-heal: relaunched - {out.get('now_playing')}")
+        print(f"📺 [cast-sender] self-heal: IDLE for {int(now - (s.idle_since or now))}s mid-queue "
+              f"on {s.host} - reloading track {idx + 1} of {len(ids)} at {int(pos)}s")
+        s.idle_since = None
+        _load_queue_index(s, idx, current_time=pos)
+        s.position, s.position_at = pos, time.time()
+        _save_state(s)
     except Exception as e:
         print(f"📺 [cast-sender] self-heal failed on {s.host}: {e}")
     finally:

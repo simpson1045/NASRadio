@@ -32,7 +32,8 @@ def _prompt_password():
 
 
 def _db():
-    return Database(Config().DATABASE_URL)
+    # migrate=True: this CLI may be the first thing run against a fresh database.
+    return Database(Config().DATABASE_URL, migrate=True)
 
 
 def cmd_list():
