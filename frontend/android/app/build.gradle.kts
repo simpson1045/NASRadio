@@ -1,9 +1,23 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("kotlin-android")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
+
+// Release signing: android/key.properties (gitignored) names a keystore and
+// its passwords; CI writes it from secrets. Without it, release builds are
+// signed with the debug key: they install, but Android refuses to update an
+// install that was signed with a different key.
+val keystoreProperties = Properties()
+val keystorePropertiesFile = rootProject.file("key.properties")
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+}
+val hasReleaseKey = keystoreProperties.getProperty("storeFile") != null
 
 android {
     namespace = "com.example.frontend"
@@ -31,23 +45,13 @@ android {
         versionName = flutter.versionName
     }
 
-    // Release signing: android/key.properties (gitignored) names a keystore
-    // and its passwords; CI writes it from secrets. Without it, release builds
-    // are signed with the debug key: they install, but Android refuses to
-    // update an install that was signed with a different key.
-    val keyProps = java.util.Properties().apply {
-        val f = rootProject.file("key.properties")
-        if (f.exists()) f.inputStream().use { load(it) }
-    }
-    val hasReleaseKey = keyProps.getProperty("storeFile") != null
-
     signingConfigs {
         if (hasReleaseKey) {
             create("release") {
-                storeFile = file(keyProps.getProperty("storeFile"))
-                storePassword = keyProps.getProperty("storePassword")
-                keyAlias = keyProps.getProperty("keyAlias")
-                keyPassword = keyProps.getProperty("keyPassword")
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
             }
         }
     }
