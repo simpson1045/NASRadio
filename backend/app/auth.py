@@ -44,7 +44,7 @@ MEDIA_PATH_PREFIXES = (
 
 
 def is_media_request(path, method):
-    return method == "GET" and any(path.startswith(p) for p in MEDIA_PATH_PREFIXES)
+    return method in ("GET", "HEAD") and any(path.startswith(p) for p in MEDIA_PATH_PREFIXES)
 
 _db = None
 

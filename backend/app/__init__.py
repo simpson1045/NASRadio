@@ -127,14 +127,17 @@ def create_app():
         except Exception as e:
             print(f"⚠️ Could not start pipeline reconciler: {e}")
 
-        # Keep the NAS SMB session warm so cold-stat stalls / skip cascades
-        # can't happen after an idle stretch.
-        try:
-            from app.routes import start_smb_keepalive
+        # Keep an SMB session to the library warm so cold-stat stalls / skip
+        # cascades can't happen after an idle stretch. Only for a library on a
+        # network share (the old Windows-host setup); on a local disk it just
+        # reads a file every 20s and stops the drives from ever spinning down.
+        if os.environ.get("NASRADIO_SMB_KEEPALIVE", "").strip().lower() in ("1", "true", "yes", "on"):
+            try:
+                from app.routes import start_smb_keepalive
 
-            start_smb_keepalive(app)
-        except Exception as e:
-            print(f"⚠️ Could not start SMB keepalive: {e}")
+                start_smb_keepalive(app)
+            except Exception as e:
+                print(f"⚠️ Could not start SMB keepalive: {e}")
 
         # Log any pooled DB connection held open for minutes (lock-convoy guard)
         try:

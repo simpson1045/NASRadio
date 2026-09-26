@@ -117,13 +117,19 @@ class Unanalyzable(Exception):
 
 
 def probe_duration(file_path):
+    # A timeout means a busy disk, not a bad file: raise a plain error (500,
+    # retryable) instead of Unanalyzable, or one slow moment parks a good song
+    # forever. The backend's MAX_ANALYSIS_ATTEMPTS still bounds the retries.
     try:
         out = subprocess.run(
             ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
              '-of', 'default=nw=1:nk=1', file_path],
-            capture_output=True, text=True, timeout=30)
+            capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('ffprobe timed out after 60s (disk busy?)')
+    try:
         return float(out.stdout.strip().splitlines()[0])
-    except Exception:
+    except (ValueError, IndexError):
         raise Unanalyzable('ffprobe could not read a duration')
 
 
@@ -145,7 +151,8 @@ def decode_once(file_path):
                  '-c:a', 'pcm_f32le', '-t', str(ANALYZE_WINDOW_SEC), tmp_path],
                 capture_output=True, timeout=DECODE_TIMEOUT_SEC)
         except subprocess.TimeoutExpired:
-            raise Unanalyzable(f'ffmpeg decode timed out after {DECODE_TIMEOUT_SEC}s')
+            # Retryable for the same reason as the probe timeout.
+            raise RuntimeError(f'ffmpeg decode timed out after {DECODE_TIMEOUT_SEC}s')
         if r.returncode != 0 or os.path.getsize(tmp_path) < 1024:
             err = (r.stderr or b'').decode('utf-8', 'replace').strip().splitlines()
             raise Unanalyzable('ffmpeg could not decode it: ' + (err[-1][:160] if err else 'no output'))

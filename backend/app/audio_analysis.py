@@ -550,6 +550,9 @@ def store_analysis(db_url, song_id, analysis):
             )
 
         conn.commit()
+        # Any successful store wipes an old failure record, whichever path
+        # saved it (batch, single-song re-analyse, reconciler).
+        _clear_failure(db_url, song_id)
         return True
     except Exception as e:
         print(f"Error storing analysis for song {song_id}: {e}")
