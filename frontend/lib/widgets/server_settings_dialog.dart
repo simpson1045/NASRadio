@@ -50,6 +50,9 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
+      // Scroll the body when the on-screen keyboard takes the space, instead
+      // of letting the action buttons slide up over the text fields.
+      scrollable: true,
       backgroundColor: const Color(0xFF132549),
       title: const Row(
         children: [
@@ -79,6 +82,7 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                 labelText: 'Local address (LAN)',
                 hintText: 'http://192.168.1.20:5002',
                 helperText: 'Your server\'s LAN IP or hostname, port 5002',
+                helperMaxLines: 2,
                 prefixIcon: Icon(Icons.home_outlined),
                 border: OutlineInputBorder(),
               ),
@@ -93,6 +97,7 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
                 hintText: 'https://music.example.com',
                 helperText:
                     'Public HTTPS address for streaming away from home',
+                helperMaxLines: 2,
                 prefixIcon: Icon(Icons.public),
                 border: OutlineInputBorder(),
               ),

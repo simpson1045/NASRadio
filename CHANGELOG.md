@@ -1,4 +1,4 @@
-## 1.4.16 - 2026-09-26 (build 148)
+## 1.4.16 - 2026-09-26 (build 149)
 ReplayGain actually works, and casts can have their queue cleared.
 
 **Playback**
@@ -12,6 +12,8 @@ ReplayGain actually works, and casts can have their queue cleared.
 - Quiet tracks can now be turned up a little on desktop (up to about +2 dB,
   never past -1 dBTP on the loudest sample); phones can only turn down.
 - ReplayGain is not applied while casting yet.
+- On phones, the server-address dialog's buttons no longer slide over the
+  text field when the keyboard opens (build 149).
 
 **Cast**
 - Clear everything after the current song without stopping it
