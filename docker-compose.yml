@@ -1,7 +1,7 @@
 # NASRadio - self-hosted stack.
 #
 #   cp .env.example .env      # set MUSIC_DIR (and anything else you want)
-#   docker compose up -d      # Postgres + backend
+#   docker compose up -d      # Postgres + backend (first start can take a few minutes)
 #   docker compose --profile analysis up -d    # ... plus the Essentia + transcode sidecars
 #
 # Then open the app, point it at http://<this host>:5002, and follow the
@@ -14,7 +14,6 @@
 services:
   postgres:
     image: postgres:17
-    container_name: nasradio-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-nasradio}
@@ -27,14 +26,15 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      # First start initializes the database; on NAS disks that can take well
+      # over a minute (the smoke test measured 85 s), so don't count it.
+      start_period: 180s
     # Uncomment to reach Postgres from the host (psql, DBeaver, backups):
     # ports:
     #   - "5432:5432"
 
   backend:
     build: ./backend
-    image: nasradio-backend:latest
-    container_name: nasradio-backend
     restart: unless-stopped
     depends_on:
       postgres:
@@ -70,8 +70,6 @@ services:
   essentia:
     profiles: ["analysis"]
     build: ./backend/docker/essentia
-    image: nasradio-essentia:latest
-    container_name: nasradio-essentia
     restart: unless-stopped
     volumes:
       - "${MUSIC_DIR:?Set MUSIC_DIR in .env to your music folder}:/mnt/music:ro"
@@ -90,8 +88,6 @@ services:
   transcode:
     profiles: ["analysis"]
     build: ./backend/docker/transcode
-    image: nasradio-transcode:latest
-    container_name: nasradio-transcode
     restart: unless-stopped
     depends_on:
       postgres:

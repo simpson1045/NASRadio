@@ -62,6 +62,14 @@ class MediaKitEngine implements PlaybackEngine {
   // index; the engine only needs to track the lookahead it's holding.
   EngineItem? _next;
 
+  // Output = master volume x current item's ReplayGain. mpv allows volume up
+  // to its volume-max (130 by default), so a quiet track can get ~+2.3 dB.
+  double _master = 1.0;
+  double _gain = 1.0;
+  static const double _maxOut = 1.3;
+  Future<void> _applyOut() =>
+      _player.setVolume((_master * _gain).clamp(0.0, _maxOut) * 100.0);
+
   // We track the playlist index media_kit reports so we can tell an
   // "advanced 0->1" transition apart from index churn during our own
   // remove/add reconciliation (which we suppress via _reconciling).
@@ -97,6 +105,12 @@ class MediaKitEngine implements PlaybackEngine {
         // next is now playing. The held lookahead is now the current
         // track; clear it so the app hands us a fresh one via setNext.
         _lastIndex = idx;
+        // Its ReplayGain first, before anything else runs.
+        final g = _next?.gain;
+        if (g != null && g != _gain) {
+          _gain = g;
+          _applyOut();
+        }
         _next = null;
         _advancedController.add(null);
       } else {
@@ -136,6 +150,9 @@ class MediaKitEngine implements PlaybackEngine {
       _next = null;
       _lastIndex = 0;
       final resuming = startPosition > Duration.zero;
+      // Level for THIS track before a single sample plays.
+      _gain = item.gain;
+      await _applyOut();
       // Hard reset to a single-item playlist. PlaylistMode.none so
       // media_kit never loops or decides advancement on its own.
       //
@@ -230,8 +247,16 @@ class MediaKitEngine implements PlaybackEngine {
   }
 
   @override
-  Future<void> setVolume(double volume) =>
-      _player.setVolume((volume.clamp(0.0, 1.0)) * 100.0); // media_kit: 0-100
+  Future<void> setVolume(double volume) {
+    _master = volume.clamp(0.0, 1.0);
+    return _applyOut();
+  }
+
+  @override
+  Future<void> setCurrentGain(double gain) {
+    _gain = gain;
+    return _applyOut();
+  }
 
   @override
   Future<void> setSpeed(double speed) async {

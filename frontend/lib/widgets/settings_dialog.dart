@@ -1177,14 +1177,33 @@ class _SettingsDialogState extends State<SettingsDialog>
               });
             },
           ),
-          if (widget.audioPlayerService.replayGainEnabled)
+          if (widget.audioPlayerService.replayGainEnabled) ...[
+            const SizedBox(height: 12),
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(value: 'quiet', label: Text('Quiet'), tooltip: '-16 LUFS'),
+                ButtonSegment(value: 'normal', label: Text('Normal'), tooltip: '-14 LUFS (Spotify, YouTube)'),
+                ButtonSegment(value: 'loud', label: Text('Loud'), tooltip: '-11 LUFS'),
+              ],
+              selected: {widget.audioPlayerService.replayGainPreset},
+              emptySelectionAllowed: true,
+              onSelectionChanged: (s) {
+                if (s.isEmpty) return;
+                setState(() {
+                  widget.audioPlayerService.setReplayGainPreset(s.first);
+                });
+              },
+            ),
             const Padding(
               padding: EdgeInsets.only(top: 8),
               child: Text(
-                'Requires audio analysis. Songs without analysis play at normal volume.',
+                'Loud only turns down tracks mastered hotter than most; Quiet evens out more but '
+                'plays everything softer. Needs audio analysis; unanalyzed songs play unchanged. '
+                'Not applied while casting.',
                 style: TextStyle(fontSize: 11, color: Colors.grey),
               ),
             ),
+          ],
           if (Platform.isAndroid || Platform.isIOS) ...[
             const SizedBox(height: 32),
             _buildSectionHeader('Stream Quality'),

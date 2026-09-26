@@ -54,6 +54,13 @@ class JustAudioEngine implements PlaybackEngine {
   /// [loadCurrent] and after [stop].
   ja.ConcatenatingAudioSource? _source;
 
+  // Output = master volume x current item's ReplayGain. ExoPlayer/AVPlayer
+  // cap volume at 1.0, so on mobile ReplayGain can only turn tracks down.
+  double _master = 1.0;
+  double _gain = 1.0;
+  Future<void> _applyOut() =>
+      _player.setVolume((_master * _gain).clamp(0.0, 1.0));
+
   @override
   String get tag => 'justaudio';
 
@@ -101,6 +108,12 @@ class JustAudioEngine implements PlaybackEngine {
         // now playing. The held lookahead becomes the current track; clear
         // it so the app hands us a fresh one via setNext.
         _lastIndex = idx;
+        // Its ReplayGain first, before anything else runs.
+        final g = _next?.gain;
+        if (g != null && g != _gain) {
+          _gain = g;
+          _applyOut();
+        }
         _next = null;
         _advancedController.add(null);
       } else {
@@ -159,6 +172,9 @@ class JustAudioEngine implements PlaybackEngine {
     try {
       _next = null;
       _lastIndex = 0;
+      // Level for THIS track before a single sample plays.
+      _gain = item.gain;
+      await _applyOut();
       // Hard reset to a single-item source. setAudioSource resolves once the
       // source is prepared; initialPosition seeks the start (resume).
       _source = ja.ConcatenatingAudioSource(
@@ -257,8 +273,16 @@ class JustAudioEngine implements PlaybackEngine {
   }
 
   @override
-  Future<void> setVolume(double volume) =>
-      _player.setVolume(volume.clamp(0.0, 1.0)); // just_audio: 0.0 - 1.0
+  Future<void> setVolume(double volume) {
+    _master = volume.clamp(0.0, 1.0);
+    return _applyOut();
+  }
+
+  @override
+  Future<void> setCurrentGain(double gain) {
+    _gain = gain;
+    return _applyOut();
+  }
 
   @override
   Future<void> setSpeed(double speed) async {

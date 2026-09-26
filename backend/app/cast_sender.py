@@ -1513,11 +1513,54 @@ def _live_session_or_error(data):
     return s, None
 
 
+def _clear_upcoming(s):
+    """Drop everything after the current track on a queue we own. The
+    current song keeps playing; the TV is told there is nothing next.
+    Returns how many tracks were removed."""
+    ids = [t["id"] for t in s.queue]
+    if s.current_song_id in ids:
+        keep = ids.index(s.current_song_id) + 1
+    else:
+        keep = len(ids)  # don't know where the TV is - remove nothing
+    removed = len(s.queue) - keep
+    del s.queue[keep:]
+    s.send_custom({"type": "UP_NEXT", "items": []})
+    return removed
+
+
+@cast_api.route("/api/cast/queue/clear", methods=["POST"])
+def cast_queue_clear():
+    """Remove every upcoming track from the live cast queue. The song that
+    is playing now keeps playing and the cast stays up; queue something
+    new afterwards, or use POST /api/cast/queue with "replace": true to
+    clear and add in one call."""
+    data = request.get_json(silent=True) or {}
+    s, err = _live_session_or_error(data)
+    if err:
+        return err
+    if s.joined:
+        return jsonify({"error": "this cast's queue belongs to the phone that started it; "
+                        "clear it from the phone, or start a new cast with /api/cast/play",
+                        "mode": "guest"}), 409
+    if not s.queue:
+        return jsonify({"error": "no song queue on this cast (station or idle?)"}), 409
+    removed = _clear_upcoming(s)
+    _save_state(s)
+    print(f"📺 [cast-sender] {(g.user or {}).get('username') or 'someone'} cleared "
+          f"{removed} upcoming track(s) on {s.host}")
+    return jsonify({"ok": True, "removed": removed, "queue_length": len(s.queue)})
+
+
 @cast_api.route("/api/cast/queue", methods=["POST"])
 def cast_queue():
     """Add a track or album to the live cast queue, optionally as the
     very next item ("play Cabo Wabo next"). The TV shows an attribution
-    toast: "«5150» added to the queue by Claude"."""
+    toast: "«5150» added to the queue by Claude".
+
+    Options: "shuffle": true shuffles what is being added; "replace": true
+    first clears everything after the current song (the current song keeps
+    playing), so {"query": "80's Pop", "shuffle": true, "replace": true}
+    means "after this song, play 80's Pop shuffled instead of what was queued"."""
     data = request.get_json(silent=True) or {}
     s, err = _live_session_or_error(data)
     if err:
@@ -1539,12 +1582,27 @@ def cast_queue():
         return jsonify({"error": "stations can't sit in a queue — use "
                         "/api/cast/play to switch to one"}), 400
 
-    songs = resolved["songs"]
+    songs = list(resolved["songs"])
     if resolved["kind"] == "song":
         songs = songs[:1]  # just the matched track, not its album tail
+    shuffle = bool(data.get("shuffle"))
+    replace = bool(data.get("replace"))
+    if shuffle:
+        random.shuffle(songs)
 
     if s.joined:
+        if replace:
+            return jsonify({"error": "can't replace the queue of a cast the phone owns; "
+                            "queue without \"replace\", or start a new cast with /api/cast/play",
+                            "mode": "guest"}), 409
         return _guest_queue(s, songs, resolved["kind"], play_next, by)
+
+    removed = 0
+    if replace:
+        removed = _clear_upcoming(s)
+        # What follows is now this source - status/queue report it.
+        s.source, s.shuffled = resolved.get("source"), shuffle
+        s.label, s.kind = resolved["label"], resolved["kind"]
 
     ids = [t["id"] for t in s.queue]
     try:
@@ -1576,9 +1634,12 @@ def cast_queue():
                            f"{songs[0]['artist_id']}?token={token}"),
     })
     print(f"📺 [cast-sender] {by} queued {title} "
-          f"({'next' if play_next else 'end of queue'}) on {s.host}")
+          f"({'next' if play_next else 'end of queue'}"
+          f"{', shuffled' if shuffle else ''}"
+          f"{f', replaced {removed} upcoming' if replace else ''}) on {s.host}")
     return jsonify({"ok": True, "added": title, "tracks": len(songs),
                     "position": "next" if play_next else "end",
+                    "shuffled": shuffle, "replaced": removed if replace else None,
                     "queue_length": len(s.queue), "by": by})
 
 

@@ -1,3 +1,29 @@
+## 1.4.16 - 2026-09-26 (build 148)
+ReplayGain actually works, and casts can have their queue cleared.
+
+**Playback**
+- ReplayGain no longer blasts a loud song for a second and then drops it. Each
+  track now carries its own level into the player, which applies it the
+  moment the track starts - on a fresh play, on a gapless handoff and on both
+  sides of a crossfade - instead of correcting the volume after the fact.
+- New target presets under Settings, Playback: Quiet (-16 LUFS), Normal (-14)
+  and Loud (-11, the default). Loud only turns down tracks mastered hotter
+  than most of the library, so nothing ends up quieter than it was.
+- Quiet tracks can now be turned up a little on desktop (up to about +2 dB,
+  never past -1 dBTP on the loudest sample); phones can only turn down.
+- ReplayGain is not applied while casting yet.
+
+**Cast**
+- Clear everything after the current song without stopping it
+  (`POST /api/cast/queue/clear`), and queue with `shuffle` and `replace`,
+  so "after this song, play this playlist shuffled instead" is one call.
+- Casts no longer stall mid-queue: the cause was a database lock pile-up
+  (see 1.4.15 server notes), not the TV.
+
+**Server**
+- The Docker compose file no longer hardcodes container and image names, and
+  gives Postgres time to initialize on its first start.
+
 ## 1.4.15 - 2026-09-20 (build 147)
 Long titles scroll on the TV, and the letter g keeps its tail.
 

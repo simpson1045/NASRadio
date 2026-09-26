@@ -67,7 +67,13 @@ abstract class PlaybackEngine {
   /// Stop and clear both slots.
   Future<void> stop();
 
-  Future<void> setVolume(double volume); // 0.0 - 1.0
+  /// Master volume 0.0 - 1.0. What comes out is master x the current item's
+  /// [EngineItem.gain]; callers never fold ReplayGain into this value.
+  Future<void> setVolume(double volume);
+
+  /// Replace the gain of the item in slot 0 (ReplayGain toggled or its
+  /// target changed while a track plays).
+  Future<void> setCurrentGain(double gain);
   Future<void> setSpeed(double speed);
   Future<void> setPitchCorrectionEnabled(bool enabled);
 
@@ -124,6 +130,12 @@ class EngineItem {
   final String? album;
   final String? artUri;
 
+  /// ReplayGain for this track as a linear multiplier (1.0 = unchanged).
+  /// The engine applies it the instant the track becomes current - on load,
+  /// on a gapless roll - so a loud song never plays a second at the previous
+  /// song's level. Not part of equality (see below).
+  final double gain;
+
   const EngineItem({
     required this.id,
     required this.url,
@@ -133,6 +145,7 @@ class EngineItem {
     this.artist,
     this.album,
     this.artUri,
+    this.gain = 1.0,
   });
 
   // Equality/hashCode are intentionally keyed ONLY on (id, url): two items

@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show Platform;
 import 'app_logger.dart';
-import 'dart:math' show pi, cos, sin, pow;
+import 'dart:math' show pi, cos, sin, pow, min, log, ln10;
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:media_kit/media_kit.dart';
@@ -373,6 +373,7 @@ class AudioPlayerService extends ChangeNotifier {
       artist: song.artistName,
       album: song.albumTitle,
       artUri: song.isPodcast ? _podcastArtworkUrl : null,
+      gain: _gainFor(song),
     );
   }
 
@@ -557,12 +558,15 @@ class AudioPlayerService extends ChangeNotifier {
   // - LUFS math:    gain_dB = target_LUFS - actual_LUFS; linear = 10^(gain_dB/20)
   // - Legacy math:  gain_linear = target_legacy / actual_legacy
   bool _replayGainEnabled = true;
-  // LUFS target — Spotify uses -14, Apple Music -16, YouTube -14, broadcast -23.
-  // -14 is the practical default for streaming-style playback.
-  double _targetLufs = -14.0;
-  // Legacy target — only used when a song has no LUFS yet (pre-upgrade
-  // analyses). Matches the original 5500.0 default simpson1045 was tuned to.
-  double _targetLoudness = 5500.0;
+  // LUFS target. Presets: Quiet -16, Normal -14 (Spotify/YouTube), Loud -11.
+  // Default Loud: it sits at this library's median (-11.1 LUFS), so only the
+  // loud masters get pulled down and nothing ends up quieter than it was.
+  static const Map<String, double> replayGainPresets = {
+    'quiet': -16.0,
+    'normal': -14.0,
+    'loud': -11.0,
+  };
+  double _targetLufs = -11.0;
 
   // Mobile data compression / auto quality switching
   String _streamQuality = 'lossless';
@@ -696,7 +700,11 @@ class AudioPlayerService extends ChangeNotifier {
   Duration get crossfadeDuration => _crossfadeDuration;
   double get playbackSpeed => _playbackSpeed;
   bool get replayGainEnabled => _replayGainEnabled;
-  double get targetLoudness => _targetLoudness;
+  double get targetLufs => _targetLufs;
+  String get replayGainPreset => replayGainPresets.entries
+      .firstWhere((e) => e.value == _targetLufs,
+          orElse: () => const MapEntry('custom', 0))
+      .key;
   bool get pitchCorrectionEnabled => _pitchCorrectionEnabled;
   String get streamQuality => _streamQuality;
   String get qualityPreference => _qualityPreference;
@@ -1095,7 +1103,8 @@ class AudioPlayerService extends ChangeNotifier {
       return;
     }
     final desired = _engineItemFor(_queue[ni]);
-    if (_active.nextItem == desired) return; // already loaded (==, on id+url)
+    // Already loaded (==, on id+url) - unless its ReplayGain changed.
+    if (_active.nextItem == desired && _active.nextItem!.gain == desired.gain) return;
     await _active.setNext(desired);
   }
 
@@ -2998,7 +3007,7 @@ class AudioPlayerService extends ChangeNotifier {
   Future<void> _loadReplayGainSettings() async {
     final prefs = await SharedPreferences.getInstance();
     _replayGainEnabled = prefs.getBool('replaygain_enabled') ?? true;
-    _targetLoudness = prefs.getDouble('replaygain_target') ?? 5500.0;
+    _targetLufs = prefs.getDouble('replaygain_target_lufs') ?? -11.0;
   }
 
   Future<void> setReplayGainEnabled(bool enabled) async {
@@ -3006,74 +3015,61 @@ class AudioPlayerService extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('replaygain_enabled', enabled);
     _applyVolume(); // Re-apply volume with new setting
+    _refreshLookahead(); // the pre-buffered next track carries the old gain
     notifyListeners();
   }
 
-  Future<void> setTargetLoudness(double target) async {
-    _targetLoudness = target.clamp(3000.0, 8000.0);
+  Future<void> setReplayGainPreset(String preset) async {
+    final lufs = replayGainPresets[preset];
+    if (lufs == null) return;
+    _targetLufs = lufs;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble('replaygain_target', _targetLoudness);
+    await prefs.setDouble('replaygain_target_lufs', _targetLufs);
     _applyVolume(); // Re-apply volume with new setting
+    _refreshLookahead();
     notifyListeners();
   }
 
-  // Calculate effective volume based on ReplayGain.
-  //
-  // Prefers EBU R128 LUFS when available (post-2026-05-25 analyses).
-  // Falls back to legacy Steven's-power-law math for songs analyzed
-  // before the upgrade — the resume sweep backfills LUFS over time,
-  // so the legacy path eventually goes away.
-  double _calculateEffectiveVolume() {
-    if (!_replayGainEnabled || _currentSong == null) {
-      return _volume;
+  /// ReplayGain for one song as a linear multiplier, from its EBU R128
+  /// integrated loudness: gain_dB = target_LUFS - song_LUFS. Boosts are
+  /// capped so the true peak stays under -1 dBTP (no clipping) and at +6 dB;
+  /// cuts at -12 dB. The engine adds its own ceiling (mobile players can't
+  /// go above 1.0, mpv on desktop can reach 1.3). Stations and podcasts,
+  /// and songs without an analysis, play unchanged.
+  double _gainFor(Song? song) {
+    if (!_replayGainEnabled || song == null || song.isStation || song.isPodcast) {
+      return 1.0;
     }
-
-    final lufs = _currentSong!.integratedLoudnessLufs;
-    if (lufs != null && lufs.isFinite && lufs < 0) {
-      // Real EBU R128 math: difference in LUFS == difference in dB
-      // (the LUFS scale is calibrated to a 1 dB step). A song at
-      // -10 LUFS played at -14 target needs -4 dB of gain.
-      final gainDb = _targetLufs - lufs;
-      // Convert dB to linear scale. 0 dB = 1.0, -6 dB ≈ 0.5, +6 dB ≈ 2.0.
-      double linear = pow(10, gainDb / 20.0).toDouble();
-      // Cap at 1.0 (no boost — would clip on already-hot tracks) and
-      // floor at 0.3 (don't make anything inaudible if a song is
-      // measured wildly loud by the analyzer).
-      linear = linear.clamp(0.3, 1.0);
-      return _volume * linear;
+    final lufs = song.integratedLoudnessLufs;
+    if (lufs == null || !lufs.isFinite || lufs >= 0 || lufs < -60) {
+      return 1.0; // no usable measurement (or digital silence)
     }
-
-    // Legacy path: Steven's-power-law ratio. Same math as before the
-    // LUFS upgrade. Kept verbatim so unscored-yet songs sound the same
-    // as they did pre-upgrade.
-    final loudness = _currentSong!.loudness;
-    if (loudness == null || loudness <= 0) {
-      return _volume; // No loudness data at all — use raw volume.
+    double gainDb = _targetLufs - lufs;
+    final peak = song.truePeakDbfs;
+    if (gainDb > 0 && peak != null && peak.isFinite) {
+      gainDb = min(gainDb, -1.0 - peak); // keep the loudest sample under -1 dBTP
+      if (gainDb < 0) gainDb = 0; // already hot: don't cut a quiet-but-peaky track
     }
-    double gain = _targetLoudness / loudness;
-    gain = gain.clamp(0.3, 1.0);
-    return _volume * gain;
+    gainDb = gainDb.clamp(-12.0, 6.0);
+    return pow(10, gainDb / 20.0).toDouble();
   }
 
-  // Apply volume to the active deck (with ReplayGain adjustment). The engine
-  // normalizes the 0.0-1.0 value to the backend scale (media_kit 0-100).
-  void _applyVolume() {
-    final effectiveVolume = _calculateEffectiveVolume();
-    _active.setVolume(effectiveVolume);
+  /// Master volume only. ReplayGain is applied per track by the engine
+  /// (EngineItem.gain), so crossfades and gapless rolls always use the
+  /// incoming song's own level.
+  double _calculateEffectiveVolume() => _volume;
 
+  // Apply master volume + the current song's gain to the active deck.
+  void _applyVolume() {
+    final gain = _gainFor(_currentSong);
+    _active.setCurrentGain(gain);
+    _active.setVolume(_volume);
     if (_replayGainEnabled && _currentSong != null) {
       final lufs = _currentSong!.integratedLoudnessLufs;
-      if (lufs != null) {
-        final gainDb = _targetLufs - lufs;
-        print(
-          '🔊 ReplayGain[LUFS]: ${_currentSong!.title} - lufs: ${lufs.toStringAsFixed(2)}, gain: ${gainDb.toStringAsFixed(2)} dB, effective vol: ${(effectiveVolume * 100).toStringAsFixed(0)}%',
-        );
-      } else if (_currentSong!.loudness != null) {
-        final gain = _targetLoudness / _currentSong!.loudness!;
-        print(
-          '🔊 ReplayGain[legacy]: ${_currentSong!.title} - loudness: ${_currentSong!.loudness}, gain: ${gain.toStringAsFixed(2)}, effective vol: ${(effectiveVolume * 100).toStringAsFixed(0)}%',
-        );
-      }
+      print('🔊 ReplayGain: ${_currentSong!.title} - '
+          '${lufs == null ? 'no analysis' : '${lufs.toStringAsFixed(1)} LUFS'} → '
+          '${(20 * log(gain) / ln10).toStringAsFixed(1)} dB (target ${_targetLufs.toStringAsFixed(0)} LUFS), '
+          'master ${(_volume * 100).toStringAsFixed(0)}%');
     }
   }
 
