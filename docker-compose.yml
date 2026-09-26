@@ -13,6 +13,10 @@
 
 services:
   postgres:
+    # Plain Docker runtime. Hosts whose Docker defaults to the NVIDIA runtime
+    # (TrueNAS with a GPU) would otherwise open the GPU on every container start,
+    # and a driver bug there panicked the whole box. Nothing here uses the GPU.
+    runtime: runc
     image: postgres:17
     restart: unless-stopped
     environment:
@@ -34,6 +38,7 @@ services:
     #   - "5432:5432"
 
   backend:
+    runtime: runc
     build: ./backend
     restart: unless-stopped
     depends_on:
@@ -68,6 +73,7 @@ services:
   # Essentia: genres, mood, BPM, key and ReplayGain per track. x86-64 only.
   # Model files are downloaded from Essentia's public model zoo at build time.
   essentia:
+    runtime: runc
     profiles: ["analysis"]
     build: ./backend/docker/essentia
     restart: unless-stopped
@@ -86,6 +92,7 @@ services:
   # Transcode: pre-bakes AAC copies for mobile playback into <music>/.transcode_cache.
   # Without it the backend transcodes on demand with ffmpeg.
   transcode:
+    runtime: runc
     profiles: ["analysis"]
     build: ./backend/docker/transcode
     restart: unless-stopped
