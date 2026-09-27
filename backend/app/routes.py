@@ -16387,17 +16387,18 @@ def recognize_song():
 
             track = result.get("track")
             if track:
-                # Extract album from sections metadata
+                # Album and release year live in the song section's metadata
+                # ({"title": "Album"/"Released", "text": ...}).
                 album = ""
+                year = ""
                 try:
-                    sections = track.get("sections", [])
-                    for section in sections:
-                        for meta in section.get("metadata", []):
-                            if meta.get("title", "").lower() == "album":
+                    for section in track.get("sections", []):
+                        for meta in section.get("metadata", []) or []:
+                            key = meta.get("title", "").lower()
+                            if key == "album" and not album:
                                 album = meta.get("text", "")
-                                break
-                        if album:
-                            break
+                            elif key == "released" and not year:
+                                year = meta.get("text", "")
                 except Exception:
                     pass
 
@@ -16406,6 +16407,7 @@ def recognize_song():
                     "title": track.get("title", "Unknown"),
                     "artist": track.get("subtitle", "Unknown Artist"),
                     "album": album,
+                    "year": year,
                     "genre": track.get("genres", {}).get("primary", ""),
                     "cover_url": track.get("images", {}).get("coverart", ""),
                     "shazam_url": track.get("url", ""),

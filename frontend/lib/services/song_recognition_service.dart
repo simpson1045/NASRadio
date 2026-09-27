@@ -15,6 +15,7 @@ class SongRecognitionResult {
   final String source; // "shazam" or "acoustid"
   final String? genre;
   final String? coverUrl;
+  final String? year; // release year from Shazam, e.g. "1977"
 
   SongRecognitionResult({
     required this.title,
@@ -23,6 +24,7 @@ class SongRecognitionResult {
     required this.source,
     this.genre,
     this.coverUrl,
+    this.year,
   });
 
   String get prowlarrQuery => '$artist $album';
@@ -205,6 +207,7 @@ class SongRecognitionService {
       source: data['source'] ?? 'unknown',
       genre: data['genre'],
       coverUrl: data['cover_url'],
+      year: (data['year'] as String?)?.trim().isNotEmpty == true ? data['year'] as String : null,
     );
   }
 

@@ -359,10 +359,10 @@ class _SongRecognitionSheetState extends State<_SongRecognitionSheet> {
           style: const TextStyle(color: Color(0xFF00d4ff), fontSize: 16),
           textAlign: TextAlign.center,
         ),
-        if (r.album.isNotEmpty) ...[
+        if (r.album.isNotEmpty || r.year != null) ...[
           const SizedBox(height: 2),
           Text(
-            r.album,
+            [if (r.album.isNotEmpty) r.album, if (r.year != null) r.year!].join(' · '),
             style: TextStyle(color: Colors.grey[400], fontSize: 14),
             textAlign: TextAlign.center,
           ),

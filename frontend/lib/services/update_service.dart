@@ -123,40 +123,70 @@ class UpdateService {
       ext = '.apk';
     }
 
-    final request = http.Request(
-      'GET',
-      Uri.parse('${ApiService.baseHost}/api/update/download/$platform'),
-    );
+    final uri = Uri.parse('${ApiService.baseHost}/api/update/download/$platform');
+    final dir = await getTemporaryDirectory();
+    final filePath = '${dir.path}/nasradio-update$ext';
+    final file = File(filePath);
 
-    final client = http.Client();
-    try {
-      final response = await client.send(request);
-      final contentLength = response.contentLength ?? 0;
-
-      final dir = await getTemporaryDirectory();
-      final filePath = '${dir.path}/nasradio-update$ext';
-      final file = File(filePath);
-      final sink = file.openWrite();
-
-      var received = 0;
-      await for (final chunk in response.stream) {
-        sink.add(chunk);
-        received += chunk.length;
-        if (contentLength > 0) {
-          onProgress(received / contentLength);
+    // Android drops an app's connection when it goes to the background, so a
+    // cut is normal, not fatal: resume with an HTTP Range request from what's
+    // already on disk (the server answers 206), retrying for ~2 minutes. The
+    // partial file survives a failure, so the banner's Retry resumes too.
+    const maxAttempts = 24;
+    Object? lastError;
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+      var have = (_partialTotal > 0 && await file.exists()) ? await file.length() : 0;
+      final request = http.Request('GET', uri);
+      if (have > 0) request.headers['Range'] = 'bytes=$have-';
+      final client = http.Client();
+      try {
+        final response = await client.send(request).timeout(const Duration(seconds: 20));
+        if (response.statusCode == 200) {
+          have = 0; // server sent the whole file: start over
+          _partialTotal = response.contentLength ?? 0;
+        } else if (response.statusCode == 416) {
+          _partialTotal = 0; // our partial doesn't fit this file any more
+          if (await file.exists()) await file.delete();
+          continue;
+        } else if (response.statusCode != 206) {
+          throw Exception('HTTP ${response.statusCode}');
         }
-      }
-      await sink.close();
+        final total = _partialTotal;
 
-      log.info('Update downloaded: $filePath (${(received / 1024 / 1024).toStringAsFixed(1)} MB)');
-      return filePath;
-    } catch (e) {
-      log.error('Update download failed: $e');
-      rethrow;
-    } finally {
-      client.close();
+        final sink = file.openWrite(mode: have > 0 ? FileMode.append : FileMode.write);
+        var received = have;
+        try {
+          // A backgrounded app's socket can stall instead of erroring.
+          await for (final chunk in response.stream.timeout(const Duration(seconds: 30))) {
+            sink.add(chunk);
+            received += chunk.length;
+            if (total > 0) onProgress(received / total);
+          }
+        } finally {
+          await sink.close();
+        }
+        if (total > 0 && received < total) {
+          throw Exception('connection closed at $received of $total bytes');
+        }
+
+        _partialTotal = 0;
+        log.info('Update downloaded: $filePath (${(received / 1024 / 1024).toStringAsFixed(1)} MB)');
+        return filePath;
+      } catch (e) {
+        lastError = e;
+        log.warning('Update download interrupted (attempt $attempt/$maxAttempts): $e');
+        if (attempt < maxAttempts) await Future.delayed(const Duration(seconds: 5));
+      } finally {
+        client.close();
+      }
     }
+    log.error('Update download failed: $lastError');
+    throw lastError ?? Exception('Update download failed');
   }
+
+  /// Size of the update file being downloaded; non-zero while a partial file
+  /// on disk can be resumed.
+  static int _partialTotal = 0;
 
   /// Apply the downloaded update.
   /// - Android: opens the APK with the system installer
