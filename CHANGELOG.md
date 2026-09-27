@@ -1,4 +1,4 @@
-## 1.4.16 - 2026-09-26 (build 152)
+## 1.4.16 - 2026-09-26 (build 153)
 ReplayGain actually works, and casts can have their queue cleared.
 
 **Song recognition**
@@ -12,6 +12,12 @@ ReplayGain actually works, and casts can have their queue cleared.
 - "Listen Now" only appears when the library really has that song (same
   title and at least one of the same artists). It used to offer whatever the
   search ranked first, like "Black Rose" for ROSÉ's "APT.".
+
+**Small fixes**
+- The update banner shows the build number, and the download percentage
+  where a tiny spinner used to look like a stray comma.
+- Prowlarr search: the "RuTracker results hidden, search anyway?" button
+  wraps on a phone instead of running off the edge.
 
 **Playback**
 - ReplayGain no longer blasts a loud song for a second and then drops it. Each

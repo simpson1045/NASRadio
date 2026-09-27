@@ -255,6 +255,6 @@ class SongRecognitionService {
       ticker.cancel();
       await cancelRecording();
     }
-    throw lastError ?? Exception('Could not identify the song after ${maxSeconds}s');
+    throw lastError; // the loop only exits here after a failed attempt
   }
 }

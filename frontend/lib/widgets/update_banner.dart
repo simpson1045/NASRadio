@@ -101,9 +101,11 @@ class _UpdateBannerState extends State<UpdateBanner> {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
+                  // Build number too: a same-version rebuild (1.4.16 build
+                  // 149 -> 150) otherwise reads as the version you already have.
                   _state == _UpdateState.ready
-                      ? 'Update v${widget.info.version} ready to install'
-                      : 'Update v${widget.info.version} available',
+                      ? 'v${widget.info.version} (build ${widget.info.buildNumber}) ready to install'
+                      : 'v${widget.info.version} (build ${widget.info.buildNumber}) available',
                   style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
                 ),
               ),
@@ -182,9 +184,11 @@ class _UpdateBannerState extends State<UpdateBanner> {
           ),
         );
       case _UpdateState.downloading:
-        return const SizedBox(
-          width: 20, height: 20,
-          child: CircularProgressIndicator(strokeWidth: 2),
+        // The bar below already animates; a 20px spinner here just read as a
+        // stray comma. Show the number instead.
+        return Text(
+          '${(_progress * 100).toStringAsFixed(0)}%',
+          style: const TextStyle(fontSize: 12, color: Color(0xFF00D4FF), fontWeight: FontWeight.w600),
         );
       case _UpdateState.ready:
         return ElevatedButton.icon(

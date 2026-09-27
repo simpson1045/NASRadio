@@ -934,11 +934,16 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                             ] else ...[
                               const Icon(Icons.travel_explore, size: 16, color: Color(0xFF00d4ff)),
                               const SizedBox(width: 8),
-                              Text(
-                                _rutrackerFilteredCount > 0
-                                    ? '$_rutrackerFilteredCount RuTracker result${_rutrackerFilteredCount == 1 ? '' : 's'} hidden — search anyway?'
-                                    : 'Also search RuTracker',
-                                style: const TextStyle(color: Color(0xFF00d4ff), fontSize: 13, fontWeight: FontWeight.w500),
+                              // Flexible so the long message wraps inside the
+                              // button on a phone instead of running off the edge.
+                              Flexible(
+                                child: Text(
+                                  _rutrackerFilteredCount > 0
+                                      ? '$_rutrackerFilteredCount RuTracker result${_rutrackerFilteredCount == 1 ? '' : 's'} hidden — search anyway?'
+                                      : 'Also search RuTracker',
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(color: Color(0xFF00d4ff), fontSize: 13, fontWeight: FontWeight.w500),
+                                ),
                               ),
                               const SizedBox(width: 4),
                               Text(
