@@ -1,4 +1,4 @@
-## 1.4.16 - 2026-09-26 (build 150)
+## 1.4.16 - 2026-09-26 (build 151)
 ReplayGain actually works, and casts can have their queue cleared.
 
 **Song recognition**
@@ -8,6 +8,9 @@ ReplayGain actually works, and casts can have their queue cleared.
   noisy rooms almost never matched.
 - Records from the phone's unprocessed mic (voice-recognition mic as the
   fallback), so voice noise-cancelling no longer strips out the music.
+- "Listen Now" only appears when the library really has that song (same
+  title and at least one of the same artists). It used to offer whatever the
+  search ranked first, like "Black Rose" for ROSÉ's "APT.".
 
 **Playback**
 - ReplayGain no longer blasts a loud song for a second and then drops it. Each

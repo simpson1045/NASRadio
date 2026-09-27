@@ -151,27 +151,56 @@ class _SongRecognitionSheetState extends State<_SongRecognitionSheet> {
           ?.map((s) => Song.fromJson(s))
           .toList() ?? [];
 
-      if (songs.isNotEmpty && mounted) {
-        // Find the best match — exact title match preferred
-        final titleLower = result.title.toLowerCase();
-        final artistLower = result.artist.toLowerCase();
-        Song? bestMatch;
-        for (final song in songs) {
-          if (song.title.toLowerCase() == titleLower &&
-              song.artistName.toLowerCase() == artistLower) {
-            bestMatch = song;
-            break;
-          }
-        }
-        bestMatch ??= songs.first;
+      // Only offer a song that really is the one Shazam heard: same title
+      // (ignoring accents, punctuation, "(Remastered)"/"feat." tails) AND at
+      // least one credited artist in common. Search is fuzzy — "ROSÉ" alone
+      // pulled up "Black Rose" — so no confident match means no Listen Now.
+      final wantTitle = _norm(_stripTail(result.title));
+      final wantArtists = _artists(result.artist);
+      final matches = songs.where((s) {
+        if (_norm(_stripTail(s.title)) != wantTitle) return false;
+        final have = _artists(s.artistName);
+        return wantArtists.any(have.contains);
+      }).toList();
 
+      if (matches.isNotEmpty && mounted) {
         setState(() {
-          _libraryMatch = bestMatch;
-          _libraryMatches = songs;
+          _libraryMatch = matches.first;
+          _libraryMatches = matches;
         });
       }
     } catch (_) {}
   }
+
+  static const _accents = {
+    'á': 'a', 'à': 'a', 'â': 'a', 'ä': 'a', 'ã': 'a', 'å': 'a',
+    'é': 'e', 'è': 'e', 'ê': 'e', 'ë': 'e',
+    'í': 'i', 'ì': 'i', 'î': 'i', 'ï': 'i',
+    'ó': 'o', 'ò': 'o', 'ô': 'o', 'ö': 'o', 'õ': 'o', 'ø': 'o',
+    'ú': 'u', 'ù': 'u', 'û': 'u', 'ü': 'u', 'ñ': 'n', 'ç': 'c',
+  };
+
+  /// Lowercase, accents folded, only letters/digits kept.
+  static String _norm(String s) {
+    final lower = s.toLowerCase().replaceAll('&', 'and');
+    final folded = lower.split('').map((c) => _accents[c] ?? c).join();
+    return folded.replaceAll(RegExp(r'[^a-z0-9]'), '');
+  }
+
+  /// Drop trailing "(Remastered 2011)", "[Live]", "- Single Version", "feat. X".
+  static String _stripTail(String title) => title
+      .replaceAll(RegExp(r'\s*[\(\[].*?[\)\]]'), '')
+      .replaceAll(RegExp(r'\s+-\s+.*$'), '')
+      .replaceAll(RegExp(r'\s+(feat\.?|ft\.?|featuring)\s+.*$', caseSensitive: false), '')
+      .trim();
+
+  /// "ROSÉ & Bruno Mars" / "A feat. B" / "A, B" -> {"rose", "brunomars"}.
+  static Set<String> _artists(String artist) => artist
+      .split(RegExp(r'\s*(?:&|,|/|\bx\b|\band\b|\bwith\b|\bfeat\.?|\bft\.?|\bfeaturing\b)\s*',
+          caseSensitive: false))
+      .map(_norm)
+      .where((a) => a.isNotEmpty)
+      .toSet();
 
   Widget _buildContent() {
     switch (_state) {
