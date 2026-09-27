@@ -1,4 +1,4 @@
-## 1.4.16 - 2026-09-26 (build 154)
+## 1.4.16 - 2026-09-26 (build 155)
 ReplayGain actually works, and casts can have their queue cleared.
 
 **Song recognition**
@@ -13,6 +13,8 @@ ReplayGain actually works, and casts can have their queue cleared.
   title and at least one of the same artists). It used to offer whatever the
   search ranked first, like "Black Rose" for ROSÉ's "APT.".
 - The result shows the release year next to the album ("Rumours · 1977").
+- The Listen Now button puts the library title on its own line and
+  shortens it with "..." instead of overflowing on long titles.
 
 **Small fixes**
 - The update banner shows the build number, and the download percentage

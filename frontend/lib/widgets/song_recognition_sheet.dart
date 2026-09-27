@@ -390,11 +390,26 @@ class _SongRecognitionSheetState extends State<_SongRecognitionSheet> {
                 );
               },
               icon: const Icon(Icons.play_arrow),
-              label: Text('Listen Now — ${_libraryMatch!.title}'),
+              // Two lines, library title ellipsized: long titles ("It's Five
+              // O' Clock Somewhere (Alan Jackson and Jimmy Buffett)") used to
+              // overflow the pill.
+              label: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Listen Now', style: TextStyle(fontWeight: FontWeight.w600)),
+                  Text(
+                    _libraryMatch!.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w400),
+                  ),
+                ],
+              ),
               style: ElevatedButton.styleFrom(
                 backgroundColor: const Color(0xFF00d4ff),
                 foregroundColor: const Color(0xFF0d1b2a),
-                padding: const EdgeInsets.symmetric(vertical: 12),
+                padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 20),
               ),
             ),
           ),
