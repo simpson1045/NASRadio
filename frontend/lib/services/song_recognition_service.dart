@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:http/http.dart' as http;
-import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 import 'api_service.dart';
@@ -29,8 +29,12 @@ class SongRecognitionResult {
 }
 
 class SongRecognitionService {
+  static const int _sampleRate = 16000;
+
   AudioRecorder? _recorder;
+  StreamSubscription<Uint8List>? _pcmSub;
   StreamSubscription? _amplitudeSub;
+  BytesBuilder _pcm = BytesBuilder(copy: false);
   bool _isRecording = false;
   bool get isRecording => _isRecording;
 
@@ -43,31 +47,51 @@ class SongRecognitionService {
     return status.isGranted;
   }
 
-  Future<String> _getRecordingPath() async {
-    final dir = await getTemporaryDirectory();
-    return '${dir.path}/song_recognition.wav';
-  }
-
-  Future<void> startRecording() async {
+  /// Start the mic as a raw PCM stream that keeps filling [_pcm] until
+  /// [cancelRecording]. The mic never stops between identify attempts, so
+  /// each attempt sends everything heard so far.
+  Future<void> _startListening() async {
     if (_isRecording) return;
-
-    final hasPermission = await requestMicPermission();
-    if (!hasPermission) {
+    if (!await requestMicPermission()) {
       throw Exception('Microphone permission denied');
     }
 
+    _pcm = BytesBuilder(copy: false);
     _recorder = AudioRecorder();
-    final path = await _getRecordingPath();
 
-    await _recorder!.start(
-      const RecordConfig(
-        encoder: AudioEncoder.wav,
-        sampleRate: 16000,
-        numChannels: 1,
-      ),
-      path: path,
-    );
+    RecordConfig config(AndroidAudioSource source) => RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: _sampleRate,
+          numChannels: 1,
+          // UNPROCESSED skips the voice noise-suppression some phones apply to
+          // the default mic, which strips out exactly the music we want.
+          androidConfig: AndroidRecordConfig(audioSource: source),
+        );
+
+    Stream<Uint8List> stream;
+    try {
+      stream = await _recorder!.startStream(config(AndroidAudioSource.unprocessed));
+    } catch (_) {
+      // Phone doesn't offer an unprocessed source. VOICE_RECOGNITION is the
+      // universal fallback that Android's CDD says runs without noise
+      // suppression or AGC.
+      stream = await _recorder!.startStream(config(AndroidAudioSource.voiceRecognition));
+    }
+    _pcmSub = stream.listen(_pcm.add);
     _isRecording = true;
+
+    // Some phones "start" UNPROCESSED but deliver pure silence. Check after a
+    // second and switch to VOICE_RECOGNITION if nothing is coming through.
+    if (Platform.isAndroid) {
+      await Future.delayed(const Duration(milliseconds: 1200));
+      if (_isRecording && _peak(_pcm.toBytes()) < 40) {
+        await _pcmSub?.cancel();
+        await _recorder!.stop();
+        _pcm = BytesBuilder(copy: false);
+        stream = await _recorder!.startStream(config(AndroidAudioSource.voiceRecognition));
+        _pcmSub = stream.listen(_pcm.add);
+      }
+    }
 
     // Stream amplitude ~15x/sec for reactive UI
     _amplitudeSub = _recorder!
@@ -81,29 +105,59 @@ class SongRecognitionService {
     });
   }
 
-  Future<String> stopRecording() async {
-    if (!_isRecording || _recorder == null) {
-      throw Exception('Not recording');
-    }
+  Future<void> cancelRecording() async {
     _amplitudeSub?.cancel();
     _amplitudeSub = null;
-    final path = await _recorder!.stop();
-    _isRecording = false;
-    await _recorder!.dispose();
+    final recorder = _recorder;
     _recorder = null;
-    if (path == null) throw Exception('Recording failed — no file produced');
-    return path;
+    _isRecording = false;
+    if (recorder != null) {
+      try {
+        await recorder.stop();
+      } catch (_) {}
+      await _pcmSub?.cancel();
+      _pcmSub = null;
+      await recorder.dispose();
+    }
   }
 
-  void cancelRecording() async {
-    _amplitudeSub?.cancel();
-    _amplitudeSub = null;
-    if (_isRecording && _recorder != null) {
-      await _recorder!.stop();
-      _isRecording = false;
-      await _recorder!.dispose();
-      _recorder = null;
+  /// Largest absolute 16-bit sample, to tell a live mic from dead silence.
+  int _peak(Uint8List pcm) {
+    final samples = pcm.buffer.asByteData(pcm.offsetInBytes, pcm.lengthInBytes & ~1);
+    var peak = 0;
+    for (var i = 0; i + 1 < samples.lengthInBytes; i += 2) {
+      final v = samples.getInt16(i, Endian.little).abs();
+      if (v > peak) peak = v;
     }
+    return peak;
+  }
+
+  /// 16-bit mono PCM -> a WAV file in memory.
+  Uint8List _wav(Uint8List pcm) {
+    final header = ByteData(44);
+    void ascii(int offset, String s) {
+      for (var i = 0; i < s.length; i++) {
+        header.setUint8(offset + i, s.codeUnitAt(i));
+      }
+    }
+
+    ascii(0, 'RIFF');
+    header.setUint32(4, 36 + pcm.length, Endian.little);
+    ascii(8, 'WAVE');
+    ascii(12, 'fmt ');
+    header.setUint32(16, 16, Endian.little); // fmt chunk size
+    header.setUint16(20, 1, Endian.little); // PCM
+    header.setUint16(22, 1, Endian.little); // mono
+    header.setUint32(24, _sampleRate, Endian.little);
+    header.setUint32(28, _sampleRate * 2, Endian.little); // byte rate
+    header.setUint16(32, 2, Endian.little); // block align
+    header.setUint16(34, 16, Endian.little); // bits per sample
+    ascii(36, 'data');
+    header.setUint32(40, pcm.length, Endian.little);
+    return (BytesBuilder(copy: false)
+          ..add(header.buffer.asUint8List())
+          ..add(pcm))
+        .toBytes();
   }
 
   Future<SongRecognitionResult> identify(String audioFilePath) async {
@@ -111,15 +165,17 @@ class SongRecognitionService {
     if (!await file.exists()) {
       throw Exception('Recording file not found');
     }
+    return _identifyBytes(await file.readAsBytes());
+  }
 
-    final fileBytes = await file.readAsBytes();
+  Future<SongRecognitionResult> _identifyBytes(List<int> wavBytes) async {
     final baseUrl = ApiService.baseUrl;
     final uri = Uri.parse('$baseUrl/recognize');
 
     final request = http.MultipartRequest('POST', uri);
     request.files.add(http.MultipartFile.fromBytes(
       'audio',
-      fileBytes,
+      wavBytes,
       filename: 'recording.wav',
     ));
 
@@ -152,43 +208,39 @@ class SongRecognitionService {
     );
   }
 
-  /// Chunked flow: record 5s → try identify → if no match, record 5 more → try again → hard cap at 15s
+  /// Listen continuously and try to identify at 6, 10, 15 and 20 seconds,
+  /// each attempt sending the whole recording so far (a noisy room needs
+  /// more than 5 s). The mic keeps recording while an attempt is in flight.
   Future<SongRecognitionResult> recordAndIdentify({
     void Function(int secondsElapsed, int maxSeconds)? onProgress,
     void Function(String status)? onStatus,
   }) async {
-    const int chunkSeconds = 5;
-    const int maxSeconds = 15;
+    const checkpoints = [6, 10, 15, 20];
+    final maxSeconds = checkpoints.last;
 
-    await startRecording();
+    await _startListening();
+    final clock = Stopwatch()..start();
+    Object? lastError;
+    try {
+      for (final checkpoint in checkpoints) {
+        while (clock.elapsed.inSeconds < checkpoint) {
+          await Future.delayed(const Duration(milliseconds: 250));
+          if (!_isRecording) throw Exception('Cancelled');
+          final secs = clock.elapsed.inSeconds;
+          onProgress?.call(secs > maxSeconds ? maxSeconds : secs, maxSeconds);
+        }
 
-    for (int elapsed = 1; elapsed <= maxSeconds; elapsed++) {
-      onProgress?.call(elapsed, maxSeconds);
-      await Future.delayed(const Duration(seconds: 1));
-
-      // Try identification at each chunk boundary
-      if (elapsed % chunkSeconds == 0) {
         onStatus?.call('Identifying...');
-
-        // Stop recording, grab what we have
-        final path = await stopRecording();
-
         try {
-          final result = await identify(path);
-          return result; // Match found
-        } catch (_) {
-          // No match yet — keep recording if we haven't hit the cap
-          if (elapsed < maxSeconds) {
-            onStatus?.call('Listening...');
-            await startRecording();
-          } else {
-            rethrow; // Final attempt failed, propagate the error
-          }
+          return await _identifyBytes(_wav(_pcm.toBytes()));
+        } catch (e) {
+          lastError = e;
+          if (checkpoint < maxSeconds) onStatus?.call('Listening...');
         }
       }
+    } finally {
+      await cancelRecording();
     }
-
-    // Should not reach here, but safety net
-    throw Exception('Could not identify the song after ${maxSeconds}s');
+    throw lastError ?? Exception('Could not identify the song after ${maxSeconds}s');
   }
 }
