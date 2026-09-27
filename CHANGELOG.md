@@ -1,9 +1,10 @@
-## 1.4.16 - 2026-09-26 (build 151)
+## 1.4.16 - 2026-09-26 (build 152)
 ReplayGain actually works, and casts can have their queue cleared.
 
 **Song recognition**
-- Identify-a-song listens without stopping for up to 20 seconds and sends
-  everything it has heard at 6, 10, 15 and 20 s. Before, every retry was a
+- Identify-a-song listens without stopping for up to 20 seconds, first
+  tries at 3 s and again every 2 s, each time sending everything it has
+  heard so far, so a clear chorus matches in a few seconds. Before, every retry was a
   fresh 5-second clip, and a failed retry often ended the whole attempt, so
   noisy rooms almost never matched.
 - Records from the phone's unprocessed mic (voice-recognition mic as the

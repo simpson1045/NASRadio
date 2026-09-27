@@ -208,37 +208,51 @@ class SongRecognitionService {
     );
   }
 
-  /// Listen continuously and try to identify at 6, 10, 15 and 20 seconds,
-  /// each attempt sending the whole recording so far (a noisy room needs
-  /// more than 5 s). The mic keeps recording while an attempt is in flight.
+  /// Listen continuously and try early and often: first at 3 s, then a new
+  /// attempt 2 s after the previous one started (never two in flight), up to
+  /// 20 s. Each attempt sends the whole recording so far and the mic keeps
+  /// going meanwhile, so an early miss costs nothing: a loud chorus matches
+  /// in a few seconds, a noisy passage just takes longer. Every 2 s stays
+  /// polite to Shazam's unofficial API.
   Future<SongRecognitionResult> recordAndIdentify({
     void Function(int secondsElapsed, int maxSeconds)? onProgress,
     void Function(String status)? onStatus,
   }) async {
-    const checkpoints = [6, 10, 15, 20];
-    final maxSeconds = checkpoints.last;
+    const firstTry = 3;
+    const gap = 2;
+    const maxSeconds = 20;
 
     await _startListening();
     final clock = Stopwatch()..start();
+    int secs() => clock.elapsed.inSeconds;
+    // Progress keeps ticking while an attempt is in flight.
+    final ticker = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      final s = secs();
+      onProgress?.call(s > maxSeconds ? maxSeconds : s, maxSeconds);
+    });
+    onStatus?.call('Listening...');
+
     Object? lastError;
     try {
-      for (final checkpoint in checkpoints) {
-        while (clock.elapsed.inSeconds < checkpoint) {
-          await Future.delayed(const Duration(milliseconds: 250));
+      var nextTry = firstTry;
+      while (true) {
+        while (secs() < nextTry) {
+          await Future.delayed(const Duration(milliseconds: 100));
           if (!_isRecording) throw Exception('Cancelled');
-          final secs = clock.elapsed.inSeconds;
-          onProgress?.call(secs > maxSeconds ? maxSeconds : secs, maxSeconds);
         }
-
-        onStatus?.call('Identifying...');
+        final startedAt = secs();
         try {
           return await _identifyBytes(_wav(_pcm.toBytes()));
         } catch (e) {
           lastError = e;
-          if (checkpoint < maxSeconds) onStatus?.call('Listening...');
         }
+        if (!_isRecording) throw Exception('Cancelled');
+        if (startedAt >= maxSeconds) break;
+        final next = startedAt + gap;
+        nextTry = next > maxSeconds ? maxSeconds : next;
       }
     } finally {
+      ticker.cancel();
       await cancelRecording();
     }
     throw lastError ?? Exception('Could not identify the song after ${maxSeconds}s');
