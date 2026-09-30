@@ -95,6 +95,9 @@ class _UpdateBannerState extends State<UpdateBanner> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
+          // Two rows: the title gets the full width (it used to share one
+          // row with both buttons and wrap to four lines on a phone), the
+          // buttons sit right-aligned underneath.
           Row(
             children: [
               const Icon(Icons.system_update, color: Color(0xFF00D4FF), size: 20),
@@ -104,24 +107,11 @@ class _UpdateBannerState extends State<UpdateBanner> {
                   // Build number too: a same-version rebuild (1.4.16 build
                   // 149 -> 150) otherwise reads as the version you already have.
                   _state == _UpdateState.ready
-                      ? 'v${widget.info.version} (build ${widget.info.buildNumber}) ready to install'
-                      : 'v${widget.info.version} (build ${widget.info.buildNumber}) available',
+                      ? 'Update ready: v${widget.info.version} (build ${widget.info.buildNumber})'
+                      : 'Update available: v${widget.info.version} (build ${widget.info.buildNumber})',
                   style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
                 ),
               ),
-              // What's New button
-              TextButton(
-                onPressed: _showChangelog,
-                style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 8),
-                  minimumSize: Size.zero,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-                child: const Text("What's New", style: TextStyle(fontSize: 12)),
-              ),
-              const SizedBox(width: 4),
-              // Action button (Download / Install / Retry)
-              _buildActionButton(),
               const SizedBox(width: 4),
               // Dismiss
               InkWell(
@@ -132,6 +122,25 @@ class _UpdateBannerState extends State<UpdateBanner> {
                   child: Icon(Icons.close, size: 16, color: Colors.grey),
                 ),
               ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              // What's New button
+              TextButton(
+                onPressed: _showChangelog,
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: const Text("What's New", style: TextStyle(fontSize: 12)),
+              ),
+              const SizedBox(width: 8),
+              // Action button (Download / Install / Retry / percentage)
+              _buildActionButton(),
             ],
           ),
           // Progress bar during download

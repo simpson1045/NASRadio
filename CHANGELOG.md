@@ -1,3 +1,12 @@
+## 1.4.17 - 2026-09-29 (build 158)
+A clean baseline release: the 1.4.16 fixes plus a readable update banner.
+
+**Updates**
+- The update banner puts "Update available/ready: vX (build N)" on its own
+  full-width line with the close button, and What's New plus Download /
+  Install underneath. The title used to share one row with both buttons
+  and wrap to four lines on a phone.
+
 ## 1.4.16 - 2026-09-26 (build 157)
 ReplayGain actually works, and casts can have their queue cleared.
 
