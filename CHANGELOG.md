@@ -1,4 +1,4 @@
-## 1.4.16 - 2026-09-26 (build 156)
+## 1.4.16 - 2026-09-26 (build 157)
 ReplayGain actually works, and casts can have their queue cleared.
 
 **Song recognition**
@@ -24,6 +24,9 @@ ReplayGain actually works, and casts can have their queue cleared.
   it), the RuTracker button is a tidy "Show N hidden RuTracker results /
   Slower search" row, and each result's size sits beside the link icon
   instead of on a line of its own.
+- Prowlarr search: a gap under the filters so the next box doesn't touch
+  them, Download buttons flush right again, and titles show "Cowboy's"
+  instead of an indexer's escaped "Cowboy\'s".
 - App updates resume where they left off if the download is cut (switching
   away from the app used to kill it), retrying for about two minutes; Retry
   resumes instead of starting over.

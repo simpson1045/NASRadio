@@ -779,7 +779,9 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                 // Quality filter chips — instant client-side filtering over
                 // the backend's title fingerprint. State persists.
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                  // Bottom gap so the RuTracker row / history dropdown below
+                  // doesn't sit flush against the filters.
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
@@ -1233,9 +1235,9 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Title
+            // Title (some indexers send escaped quotes: "Cowboy\'s")
             Text(
-              title,
+              title.replaceAll(r"\'", "'").replaceAll(r'\"', '"'),
               style: const TextStyle(
                 color: Colors.white,
                 fontSize: 14,
@@ -1519,9 +1521,11 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                   const SizedBox(width: 8),
 
                 // Size lives here, in the row's empty space, instead of
-                // wrapping onto its own line under the tags.
+                // wrapping onto its own line under the tags. Expanded (not
+                // Flexible + Spacer, which split the space and left a gap
+                // right of the Download button) so the button stays flush right.
                 if (size > 0)
-                  Flexible(
+                  Expanded(
                     child: Text(
                       _formatSize(size),
                       maxLines: 1,
@@ -1529,9 +1533,9 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                       softWrap: false,
                       style: TextStyle(color: Colors.grey[400], fontSize: 12),
                     ),
-                  ),
-
-                const Spacer(),
+                  )
+                else
+                  const Spacer(),
 
                 // Download button
                 SizedBox(
