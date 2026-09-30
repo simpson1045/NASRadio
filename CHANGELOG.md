@@ -1,4 +1,4 @@
-## 1.4.16 - 2026-09-26 (build 155)
+## 1.4.16 - 2026-09-26 (build 156)
 ReplayGain actually works, and casts can have their queue cleared.
 
 **Song recognition**
@@ -19,8 +19,11 @@ ReplayGain actually works, and casts can have their queue cleared.
 **Small fixes**
 - The update banner shows the build number, and the download percentage
   where a tiny spinner used to look like a stray comma.
-- Prowlarr search: the "RuTracker results hidden, search anyway?" button
-  wraps on a phone instead of running off the edge.
+- Prowlarr search on a phone: the quality filters are one fixed row that
+  no longer reshuffles when you toggle one (the "hidden" count sits below
+  it), the RuTracker button is a tidy "Show N hidden RuTracker results /
+  Slower search" row, and each result's size sits beside the link icon
+  instead of on a line of its own.
 - App updates resume where they left off if the download is cut (switching
   away from the app used to kill it), retrying for about two minutes; Retry
   resumes instead of starting over.

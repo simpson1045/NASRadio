@@ -507,27 +507,40 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
     );
   }
 
+  /// Fixed-size toggle for the quality filter row. A FilterChip grew a
+  /// checkmark when selected, which reflowed the whole row on a phone with
+  /// large text; this one is filled when on and scales its label down to fit.
   Widget _filterChip(String label, bool selected, ValueChanged<bool> onChanged) {
     const cyan = Color(0xFF00d4ff);
-    return FilterChip(
-      label: Text(label,
-          style: TextStyle(
-            fontSize: 11,
-            fontWeight: FontWeight.w600,
-            color: selected ? Colors.black : cyan,
-          )),
-      selected: selected,
-      onSelected: (v) {
-        onChanged(v);
-        _saveFilters();
-      },
-      selectedColor: cyan,
-      checkmarkColor: Colors.black,
-      backgroundColor: const Color(0xFF1a2332),
-      side: BorderSide(color: cyan.withOpacity(selected ? 1 : 0.35)),
-      visualDensity: VisualDensity.compact,
-      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 0),
+    return Material(
+      color: selected ? cyan : const Color(0xFF1a2332),
+      shape: StadiumBorder(
+        side: BorderSide(color: cyan.withOpacity(selected ? 1 : 0.35)),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: () {
+          onChanged(!selected);
+          _saveFilters();
+        },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+          child: Center(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(
+                label,
+                maxLines: 1,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: selected ? Colors.black : cyan,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -767,24 +780,32 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                 // the backend's title fingerprint. State persists.
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-                  child: Wrap(
-                    spacing: 8,
-                    runSpacing: 4,
-                    crossAxisAlignment: WrapCrossAlignment.center,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
-                      _filterChip('Lossless', _fLossless,
-                          (v) => setState(() => _fLossless = v)),
-                      _filterChip('24-bit+', _fHiRes,
-                          (v) => setState(() => _fHiRes = v)),
-                      _filterChip('Surround', _fSurround,
-                          (v) => setState(() => _fSurround = v)),
-                      _filterChip('No MP3/AAC', _fNoLossy,
-                          (v) => setState(() => _fNoLossy = v)),
+                      // One fixed row of equal toggles: toggling never reflows it.
+                      Row(
+                        children: [
+                          Expanded(child: _filterChip('Lossless', _fLossless,
+                              (v) => setState(() => _fLossless = v))),
+                          const SizedBox(width: 6),
+                          Expanded(child: _filterChip('24-bit+', _fHiRes,
+                              (v) => setState(() => _fHiRes = v))),
+                          const SizedBox(width: 6),
+                          Expanded(child: _filterChip('Surround', _fSurround,
+                              (v) => setState(() => _fSurround = v))),
+                          const SizedBox(width: 6),
+                          Expanded(child: _filterChip('No MP3/AAC', _fNoLossy,
+                              (v) => setState(() => _fNoLossy = v))),
+                        ],
+                      ),
                       if (_anyFilterActive && _hasSearched && _hiddenByFilters > 0)
-                        Text(
-                          '$_hiddenByFilters hidden',
-                          style: TextStyle(
-                              color: Colors.grey[600], fontSize: 11),
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4, right: 4),
+                          child: Text(
+                            '$_hiddenByFilters hidden by filters',
+                            style: TextStyle(color: Colors.grey[600], fontSize: 11),
+                          ),
                         ),
                     ],
                   ),
@@ -914,42 +935,49 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                                 : const Color(0xFF00d4ff).withOpacity(0.3),
                           ),
                         ),
+                        // A left-aligned list row (icon, title over a small
+                        // "slower" line, chevron) instead of one centred
+                        // sentence that wrapped awkwardly on a phone.
                         child: Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
                           children: [
                             if (_isDeepSearching) ...[
                               const SizedBox(
-                                width: 14,
-                                height: 14,
+                                width: 16,
+                                height: 16,
                                 child: CircularProgressIndicator(
                                   strokeWidth: 2,
                                   color: Colors.orange,
                                 ),
                               ),
-                              const SizedBox(width: 8),
-                              const Text(
-                                'Searching RuTracker...',
-                                style: TextStyle(color: Colors.orange, fontSize: 13),
-                              ),
-                            ] else ...[
-                              const Icon(Icons.travel_explore, size: 16, color: Color(0xFF00d4ff)),
-                              const SizedBox(width: 8),
-                              // Flexible so the long message wraps inside the
-                              // button on a phone instead of running off the edge.
-                              Flexible(
+                              const SizedBox(width: 10),
+                              const Expanded(
                                 child: Text(
-                                  _rutrackerFilteredCount > 0
-                                      ? '$_rutrackerFilteredCount RuTracker result${_rutrackerFilteredCount == 1 ? '' : 's'} hidden — search anyway?'
-                                      : 'Also search RuTracker',
-                                  textAlign: TextAlign.center,
-                                  style: const TextStyle(color: Color(0xFF00d4ff), fontSize: 13, fontWeight: FontWeight.w500),
+                                  'Searching RuTracker...',
+                                  style: TextStyle(color: Colors.orange, fontSize: 13),
                                 ),
                               ),
-                              const SizedBox(width: 4),
-                              Text(
-                                '(slower)',
-                                style: TextStyle(color: Colors.grey[600], fontSize: 11),
+                            ] else ...[
+                              const Icon(Icons.travel_explore, size: 18, color: Color(0xFF00d4ff)),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      _rutrackerFilteredCount > 0
+                                          ? 'Show $_rutrackerFilteredCount hidden RuTracker result${_rutrackerFilteredCount == 1 ? '' : 's'}'
+                                          : 'Also search RuTracker',
+                                      style: const TextStyle(color: Color(0xFF00d4ff), fontSize: 13, fontWeight: FontWeight.w500),
+                                    ),
+                                    Text(
+                                      'Slower search',
+                                      style: TextStyle(color: Colors.grey[600], fontSize: 11),
+                                    ),
+                                  ],
+                                ),
                               ),
+                              Icon(Icons.chevron_right, size: 18, color: const Color(0xFF00d4ff).withOpacity(0.6)),
                             ],
                           ],
                         ),
@@ -1366,21 +1394,6 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                     ],
                   ),
                 ),
-                // Size badge
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 6,
-                    vertical: 2,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.grey.withOpacity(0.2),
-                    borderRadius: BorderRadius.circular(4),
-                  ),
-                  child: Text(
-                    _formatSize(size),
-                    style: TextStyle(color: Colors.grey[400], fontSize: 10),
-                  ),
-                ),
                 // In Library badge. Green means "you own this mix";
                 // amber STEREO IN LIBRARY means the release is a
                 // surround/Atmos mix but the library copy is stereo —
@@ -1504,6 +1517,19 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                 if (result['info_url'] != null &&
                     (result['info_url'] as String).isNotEmpty)
                   const SizedBox(width: 8),
+
+                // Size lives here, in the row's empty space, instead of
+                // wrapping onto its own line under the tags.
+                if (size > 0)
+                  Flexible(
+                    child: Text(
+                      _formatSize(size),
+                      maxLines: 1,
+                      overflow: TextOverflow.fade,
+                      softWrap: false,
+                      style: TextStyle(color: Colors.grey[400], fontSize: 12),
+                    ),
+                  ),
 
                 const Spacer(),
 
