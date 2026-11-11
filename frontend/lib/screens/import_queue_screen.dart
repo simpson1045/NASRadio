@@ -9,6 +9,7 @@ import 'dart:io';
 import 'dart:convert';
 import '../services/auth_http_client.dart';
 import '../widgets/mb_submit_dialog.dart';
+import '../widgets/device_upload.dart';
 
 class ImportQueueScreen extends StatefulWidget {
   final AudioPlayerService audioPlayerService;
@@ -54,6 +55,19 @@ class _ImportQueueScreenState extends State<ImportQueueScreen> {
             .width /
         WidgetsBinding.instance.platformDispatcher.views.first.devicePixelRatio;
     return width < 600;
+  }
+
+  /// Bring in music from this device (phone storage; a PC's drives and
+  /// network shares) without copying it into the downloads folder first. It
+  /// lands in the queue like any download.
+  Future<void> _uploadFromDevice() async {
+    final item = await pickAndUploadForImport(context);
+    if (item == null || !mounted) return;
+    await _loadPending();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('"${item['folder_name']}" is in the queue: tap it to import'),
+    ));
   }
 
   Future<void> _loadPending() async {
@@ -1609,6 +1623,11 @@ class _ImportQueueScreenState extends State<ImportQueueScreen> {
             backgroundColor: const Color(0xFF0d1b2a),
             actions: [
               IconButton(
+                icon: const Icon(Icons.upload_file),
+                tooltip: 'Upload from this device',
+                onPressed: _uploadFromDevice,
+              ),
+              IconButton(
                 icon: const Icon(Icons.refresh),
                 onPressed: _loadPending,
               ),
@@ -1884,6 +1903,11 @@ class _ImportQueueScreenState extends State<ImportQueueScreen> {
         title: const Text('Import Queue'),
         backgroundColor: const Color(0xFF0d1b2a),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.upload_file),
+            tooltip: 'Upload from this device',
+            onPressed: _uploadFromDevice,
+          ),
           IconButton(icon: const Icon(Icons.refresh), onPressed: _loadPending),
         ],
       ),
@@ -2557,6 +2581,9 @@ class _ImportDetailScreenState extends State<_ImportDetailScreen> {
   // their fetched release lists (null = fetch in flight).
   final Set<String> _rgExpanded = {};
   final Map<String, List<Map<String, dynamic>>?> _rgReleases = {};
+  // Per release group: the server's verdict on which release these files
+  // are ({best, candidates, summary}); see backend release_match.py.
+  final Map<String, Map<String, dynamic>> _rgMatch = {};
   bool _isSearching = false;
   bool _isImporting = false;
   bool _isDeleting = false;
@@ -2598,6 +2625,7 @@ class _ImportDetailScreenState extends State<_ImportDetailScreen> {
     // Auto-read tags from files (will also auto-search MusicBrainz if successful)
     _readTags();
     _loadFolderFiles();
+    _loadFolderFacts();
     _checkMixMatch();
   }
 
@@ -2720,6 +2748,7 @@ class _ImportDetailScreenState extends State<_ImportDetailScreen> {
         _mbShown = 5;
         _isSearching = false;
       });
+      _maybeAutoPick();
     } catch (e) {
       setState(() {
         _error = e.toString();
@@ -3535,6 +3564,7 @@ class _ImportDetailScreenState extends State<_ImportDetailScreen> {
   List<Widget> _mbResultsSection() {
     return [
                   const SizedBox(height: 16),
+                  _buildPickBanner(),
                   if (_mbResults.isNotEmpty) ...[
                     const Text(
                       'MusicBrainz Results',
@@ -3768,6 +3798,7 @@ class _ImportDetailScreenState extends State<_ImportDetailScreen> {
     return ListView(
       children: [
         const SizedBox(height: 4),
+        _buildPickBanner(),
         if (_mbResults.isEmpty)
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 24),
@@ -4014,6 +4045,7 @@ class _ImportDetailScreenState extends State<_ImportDetailScreen> {
                       'MusicBrainz match',
                       [
                         const SizedBox(height: 4),
+                        _buildPickBanner(),
                         if (_mbResults.isEmpty)
                           Padding(
                             padding:
@@ -4289,12 +4321,222 @@ class _ImportDetailScreenState extends State<_ImportDetailScreen> {
                   style: TextStyle(color: Colors.grey[600], fontSize: 10.5),
                 ),
               ),
+              if (_rgMatch[rgid] != null)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 3, 12, 2),
+                  child: Text(
+                    'Your files: ${_rgMatch[rgid]!['summary'] ?? ''}'
+                    '${_rgMatch[rgid]!['best'] == null ? ((_rgMatch[rgid]!['candidates'] as List?)?.isNotEmpty == true ? '  ·  ${(_rgMatch[rgid]!['candidates'] as List).length} possible matches' : '  ·  no clear match') : ''}',
+                    style: TextStyle(color: Colors.grey[500], fontSize: 10.5),
+                  ),
+                ),
               ...List.generate(
                   releases.length,
                   (i) => _rgReleaseRow(releases[i], i)),
             ],
             const SizedBox(height: 6),
           ],
+        ],
+      ),
+    );
+  }
+
+  // ---- 196: say what the download is, and pick its release ----------------
+  Map<String, dynamic>? _facts;
+  bool _autoPicking = false;
+  int _autoPickIndex = 0; // which search result is being tried (top 3)
+  Map<String, dynamic>? _autoPicked; // the release picked for you
+  String? _autoPickNote; // when it couldn't tell
+
+  Future<void> _loadFolderFacts() async {
+    final path = widget.item['path'] as String?;
+    if (path == null) return;
+    try {
+      final body = await widget.apiService.getFolderFacts(path);
+      if (mounted && body['facts'] is Map) {
+        setState(() => _facts = Map<String, dynamic>.from(body['facts']));
+      }
+    } catch (_) {
+      // The line just doesn't show.
+    }
+  }
+
+  /// With a download folder and nothing chosen yet: open the top search
+  /// result and, if the files clearly match one of its releases (track
+  /// count, lengths, bit depth, .nfo source...), select it. Until Nov 9 the
+  /// best match was only sorted to the top of a list you had to open.
+  void _maybeAutoPick() {
+    if (_selectedAlbumMbid != null || _mbResults.isEmpty) return;
+    if ((widget.item['path'] as String?) == null) return;
+    _autoPickIndex = 0;
+    final rgid = _mbResults.first['mbid'] as String?;
+    if (rgid == null) return;
+    _autoPicking = true;
+    _autoPickNote = null;
+    if (_rgExpanded.contains(rgid) && _rgReleases[rgid] != null) {
+      setState(() => _applyAutoPick(_rgReleases[rgid]!, _rgMatch[rgid]));
+    } else if (!_rgExpanded.contains(rgid)) {
+      _toggleRgExpand(rgid);
+    }
+  }
+
+  void _applyAutoPick(
+      List<Map<String, dynamic>> releases, Map<String, dynamic>? match) {
+    if (!_autoPicking) return;
+    _autoPicking = false;
+    if (_selectedAlbumMbid != null) return; // you picked one meanwhile
+    final best = match?['best'] as String?;
+    // No clear match in this result: try the next one (a single or a
+    // compilation is sometimes ranked above the album), up to the top 3.
+    if (best == null && _autoPickIndex < 2 && _autoPickIndex + 1 < _mbResults.length) {
+      _autoPickIndex++;
+      final next = _mbResults[_autoPickIndex]['mbid'] as String?;
+      if (next != null) {
+        _autoPicking = true;
+        Future.microtask(() {
+          if (!mounted || _selectedAlbumMbid != null) return;
+          if (_rgExpanded.contains(next) && _rgReleases[next] != null) {
+            setState(() => _applyAutoPick(_rgReleases[next]!, _rgMatch[next]));
+          } else if (!_rgExpanded.contains(next)) {
+            _toggleRgExpand(next);
+          } else {
+            _autoPicking = false;
+          }
+        });
+        return;
+      }
+    }
+    if (best != null) {
+      _selectedAlbumMbid = best;
+      _autoPicked = releases.firstWhere((r) => r['id'] == best,
+          orElse: () => <String, dynamic>{'id': best});
+    } else if ((match?['candidates'] as List?)?.isNotEmpty ?? false) {
+      _autoPickNote = "Couldn't tell for sure which release this is: the "
+          'closest matches are marked below.';
+    } else if (match != null) {
+      _autoPickNote = "None of this album's releases match these files "
+          '(a different edition, or a different album?).';
+    }
+  }
+
+  bool _looksLikeLabel(Object? v) {
+    final s = (v ?? '').toString().trim();
+    return s.isNotEmpty &&
+        s.length <= 40 &&
+        !s.contains('..') &&
+        !s.contains(':') &&
+        !s.toLowerCase().contains('rip');
+  }
+
+  String _fmtTotal(int seconds) {
+    final h = seconds ~/ 3600, m = (seconds % 3600) ~/ 60, s = seconds % 60;
+    return h > 0
+        ? '$h:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}'
+        : '$m:${s.toString().padLeft(2, '0')}';
+  }
+
+  /// "In this download: ..." + "Picked for you" / "couldn't tell".
+  Widget _buildPickBanner() {
+    final f = _facts;
+    final picked = _autoPicked != null &&
+            _selectedAlbumMbid == _autoPicked!['id']
+        ? _autoPicked
+        : null;
+    if (f == null && picked == null && _autoPickNote == null) {
+      return const SizedBox.shrink();
+    }
+    final bits = f?['bits'] as int?;
+    final rate = f?['rate'] as int?;
+    final factParts = <String>[
+      if (f != null) '${f['track_count']} tracks',
+      if (f?['total_seconds'] is int) _fmtTotal(f!['total_seconds'] as int),
+      if ((f?['file_types'] as List?)?.isNotEmpty ?? false)
+        (f!['file_types'] as List).join('/').toUpperCase(),
+      if (bits != null || rate != null)
+        [
+          if (bits != null) '$bits-bit',
+          if (rate != null)
+            '${(rate / 1000).toStringAsFixed(rate % 1000 == 0 ? 0 : 1)} kHz',
+        ].join(' / ') + (f?['hires'] == true ? ' (hi-res)' : ''),
+      if ((f?['nfo_source'] ?? '').toString().isNotEmpty) 'source: ${f!['nfo_source']}',
+      // The .nfo reader sometimes grabs a credit line ("Ripped by....: x on
+      // date") as the label: only show something that looks like a name.
+      if (_looksLikeLabel(f?['nfo_label'])) 'label: ${f!['nfo_label']}',
+      if ((f?['name_hint'] ?? '').toString().isNotEmpty) 'folder says: ${f!['name_hint']}',
+    ];
+    final reasons = ((picked?['match'] as Map?)?['reasons'] as List?)
+            ?.cast<Map>() ??
+        const [];
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (factParts.isNotEmpty)
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Icon(Icons.folder_open, size: 15, color: Colors.white54),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    'In this download: ${factParts.join(' · ')}',
+                    style: const TextStyle(color: Colors.white70, fontSize: 12.5),
+                  ),
+                ),
+              ],
+            ),
+          if (picked != null)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(top: 8),
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.green.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.green.withValues(alpha: 0.5)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    '★ Picked for you: ${[
+                      (picked['date'] ?? '').toString(),
+                      ((picked['formats'] as List?) ?? []).join(' + '),
+                      (picked['country'] ?? '').toString(),
+                      if ((picked['disambiguation'] ?? '').toString().isNotEmpty)
+                        '(${picked['disambiguation']})',
+                    ].where((s) => s.isNotEmpty).join(' · ')}',
+                    style: const TextStyle(
+                        color: Colors.greenAccent,
+                        fontWeight: FontWeight.w600,
+                        fontSize: 13),
+                  ),
+                  for (final r in reasons.take(5))
+                    Text(
+                      '${r['ok'] == true ? '✓' : '✗'} ${r['text']}',
+                      style: TextStyle(
+                        color: r['ok'] == true ? Colors.white70 : Colors.orange.shade200,
+                        fontSize: 12,
+                      ),
+                    ),
+                  const Text(
+                    'Not right? Pick another release below.',
+                    style: TextStyle(color: Colors.white38, fontSize: 11.5),
+                  ),
+                ],
+              ),
+            ),
+          if (picked == null && _autoPickNote != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                _autoPickNote!,
+                style: TextStyle(color: Colors.amber.shade200, fontSize: 12),
+              ),
+            ),
         ],
       ),
     );
@@ -4310,8 +4552,32 @@ class _ImportDetailScreenState extends State<_ImportDetailScreen> {
     });
     if (_rgExpanded.contains(rgid) && !_rgReleases.containsKey(rgid)) {
       _rgReleases[rgid] = null;
-      widget.apiService.getMbRgReleases(rgid).then((list) {
-        if (mounted) setState(() => _rgReleases[rgid] = list);
+      widget.apiService
+          .getMbRgReleases(rgid, folderPath: widget.item['path'] as String?)
+          .then((body) {
+        final list = List<Map<String, dynamic>>.from(body['releases'] ?? []);
+        // Best match first, then possible matches, then the usual date order.
+        int rank(Map<String, dynamic> r) {
+          final m = r['match'] as Map?;
+          if (m?['best'] == true) return 0;
+          if (m?['candidate'] == true) return 1;
+          return 2;
+        }
+        final ordered = [
+          for (var i = 0; i < list.length; i++) (i, list[i])
+        ]..sort((a, b) {
+            final c = rank(a.$2).compareTo(rank(b.$2));
+            return c != 0 ? c : a.$1.compareTo(b.$1);
+          });
+        if (mounted) {
+          setState(() {
+            _rgReleases[rgid] = [for (final e in ordered) e.$2];
+            if (body['match'] is Map) {
+              _rgMatch[rgid] = Map<String, dynamic>.from(body['match']);
+            }
+            _applyAutoPick(_rgReleases[rgid]!, _rgMatch[rgid]);
+          });
+        }
       }).catchError((_) {
         if (mounted) setState(() => _rgReleases[rgid] = []);
       });
@@ -4351,6 +4617,10 @@ class _ImportDetailScreenState extends State<_ImportDetailScreen> {
       if ((r['track_count'] ?? 0) != 0) '${r['track_count']} trk',
       if ((r['country'] ?? '') != '') r['country'],
     ].join(' • ');
+    final match = r['match'] as Map?;
+    final isBest = match?['best'] == true;
+    final isCandidate = match?['candidate'] == true;
+    final reasons = (match?['reasons'] as List?)?.cast<Map>() ?? const [];
 
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 1),
@@ -4378,7 +4648,10 @@ class _ImportDetailScreenState extends State<_ImportDetailScreen> {
         },
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          child: Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+          Row(
             children: [
               Icon(
                 selected
@@ -4445,6 +4718,53 @@ class _ImportDetailScreenState extends State<_ImportDetailScreen> {
                       color: Color(0xFF00d4ff),
                       fontWeight: FontWeight.w600,
                     ),
+                  ),
+                ),
+              if (isBest || isCandidate)
+                Container(
+                  margin: const EdgeInsets.only(left: 8),
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: (isBest ? const Color(0xFFFFD700) : Colors.orange)
+                        .withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(
+                      color: (isBest ? const Color(0xFFFFD700) : Colors.orange)
+                          .withOpacity(0.6),
+                    ),
+                  ),
+                  child: Text(
+                    isBest ? '★ BEST MATCH' : 'possible match',
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: isBest ? const Color(0xFFFFD700) : Colors.orange,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+              // Why: the clues behind the verdict, so a match can be
+              // trusted (or overruled) at a glance.
+              if ((isBest || isCandidate) && reasons.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(left: 49, top: 3),
+                  child: Wrap(
+                    spacing: 10,
+                    runSpacing: 2,
+                    children: [
+                      for (final why in reasons)
+                        Text(
+                          '${why['ok'] == true ? '✓' : '✗'} ${why['text']}',
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            color: why['ok'] == true
+                                ? Colors.green[300]
+                                : Colors.red[300],
+                          ),
+                        ),
+                    ],
                   ),
                 ),
             ],

@@ -1,0 +1,16 @@
+{
+  "name": "nasradio-tv",
+  "version": "0.1.0",
+  "description": "NASRadio TV: the cast screen as a full-screen app on ELKO",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "package": "electron-packager . \"NASRadio TV\" --platform=win32 --arch=x64 --out=dist --overwrite --ignore=^/dist --ignore=nasradio-tv\\.json"
+  },
+  "devDependencies": {
+    "@electron/packager": "^18.3.6",
+    "electron": "45.2.1",
+    "socket.io-client": "4.8.1"
+  }
+}

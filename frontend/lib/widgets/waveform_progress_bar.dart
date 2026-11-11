@@ -1,4 +1,6 @@
+import 'dart:async' show Timer;
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart' show Ticker;
 import 'dart:ui' as ui;
 import 'dart:math' as math;
 import 'dart:io' show Platform;
@@ -12,7 +14,12 @@ class WaveformProgressBar extends StatefulWidget {
   final Color? lightsaberColor;
   final bool dnaMode;
   final bool evhStripesMode;
+  /// Song id for the EVH stripes: each song gets its own (stable) pattern.
+  final int evhSeed;
   final bool liveSeek;
+  /// Music is playing: the glow pulse runs every frame. Paused: it breathes
+  /// at 20 fps instead.
+  final bool isPlaying;
 
   const WaveformProgressBar({
     super.key,
@@ -24,7 +31,9 @@ class WaveformProgressBar extends StatefulWidget {
     this.lightsaberColor,
     this.dnaMode = false,
     this.evhStripesMode = false,
+    this.evhSeed = 0,
     this.liveSeek = true,
+    this.isPlaying = true,
   });
 
   @override
@@ -32,11 +41,14 @@ class WaveformProgressBar extends StatefulWidget {
 }
 
 class _WaveformProgressBarState extends State<WaveformProgressBar>
-    with TickerProviderStateMixin {
+    with SingleTickerProviderStateMixin {
   double? _dragPosition;
   double? _dragX; // X position for tooltip
-  AnimationController? _smoothController;
-  AnimationController? _pulseController;
+  late final Ticker _pulseTicker;
+  Timer? _pulseTimer;
+  final ValueNotifier<double> _pulse = ValueNotifier<double>(0.0);
+  final Stopwatch _pulseClock = Stopwatch()..start();
+  bool _tickersEnabled = true;
   Duration _lastKnownPosition = Duration.zero;
   DateTime _lastUpdateTime = DateTime.now();
 
@@ -47,34 +59,55 @@ class _WaveformProgressBarState extends State<WaveformProgressBar>
     super.initState();
     _lastKnownPosition = widget.position;
     _lastUpdateTime = DateTime.now();
+    // Glow pulse while playing: a ticker, so TickerMode (hidden section,
+    // minimized window) mutes it for free.
+    _pulseTicker = createTicker((_) => _pulse.value = _pulseNow());
+  }
 
-    // Only use smooth animation on desktop - mobile relies on position updates
-    if (!_isMobile) {
-      _smoothController = AnimationController(
-        vsync: this,
-        duration: const Duration(hours: 24),
-      )..repeat();
+  // No progress clock here any more. Until Nov 9 a 24 h AnimationController
+  // repeated forever on desktop from the moment the bar appeared, playing or
+  // paused, but _smoothPosition is capped at widget.position, so all it did
+  // was repaint the same picture 60 times a second (FRAMEWORK: ~17% GPU plus
+  // the compositor, running hot, whole-machine freezes). The parent hands in
+  // a new position every frame while playing; that is what moves the bar.
+
+  bool get _wantsPulse =>
+      !_isMobile &&
+      (widget.lightsaberMode || widget.dnaMode || widget.evhStripesMode);
+
+  /// Triangle wave 0 -> 1 -> 0 over 1.6 s, the old 800 ms repeat(reverse).
+  double _pulseNow() {
+    final t = (_pulseClock.elapsedMilliseconds % 1600) / 800.0;
+    return t <= 1.0 ? t : 2.0 - t;
+  }
+
+  /// Playing: pulse every frame (the frame is drawn for the progress anyway).
+  /// Paused: a slow breathe at 20 fps. Hidden, or a plain song: still.
+  void _syncPulse() {
+    final on = _wantsPulse && _tickersEnabled;
+    if (on && widget.isPlaying) {
+      if (!_pulseTicker.isActive) _pulseTicker.start();
+    } else if (_pulseTicker.isActive) {
+      _pulseTicker.stop();
     }
-
-    // Start pulse animation if in lightsaber mode, DNA mode, or EVH mode (desktop only for performance)
-    if (!_isMobile &&
-        (widget.lightsaberMode || widget.dnaMode || widget.evhStripesMode)) {
-      _startPulseAnimation();
+    if (on && !widget.isPlaying) {
+      _pulseTimer ??= Timer.periodic(
+        const Duration(milliseconds: 50),
+        (_) => _pulse.value = _pulseNow(),
+      );
+    } else {
+      _pulseTimer?.cancel();
+      _pulseTimer = null;
     }
   }
 
-  void _startPulseAnimation() {
-    if (_isMobile) return; // Skip pulse animation on mobile for performance
-    _pulseController?.dispose();
-    _pulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 800),
-    )..repeat(reverse: true);
-  }
-
-  void _stopPulseAnimation() {
-    _pulseController?.dispose();
-    _pulseController = null;
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // TickerMode off = hidden section or minimized window. A Timer isn't
+    // muted by TickerMode on its own, so stop the breathe here too.
+    _tickersEnabled = TickerMode.of(context);
+    _syncPulse();
   }
 
   @override
@@ -85,44 +118,14 @@ class _WaveformProgressBarState extends State<WaveformProgressBar>
       _lastKnownPosition = widget.position;
       _lastUpdateTime = DateTime.now();
     }
-
-    // Handle lightsaber mode changes (desktop only)
-    if (!_isMobile) {
-      if (widget.lightsaberMode && !oldWidget.lightsaberMode) {
-        _startPulseAnimation();
-      } else if (!widget.lightsaberMode &&
-          oldWidget.lightsaberMode &&
-          !widget.dnaMode &&
-          !widget.evhStripesMode) {
-        _stopPulseAnimation();
-      }
-
-      // Handle DNA mode changes
-      if (widget.dnaMode && !oldWidget.dnaMode) {
-        _startPulseAnimation();
-      } else if (!widget.dnaMode &&
-          oldWidget.dnaMode &&
-          !widget.lightsaberMode &&
-          !widget.evhStripesMode) {
-        _stopPulseAnimation();
-      }
-
-      // Handle EVH stripes mode changes
-      if (widget.evhStripesMode && !oldWidget.evhStripesMode) {
-        _startPulseAnimation();
-      } else if (!widget.evhStripesMode &&
-          oldWidget.evhStripesMode &&
-          !widget.lightsaberMode &&
-          !widget.dnaMode) {
-        _stopPulseAnimation();
-      }
-    }
+    _syncPulse();
   }
 
   @override
   void dispose() {
-    _smoothController?.dispose();
-    _pulseController?.dispose();
+    _pulseTimer?.cancel();
+    _pulseTicker.dispose();
+    _pulse.dispose();
     super.dispose();
   }
 
@@ -267,20 +270,10 @@ class _WaveformProgressBarState extends State<WaveformProgressBar>
   }
 
   Widget _buildAnimatedPaint() {
-    // Combine listenables for efficient rebuilds - only rebuilds CustomPaint, not entire widget tree
-    final List<Listenable> listenables = [];
-    if (_smoothController != null) listenables.add(_smoothController!);
-    if (_pulseController != null) listenables.add(_pulseController!);
-
-    if (listenables.isEmpty) {
-      // No animations - just build static paint
-      return _buildCustomPaint();
-    }
-
+    // Only the glow pulse animates in here; progress comes from the parent.
+    if (!_wantsPulse) return _buildCustomPaint();
     return AnimatedBuilder(
-      animation: listenables.length == 1
-          ? listenables.first
-          : Listenable.merge(listenables),
+      animation: _pulse,
       builder: (context, child) => _buildCustomPaint(),
     );
   }
@@ -303,10 +296,12 @@ class _WaveformProgressBarState extends State<WaveformProgressBar>
             : progress,
         lightsaberMode: widget.lightsaberMode,
         lightsaberColor: widget.lightsaberColor ?? const Color(0xFF4488ff),
-        pulseValue: _pulseController?.value ?? 0.0,
+        pulseValue: _wantsPulse ? _pulse.value : 0.0,
         dnaMode: widget.dnaMode,
         evhStripesMode: widget.evhStripesMode,
+        evhSeed: widget.evhSeed,
         isMobile: _isMobile,
+        devicePixelRatio: MediaQuery.devicePixelRatioOf(context),
       ),
       size: Size.infinite,
     );
@@ -331,7 +326,9 @@ class WaveformPainter extends CustomPainter {
   final double pulseValue;
   final bool dnaMode;
   final bool evhStripesMode;
+  final int evhSeed;
   final bool isMobile;
+  final double devicePixelRatio;
 
   WaveformPainter({
     required this.waveformData,
@@ -341,12 +338,14 @@ class WaveformPainter extends CustomPainter {
     this.pulseValue = 0.0,
     this.dnaMode = false,
     this.evhStripesMode = false,
+    this.evhSeed = 0,
     this.isMobile = false,
+    this.devicePixelRatio = 1.0,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (waveformData.isEmpty) return;
+    if (waveformData.isEmpty || size.isEmpty) return;
 
     final width = size.width;
     final centerY = size.height / 2;
@@ -357,27 +356,32 @@ class WaveformPainter extends CustomPainter {
     final bladeStartX = hiltWidth;
     final bladeWidth = width - hiltWidth;
 
-    // Build the complete waveform path once
-    final waveformPath = Path();
-    waveformPath.moveTo(bladeStartX, centerY);
+    // The complete waveform outline (~2 points per sample). Normal mode only
+    // builds it when its cached images need redrawing (new song or size).
+    Path buildPath() {
+      final path = Path();
+      path.moveTo(bladeStartX, centerY);
 
-    // Top half
-    for (int i = 0; i < waveformData.length; i++) {
-      final x = bladeStartX + (i / waveformData.length) * bladeWidth;
-      final amplitude = waveformData[i] * maxAmplitude;
-      waveformPath.lineTo(x, centerY - amplitude);
-    }
+      // Top half
+      for (int i = 0; i < waveformData.length; i++) {
+        final x = bladeStartX + (i / waveformData.length) * bladeWidth;
+        final amplitude = waveformData[i] * maxAmplitude;
+        path.lineTo(x, centerY - amplitude);
+      }
 
-    // Bottom half (mirrored)
-    for (int i = waveformData.length - 1; i >= 0; i--) {
-      final x = bladeStartX + (i / waveformData.length) * bladeWidth;
-      final amplitude = waveformData[i] * maxAmplitude;
-      waveformPath.lineTo(x, centerY + amplitude);
+      // Bottom half (mirrored)
+      for (int i = waveformData.length - 1; i >= 0; i--) {
+        final x = bladeStartX + (i / waveformData.length) * bladeWidth;
+        final amplitude = waveformData[i] * maxAmplitude;
+        path.lineTo(x, centerY + amplitude);
+      }
+      path.close();
+      return path;
     }
-    waveformPath.close();
 
     if (lightsaberMode) {
       // ===== LIGHTSABER MODE =====
+      final waveformPath = buildPath();
 
       // Bright white core color
       final coreColor = Color.lerp(lightsaberColor, Colors.white, 0.7)!;
@@ -474,25 +478,29 @@ class WaveformPainter extends CustomPainter {
       _drawEvhStripes(canvas, size, progress, pulseValue, waveformData);
     } else {
       // ===== NORMAL MODE =====
+      // The waveform is drawn ONCE per song and size into two images (played
+      // colour, unplayed colour); each frame only shows a slice of each. Until
+      // Nov 9 the ~2000-point outline was rebuilt and filled twice on every
+      // frame of the 60 fps scrubber.
+      final images = _WaveformImages.of(
+          waveformData, size, devicePixelRatio, buildPath);
+      final src = Rect.fromLTWH(0, 0, images.played.width.toDouble(),
+          images.played.height.toDouble());
+      final dst = Offset.zero & size;
+      final imagePaint = Paint()..filterQuality = FilterQuality.medium;
 
-      // Draw played portion (clipped)
+      // Played portion (clipped)
       canvas.save();
       canvas.clipRect(Rect.fromLTWH(0, 0, width * progress, size.height));
-      final playedPaint = Paint()
-        ..color = const Color(0xFF00d4ff)
-        ..style = PaintingStyle.fill;
-      canvas.drawPath(waveformPath, playedPaint);
+      canvas.drawImageRect(images.played, src, dst, imagePaint);
       canvas.restore();
 
-      // Draw unplayed portion (clipped)
+      // Unplayed portion (clipped)
       canvas.save();
       canvas.clipRect(
         Rect.fromLTWH(width * progress, 0, width * (1 - progress), size.height),
       );
-      final unplayedPaint = Paint()
-        ..color = const Color(0xFF2a3f5f)
-        ..style = PaintingStyle.fill;
-      canvas.drawPath(waveformPath, unplayedPaint);
+      canvas.drawImageRect(images.unplayed, src, dst, imagePaint);
       canvas.restore();
     }
   }
@@ -506,7 +514,9 @@ class WaveformPainter extends CustomPainter {
         oldDelegate.pulseValue != pulseValue ||
         oldDelegate.dnaMode != dnaMode ||
         oldDelegate.evhStripesMode != evhStripesMode ||
-        oldDelegate.isMobile != isMobile;
+        oldDelegate.evhSeed != evhSeed ||
+        oldDelegate.isMobile != isMobile ||
+        oldDelegate.devicePixelRatio != devicePixelRatio;
   }
 
   void _drawHilt(
@@ -1022,66 +1032,50 @@ class WaveformPainter extends CustomPainter {
       Paint()..color = evhRed,
     );
 
-    // Stripe positions below are absolute pixel offsets, tuned for a
-    // ~1120-pixel canvas. On ultrawide displays at fullscreen the widget
-    // can be 1900+ pixels wide, leaving the right portion stripeless
-    // (solid red base only). Scale x positions by the actual width to
-    // stretch the pattern across the full canvas. Stripe widths/angles
-    // stay constant so individual stripes look the same — pattern just
-    // becomes slightly more open on wide screens, denser on narrow.
-    const double evhDesignWidth = 1120.0;
-    final double stripeScale = width / evhDesignWidth;
+    // Frankenstrat stripes — the same seeded generator as the Van Halen
+    // artist page (and the cast receiver's evhStripes): random spots,
+    // angles and widths, one stripe per ~40 px of width. The old fixed
+    // table was laid out for a 1120 px canvas and had its x positions
+    // scaled down to fit, so a phone got all 24 full-width stripes crammed
+    // together as a few fat, regular zigzags with no red. Angles stop at
+    // ~69° off vertical: steeper smears into a flat line on a bar this thin.
+    // Per-song seed (same formula as the receiver's evhStripes, so a song
+    // looks the same on the phone and the TV at the same bar width).
+    int seed = (0x5EED ^ (evhSeed * 2654435761)) & 0x7fffffff;
+    if (seed == 0) seed = 0x5EED;
+    double rnd() {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    }
 
-    // Define stripe patterns - chaotic angles like the real Frankenstein
-    final stripes = <Map<String, dynamic>>[
-      // Black stripes
-      {'color': evhBlack, 'x': -20.0, 'angle': 0.4, 'width': 18.0},
-      {'color': evhBlack, 'x': 60.0, 'angle': -0.6, 'width': 22.0},
-      {'color': evhBlack, 'x': 150.0, 'angle': 0.3, 'width': 16.0},
-      {'color': evhBlack, 'x': 240.0, 'angle': -0.5, 'width': 20.0},
-      {'color': evhBlack, 'x': 350.0, 'angle': 0.7, 'width': 18.0},
-      {'color': evhBlack, 'x': 450.0, 'angle': -0.4, 'width': 24.0},
-      {'color': evhBlack, 'x': 550.0, 'angle': 0.5, 'width': 16.0},
-      {'color': evhBlack, 'x': 650.0, 'angle': -0.3, 'width': 20.0},
-      {'color': evhBlack, 'x': 750.0, 'angle': 0.6, 'width': 18.0},
-      {'color': evhBlack, 'x': 850.0, 'angle': -0.5, 'width': 22.0},
-      {'color': evhBlack, 'x': 950.0, 'angle': 0.4, 'width': 16.0},
-      {'color': evhBlack, 'x': 1050.0, 'angle': -0.6, 'width': 20.0},
-      // White stripes
-      {'color': evhWhite, 'x': 20.0, 'angle': -0.5, 'width': 10.0},
-      {'color': evhWhite, 'x': 100.0, 'angle': 0.6, 'width': 8.0},
-      {'color': evhWhite, 'x': 200.0, 'angle': -0.4, 'width': 12.0},
-      {'color': evhWhite, 'x': 300.0, 'angle': 0.5, 'width': 10.0},
-      {'color': evhWhite, 'x': 400.0, 'angle': -0.7, 'width': 8.0},
-      {'color': evhWhite, 'x': 500.0, 'angle': 0.4, 'width': 12.0},
-      {'color': evhWhite, 'x': 600.0, 'angle': -0.6, 'width': 10.0},
-      {'color': evhWhite, 'x': 700.0, 'angle': 0.3, 'width': 8.0},
-      {'color': evhWhite, 'x': 800.0, 'angle': -0.5, 'width': 10.0},
-      {'color': evhWhite, 'x': 900.0, 'angle': 0.6, 'width': 12.0},
-      {'color': evhWhite, 'x': 1000.0, 'angle': -0.4, 'width': 8.0},
-      {'color': evhWhite, 'x': 1100.0, 'angle': 0.5, 'width': 10.0},
-    ];
-
-    // Draw each stripe
-    for (final stripe in stripes) {
-      final color = stripe['color'] as Color;
-      final x = stripe['x'] as double;
-      final angle = stripe['angle'] as double;
-      final stripeWidth = stripe['width'] as double;
-
-      canvas.save();
-      canvas.translate(x * stripeScale, centerY);
-      canvas.rotate(angle);
-
-      canvas.drawRect(
-        Rect.fromCenter(
-          center: Offset.zero,
-          width: stripeWidth,
-          height: size.height * 3,
-        ),
-        Paint()..color = color,
-      );
-      canvas.restore();
+    // Jittered slots: one stripe somewhere inside each equal slice of the
+    // bar, so pure chance can't leave a stretch bare (it bunched up and
+    // left the start of the bar nearly plain red).
+    final n = math.max(8, (width / 32).round());
+    final slot = (width + 40) / n;
+    // (isBlack, width, x, y, angle): generated in slot order with the same
+    // draw sequence as the receiver, then painted white first, black on top.
+    final stripes = <(bool, double, double, double, double)>[];
+    for (var i = 0; i < n; i++) {
+      final isBlack = rnd() >= 9 / 16;
+      final w = isBlack ? 12 + rnd() * 9 : 7 + rnd() * 6;
+      final x = -20 + (i + rnd()) * slot;
+      final y = rnd() * size.height;
+      final angle = (rnd() - 0.5) * 2.4;
+      stripes.add((isBlack, w, x, y, angle));
+    }
+    for (final black in [false, true]) {
+      for (final (isBlack, w, x, y, angle) in stripes) {
+        if (isBlack != black) continue;
+        canvas.save();
+        canvas.translate(x, y);
+        canvas.rotate(angle);
+        canvas.drawRect(
+          Rect.fromCenter(center: Offset.zero, width: w, height: size.height * 6),
+          Paint()..color = isBlack ? evhBlack : evhWhite,
+        );
+        canvas.restore();
+      }
     }
 
     canvas.restore();
@@ -1114,5 +1108,67 @@ class WaveformPainter extends CustomPainter {
 
   double _sineWave(double x) {
     return math.sin(x);
+  }
+}
+
+/// Normal-mode waveform rendered once into two images at device resolution
+/// (played + unplayed colours). One entry: only one waveform is on screen at a
+/// time. A new song (new data list), a resize or a DPI change re-renders it.
+class _WaveformImages {
+  _WaveformImages._(this.data, this.size, this.dpr, this.played, this.unplayed);
+
+  final List<double> data;
+  final Size size;
+  final double dpr;
+  final ui.Image played;
+  final ui.Image unplayed;
+
+  static _WaveformImages? _last;
+
+  static _WaveformImages of(
+    List<double> data,
+    Size size,
+    double dpr,
+    Path Function() buildPath,
+  ) {
+    final cached = _last;
+    if (cached != null &&
+        identical(cached.data, data) &&
+        cached.size == size &&
+        cached.dpr == dpr) {
+      return cached;
+    }
+    final path = buildPath();
+    final w = (size.width * dpr).ceil();
+    final h = (size.height * dpr).ceil();
+    ui.Image render(Color color) {
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+      canvas.scale(dpr);
+      canvas.drawPath(
+        path,
+        Paint()
+          ..color = color
+          ..style = PaintingStyle.fill,
+      );
+      final picture = recorder.endRecording();
+      final image = picture.toImageSync(w, h);
+      picture.dispose();
+      return image;
+    }
+
+    final next = _WaveformImages._(
+      data,
+      size,
+      dpr,
+      render(const Color(0xFF00d4ff)),
+      render(const Color(0xFF2a3f5f)),
+    );
+    // Safe while an old frame still shows them: a picture keeps its images
+    // alive until it is gone too.
+    cached?.played.dispose();
+    cached?.unplayed.dispose();
+    _last = next;
+    return next;
   }
 }

@@ -301,6 +301,7 @@ class _DuplicateReviewScreenState extends State<DuplicateReviewScreen> {
                     ? CachedNetworkImage(
                         imageUrl: _apiService.getArtworkUrl(albumId),
                         width: 60,
+                        memCacheWidth: 120,
                         height: 60,
                         fit: BoxFit.cover,
                         placeholder: (context, url) => Container(

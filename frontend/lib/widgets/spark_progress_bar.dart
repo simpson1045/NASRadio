@@ -1,16 +1,21 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart' show Ticker;
 import 'dart:math';
 
 class SparkProgressBar extends StatefulWidget {
   final double progress;
   final Color progressColor;
   final Color backgroundColor;
+  /// Sparks spawn only while active (playing); when it goes false the last
+  /// sparks fade out and the bar stops animating entirely.
+  final bool active;
 
   const SparkProgressBar({
     super.key,
     required this.progress,
     this.progressColor = const Color(0xFF00d4ff),
     this.backgroundColor = const Color(0xFF0d1b2a),
+    this.active = true,
   });
 
   @override
@@ -19,25 +24,33 @@ class SparkProgressBar extends StatefulWidget {
 
 class _SparkProgressBarState extends State<SparkProgressBar>
     with SingleTickerProviderStateMixin {
-  late AnimationController _animationController;
+  // Runs only while active or while sparks are still fading (it used to be a
+  // 24 h repeating controller that ran even when paused). The app-wide
+  // TickerMode also mutes it while the app can't be seen.
+  late final Ticker _ticker;
   final List<Spark> _sparks = [];
   final Random _random = Random();
 
   @override
   void initState() {
     super.initState();
-    _animationController =
-        AnimationController(vsync: this, duration: const Duration(hours: 24))
-          ..addListener(() {
-            _updateSparks();
-            if (mounted) setState(() {});
-          });
-    _animationController.repeat();
+    _ticker = createTicker((_) {
+      _updateSparks();
+      if (!widget.active && _sparks.isEmpty) _ticker.stop();
+      if (mounted) setState(() {});
+    });
+    if (widget.active) _ticker.start();
+  }
+
+  @override
+  void didUpdateWidget(SparkProgressBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.active && !_ticker.isActive) _ticker.start();
   }
 
   void _updateSparks() {
     // Generate new sparks at the progress point
-    if (_random.nextDouble() < 0.3) {
+    if (widget.active && _random.nextDouble() < 0.3) {
       // 30% chance each frame
       _sparks.add(
         Spark(
@@ -60,7 +73,7 @@ class _SparkProgressBarState extends State<SparkProgressBar>
 
   @override
   void dispose() {
-    _animationController.dispose();
+    _ticker.dispose();
     super.dispose();
   }
 

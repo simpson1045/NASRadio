@@ -15,6 +15,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../widgets/explicit_badge.dart';
 import '../widgets/hdcd_badge.dart';
 import '../widgets/surround_badge.dart';
+import '../widgets/edition_badge.dart';
 
 class SearchScreen extends StatefulWidget {
   final AudioPlayerService audioPlayerService;
@@ -34,6 +35,10 @@ class _SearchScreenState extends State<SearchScreen> {
   final ApiService _apiService = ApiService();
   final TextEditingController _searchController = TextEditingController();
   Timer? _debounceTimer;
+  // Numbers each search: only the newest one may update the results. A slow
+  // answer for a half-typed query ("the hun") used to land after the real
+  // one ("the hunter") and overwrite it (Nov 3, during a NAS pool stall).
+  int _searchSeq = 0;
 
   bool get _isMobile => Platform.isAndroid || Platform.isIOS;
 
@@ -144,6 +149,7 @@ class _SearchScreenState extends State<SearchScreen> {
   }
 
   Future<void> _performSearch(String query) async {
+    final seq = ++_searchSeq;
     if (query.isEmpty) {
       setState(() {
         _artists = [];
@@ -160,6 +166,7 @@ class _SearchScreenState extends State<SearchScreen> {
 
     try {
       final results = await _apiService.search(query);
+      if (!mounted || seq != _searchSeq) return; // a newer search took over
 
       setState(() {
         _artists = (results['artists'] as List)
@@ -180,6 +187,7 @@ class _SearchScreenState extends State<SearchScreen> {
         _addToSearchHistory(query);
       }
     } catch (e) {
+      if (!mounted || seq != _searchSeq) return; // stale: the newer one decides
       setState(() {
         _isSearching = false;
       });
@@ -223,11 +231,13 @@ class _SearchScreenState extends State<SearchScreen> {
                     icon: const Icon(Icons.clear, color: Colors.white54),
                     onPressed: () {
                       _searchController.clear();
+                      _searchSeq++; // drop any search still in flight
                       setState(() {
                         _artists = [];
                         _albums = [];
                         _songs = [];
                         _hasSearched = false;
+                        _isSearching = false;
                       });
                     },
                   )
@@ -239,11 +249,13 @@ class _SearchScreenState extends State<SearchScreen> {
 
             // Clear results immediately if empty
             if (value.isEmpty) {
+              _searchSeq++; // drop any search still in flight
               setState(() {
                 _artists = [];
                 _albums = [];
                 _songs = [];
                 _hasSearched = false;
+                _isSearching = false;
               });
               return;
             }
@@ -546,23 +558,26 @@ class _SearchScreenState extends State<SearchScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: CachedNetworkImage(
-                imageUrl: _apiService.getArtworkUrl(album.id),
-                width: size,
-                height: size,
-                fit: BoxFit.cover,
-                placeholder: (context, url) => Container(
+            EditionBadge.over(
+              album: album,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: CachedNetworkImage(
+                  imageUrl: _apiService.getArtworkUrl(album.id),
                   width: size,
                   height: size,
-                  color: const Color(0xFF1a2332),
-                ),
-                errorWidget: (context, url, error) => Container(
-                  width: size,
-                  height: size,
-                  color: const Color(0xFF1a2332),
-                  child: const Icon(Icons.album, color: Color(0xFF00d4ff)),
+                  fit: BoxFit.cover,
+                  placeholder: (context, url) => Container(
+                    width: size,
+                    height: size,
+                    color: const Color(0xFF1a2332),
+                  ),
+                  errorWidget: (context, url, error) => Container(
+                    width: size,
+                    height: size,
+                    color: const Color(0xFF1a2332),
+                    child: const Icon(Icons.album, color: Color(0xFF00d4ff)),
+                  ),
                 ),
               ),
             ),

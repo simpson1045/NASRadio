@@ -24,6 +24,22 @@ class _SystemLogsScreenState extends State<SystemLogsScreen> {
   bool _essentia = false;
   bool _transcode = false;
 
+  // False while another section or page covers this one, or the app is
+  // minimized (TickerMode): the 3 s refresh skips then, instead of reloading
+  // and rebuilding 500 log lines nobody can see (Nov 9 audit).
+  bool _visible = true;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final visible = TickerMode.of(context);
+    if (visible && !_visible) {
+      _loadLogs();
+      _loadHealth();
+    }
+    _visible = visible;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -32,6 +48,7 @@ class _SystemLogsScreenState extends State<SystemLogsScreen> {
     _refreshTimer = Timer.periodic(
       const Duration(seconds: 3),
       (_) {
+        if (!_visible) return;
         _loadLogs();
         _loadHealth();
       },

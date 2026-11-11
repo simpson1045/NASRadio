@@ -171,11 +171,11 @@ class ProwlarrClient:
         self.base_url = self.config.PROWLARR_URL.rstrip("/")
         self.api_key = self.config.PROWLARR_API_KEY
 
-    def _get(self, endpoint, params=None):
+    def _get(self, endpoint, params=None, timeout=120):
         """Make a GET request to Prowlarr API"""
         url = f"{self.base_url}/api/v1/{endpoint}"
         headers = {"X-Api-Key": self.api_key}
-        response = requests.get(url, headers=headers, params=params, timeout=120)
+        response = requests.get(url, headers=headers, params=params, timeout=timeout)
         response.raise_for_status()
         return response.json()
 
@@ -349,7 +349,7 @@ class ProwlarrClient:
         }
 
     def search(self, query, indexer_ids=None, categories=None,
-               filter_rutracker_source=False):
+               filter_rutracker_source=False, timeout=120):
         """
         Search for releases across indexers.
 
@@ -386,7 +386,7 @@ class ProwlarrClient:
             if indexer_ids:
                 params["indexerIds"] = indexer_ids
 
-            results = self._get("search", params)
+            results = self._get("search", params, timeout=timeout)
 
             # Tokenize the query into lowercased terms for whole-word
             # post-filtering (see _matches_query). Indexers do loose

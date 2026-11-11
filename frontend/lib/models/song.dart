@@ -68,6 +68,11 @@ class Song {
   // sourceType=='station'; null otherwise.
   final String? stationArtworkUrl;
 
+  /// Album references: this song lives on another album (albumId /
+  /// homeAlbumTitle) and is only LISTED on the album being viewed.
+  final bool linked;
+  final String? homeAlbumTitle;
+
   bool get isPodcast => sourceType == 'podcast';
   bool get isStation => sourceType == 'station';
 
@@ -116,6 +121,8 @@ class Song {
     this.playedPosition = 0,
     this.isCompleted = false,
     this.stationArtworkUrl,
+    this.linked = false,
+    this.homeAlbumTitle,
   });
 
   factory Song.fromJson(Map<String, dynamic> json) {
@@ -157,6 +164,8 @@ class Song {
       playedPosition: _toInt(json['played_position']),
       isCompleted: json['is_completed'] == 1 || json['is_completed'] == true,
       stationArtworkUrl: json['station_artwork_url'] as String?,
+      linked: json['linked'] == true,
+      homeAlbumTitle: json['home_album_title'] as String?,
     );
   }
 
@@ -217,6 +226,8 @@ class Song {
       return isStation ? 'RADIO' : 'STREAM';
     }
     final extension = filePath.split('.').last.toUpperCase();
+    // Disc-rip TrueHD/Atmos lives in Matroska audio (.mka).
+    if (extension == 'MKA') return 'TrueHD';
     return extension;
   }
 
@@ -224,6 +235,8 @@ class Song {
     switch (fileFormat) {
       case 'FLAC':
         return const Color(0xFF00d4ff); // Cyan - the elite choice
+      case 'TrueHD':
+        return const Color(0xFFFFB300); // Amber - lossless Dolby
       case 'MP3':
         return Colors.orange; // Orange - the peasant format
       case 'WAV':

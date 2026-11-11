@@ -13,6 +13,7 @@ import 'year_detail_screen.dart';
 import '../widgets/alphabet_scroll_bar.dart';
 import '../widgets/music_context_menu.dart';
 import '../widgets/settings_dialog.dart';
+import '../widgets/edition_badge.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'rss_feeds_screen.dart';
 
@@ -323,6 +324,7 @@ class _LibraryScreenState extends State<LibraryScreen>
                       child: CachedNetworkImage(
                         imageUrl: _apiService.getArtistImageUrl(artist.id),
                         width: 40,
+                        memCacheWidth: 80,
                         height: 40,
                         fit: BoxFit.cover,
                         placeholder: (context, url) => Container(
@@ -392,6 +394,7 @@ class _LibraryScreenState extends State<LibraryScreen>
                       child: CachedNetworkImage(
                         imageUrl: _apiService.getArtworkUrl(album.id),
                         width: 50,
+                        memCacheWidth: 100,
                         height: 50,
                         fit: BoxFit.cover,
                         placeholder: (context, url) => Container(
@@ -408,8 +411,13 @@ class _LibraryScreenState extends State<LibraryScreen>
                     )
                   : const Icon(Icons.album, size: 40, color: Color(0xFF00d4ff)),
               title: Text(album.title),
-              subtitle: Text(
-                '${album.artistName} • ${album.year ?? "Unknown"} • ${album.songCount} songs',
+              subtitle: EditionBadge.after(
+                album: album,
+                text: Text(
+                  '${album.artistName} • ${album.year ?? "Unknown"} • ${album.songCount} songs',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
               trailing: MusicContextMenu(
                 itemType: 'album',

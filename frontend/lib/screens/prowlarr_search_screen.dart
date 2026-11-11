@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -41,6 +42,17 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
   final Map<String, Map<String, dynamic>> _verifiedSwarm = {};
   Map<String, Map<String, dynamic>> _libraryMatches = {};
   Set<String> _inTransmission = {};
+
+  // Per-indexer search: every indexer is its own request, results merge in as
+  // each answers, and the Search button turns into a red Cancel while any are
+  // still out. _searchGen drops answers from a search that was cancelled or
+  // replaced.
+  int _searchGen = 0;
+  String? _searchId;
+  final Map<int, String> _indexerNames = {};
+  final Map<int, String> _indexerStatus = {}; // searching | done:N | timeout | error | cancelled
+  List<Map<String, dynamic>> _deepIndexers = [];
+  bool get _searching => _indexerStatus.values.any((s) => s == 'searching');
 
   // Deep search (RuTracker etc.)
   bool _isDeepSearching = false;
@@ -167,91 +179,202 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
 
     _addToHistory(query);
 
+    final gen = ++_searchGen;
+    final searchId = '${DateTime.now().microsecondsSinceEpoch}-$gen';
     setState(() {
       _isLoading = true;
       _showHistory = false;
       _error = null;
       _hasSearched = true;
+      _results = [];
       _libraryMatches = {};
       _inTransmission = {};
       _isDeepSearching = false;
       _deepSearchDone = false;
       _deepResultsAdded = 0;
       _rutrackerFilteredCount = 0;
+      _searchId = searchId;
+      _indexerStatus.clear();
     });
 
+    List<Map<String, dynamic>> fast;
     try {
-      final result = await _apiService.searchProwlarr(query);
-      final results = List<Map<String, dynamic>>.from(result['results'] ?? []);
-
-      // Widget can be disposed during the await (user navigates away
-      // mid-search). setState on a disposed State throws "Null check
-      // operator used on a null value" — caught a 2026-05-20 crash.
-      if (!mounted) return;
-      setState(() {
-        _results = results;
-        _rutrackerFilteredCount =
-            (result['rutracker_filtered_count'] as int?) ?? 0;
-      });
-
-      // Check library and Transmission in parallel
-      await Future.wait([
-        _checkLibraryMatches(results),
-        _checkTransmissionMatches(results),
-      ]);
-
-      if (!mounted) return;
-      setState(() {
-        _isLoading = false;
-      });
+      final tiers = await _apiService.getProwlarrTiers();
+      fast = List<Map<String, dynamic>>.from(tiers['fast'] ?? []);
+      _deepIndexers = List<Map<String, dynamic>>.from(tiers['deep'] ?? []);
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() {
-        _error = e.toString();
+        _error = e.toString().replaceFirst('Exception: ', '');
         _isLoading = false;
       });
+      return;
     }
+    if (!mounted || gen != _searchGen) return;
+    if (fast.isEmpty) {
+      setState(() {
+        _error = 'No indexers are enabled in Prowlarr';
+        _isLoading = false;
+      });
+      return;
+    }
+    setState(() {
+      for (final i in fast) {
+        final id = i['id'] as int;
+        _indexerNames[id] = i['name'] as String? ?? 'Indexer $id';
+        _indexerStatus[id] = 'searching';
+      }
+    });
+    for (final i in fast) {
+      unawaited(_searchOneIndexer(gen, searchId, query, i['id'] as int, deep: false));
+    }
+  }
+
+  /// One indexer's request. Merges its results into the list the moment it
+  /// answers (deduped by guid, re-sorted by seeders) and fills in the
+  /// library / Transmission badges for just the new ones.
+  Future<void> _searchOneIndexer(int gen, String searchId, String query, int indexerId,
+      {required bool deep}) async {
+    String status;
+    List<Map<String, dynamic>> added = [];
+    try {
+      final r = await _apiService.searchProwlarrIndexer(
+        query,
+        indexerId,
+        searchId,
+        timeoutSec: deep ? 120 : 25,
+        filterRutracker: !deep,
+      );
+      if (!mounted || gen != _searchGen) return;
+      if (r['cancelled'] == true) {
+        status = 'cancelled';
+      } else {
+        final incoming = List<Map<String, dynamic>>.from(r['results'] ?? []);
+        final have = _results.map((x) => x['guid']).toSet();
+        added = incoming.where((x) => !have.contains(x['guid'])).toList();
+        _rutrackerFilteredCount += (r['rutracker_filtered_count'] as int?) ?? 0;
+        status = 'done:${incoming.length}';
+      }
+    } on TimeoutException {
+      status = 'timeout';
+    } catch (e) {
+      status = e.toString().toLowerCase().contains('timed out') ? 'timeout' : 'error';
+    }
+    if (!mounted || gen != _searchGen) return;
+    setState(() {
+      _indexerStatus[indexerId] = status;
+      if (added.isNotEmpty) {
+        _results = [..._results, ...added]
+          ..sort((a, b) => (b['seeders'] as int? ?? 0).compareTo(a['seeders'] as int? ?? 0));
+        if (deep) _deepResultsAdded += added.length;
+      }
+      if (_results.isNotEmpty || !_searching) _isLoading = false;
+      if (deep && !_deepIndexers.any((i) => _indexerStatus[i['id']] == 'searching')) {
+        _isDeepSearching = false;
+        _deepSearchDone = true;
+      }
+      if (!_searching && _results.isEmpty && _error == null &&
+          _indexerStatus.values.every((s) => s == 'timeout' || s == 'error')) {
+        _error = 'No indexer answered. Prowlarr may be busy; try again.';
+      }
+    });
+    if (added.isNotEmpty) {
+      unawaited(Future.wait([
+        _checkLibraryMatches(added),
+        _checkTransmissionMatches(added),
+      ]));
+    }
+  }
+
+  /// The red ❌: tell the server to stop, stop listening, keep what arrived.
+  void _cancelSearch() {
+    final id = _searchId;
+    if (id != null) _apiService.cancelProwlarrSearch(id).ignore();
+    _searchGen++;
+    setState(() {
+      _indexerStatus.updateAll((_, s) => s == 'searching' ? 'cancelled' : s);
+      _isLoading = false;
+      if (_isDeepSearching) {
+        _isDeepSearching = false;
+        _deepSearchDone = true;
+      }
+    });
   }
 
   Future<void> _performDeepSearch() async {
     final query = _searchController.text.trim();
-    if (query.isEmpty) return;
-
+    if (query.isEmpty || _deepIndexers.isEmpty) return;
+    final gen = _searchGen;
+    final searchId = _searchId ?? '${DateTime.now().microsecondsSinceEpoch}-$gen';
+    _searchId = searchId;
     setState(() {
       _isDeepSearching = true;
-    });
-
-    try {
-      final result = await _apiService.searchProwlarr(query, deepOnly: true);
-      final deepResults = List<Map<String, dynamic>>.from(result['results'] ?? []);
-
-      // Merge: add only results whose guid isn't already in _results
-      final existingGuids = _results.map((r) => r['guid']).toSet();
-      final newResults = deepResults.where((r) => !existingGuids.contains(r['guid'])).toList();
-
-      setState(() {
-        _results.addAll(newResults);
-        // Re-sort by seeders
-        _results.sort((a, b) => (b['seeders'] as int? ?? 0).compareTo(a['seeders'] as int? ?? 0));
-        _deepResultsAdded = newResults.length;
-        _isDeepSearching = false;
-        _deepSearchDone = true;
-      });
-
-      // Check library/transmission matches for new results
-      if (newResults.isNotEmpty) {
-        await Future.wait([
-          _checkLibraryMatches(newResults),
-          _checkTransmissionMatches(newResults),
-        ]);
+      _deepResultsAdded = 0;
+      for (final i in _deepIndexers) {
+        final id = i['id'] as int;
+        _indexerNames[id] = i['name'] as String? ?? 'Indexer $id';
+        _indexerStatus[id] = 'searching';
       }
-    } catch (e) {
-      setState(() {
-        _isDeepSearching = false;
-        _deepSearchDone = true;
-        _deepResultsAdded = 0;
-      });
+    });
+    for (final i in _deepIndexers) {
+      unawaited(_searchOneIndexer(gen, searchId, query, i['id'] as int, deep: true));
     }
+  }
+
+  /// One small chip per indexer under the filters: spinner while searching,
+  /// then how many it found / timed out / failed / cancelled.
+  Widget _buildIndexerStatusRow() {
+    if (_indexerStatus.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      child: Wrap(
+        spacing: 6,
+        runSpacing: 6,
+        children: _indexerStatus.entries.map((e) {
+          final name = _indexerNames[e.key] ?? 'Indexer ${e.key}';
+          final s = e.value;
+          Widget lead;
+          String label;
+          Color color;
+          if (s == 'searching') {
+            lead = const SizedBox(
+                width: 10, height: 10,
+                child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF00d4ff)));
+            label = name;
+            color = const Color(0xFF00d4ff);
+          } else if (s.startsWith('done:')) {
+            lead = const Icon(Icons.check, size: 12, color: Colors.green);
+            label = '$name ${s.substring(5)}';
+            color = Colors.green;
+          } else if (s == 'timeout') {
+            lead = const Icon(Icons.timer_off, size: 12, color: Colors.orange);
+            label = '$name too slow';
+            color = Colors.orange;
+          } else if (s == 'cancelled') {
+            lead = Icon(Icons.block, size: 12, color: Colors.grey[500]);
+            label = '$name stopped';
+            color = Colors.grey;
+          } else {
+            lead = const Icon(Icons.error_outline, size: 12, color: Colors.redAccent);
+            label = '$name failed';
+            color = Colors.redAccent;
+          }
+          return Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.08),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: color.withOpacity(0.35)),
+            ),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              lead,
+              const SizedBox(width: 4),
+              Text(label, style: TextStyle(color: color, fontSize: 11)),
+            ]),
+          );
+        }).toList(),
+      ),
+    );
   }
 
   Future<void> _checkLibraryMatches(List<Map<String, dynamic>> results) async {
@@ -262,12 +385,17 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
       final response = await _apiService.checkLibraryExists(titles);
 
       if (response['success'] == true) {
+        if (!mounted) return;
         setState(() {
-          _libraryMatches = Map<String, Map<String, dynamic>>.from(
-            (response['results'] as Map).map(
-              (k, v) => MapEntry(k.toString(), Map<String, dynamic>.from(v)),
+          // Merge: results arrive one indexer at a time.
+          _libraryMatches = {
+            ..._libraryMatches,
+            ...Map<String, Map<String, dynamic>>.from(
+              (response['results'] as Map).map(
+                (k, v) => MapEntry(k.toString(), Map<String, dynamic>.from(v)),
+              ),
             ),
-          );
+          };
         });
       }
     } catch (e, stack) {
@@ -309,8 +437,9 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
           }
         }
 
+        if (!mounted) return;
         setState(() {
-          _inTransmission = matches;
+          _inTransmission = {..._inTransmission, ...matches};
         });
       }
     } catch (e) {
@@ -745,33 +874,47 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                         ),
                       ),
                       const SizedBox(width: 12),
-                      ElevatedButton(
-                        onPressed: _isLoading ? null : _performSearch,
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF00d4ff),
-                          foregroundColor: Colors.black,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 24,
-                            vertical: 16,
-                          ),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                        ),
-                        child: _isLoading
-                            ? const SizedBox(
-                                width: 20,
-                                height: 20,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                  color: Colors.black,
+                      // Search turns into a red Cancel while any indexer is
+                      // still out: stops the server side and keeps whatever
+                      // already arrived.
+                      (_searching || (_isLoading && _indexerStatus.isEmpty))
+                          ? ElevatedButton.icon(
+                              onPressed: _cancelSearch,
+                              icon: const Icon(Icons.close, size: 18),
+                              label: const Text(
+                                'Cancel',
+                                style: TextStyle(fontWeight: FontWeight.bold),
+                              ),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.redAccent,
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 16,
                                 ),
-                              )
-                            : const Text(
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                              ),
+                            )
+                          : ElevatedButton(
+                              onPressed: _performSearch,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFF00d4ff),
+                                foregroundColor: Colors.black,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 24,
+                                  vertical: 16,
+                                ),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                              ),
+                              child: const Text(
                                 'Search',
                                 style: TextStyle(fontWeight: FontWeight.bold),
                               ),
-                      ),
+                            ),
                     ],
                   ),
                 ),
@@ -918,8 +1061,11 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                     ),
                   ),
 
+                _buildIndexerStatusRow(),
+
                 // Deep search banner (RuTracker)
-                if (_hasSearched && !_isLoading && _results.isNotEmpty && !_deepSearchDone)
+                if (_hasSearched && !_isLoading && _results.isNotEmpty && !_deepSearchDone &&
+                    _deepIndexers.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16),
                     child: GestureDetector(
@@ -952,10 +1098,10 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                                 ),
                               ),
                               const SizedBox(width: 10),
-                              const Expanded(
+                              Expanded(
                                 child: Text(
-                                  'Searching RuTracker...',
-                                  style: TextStyle(color: Colors.orange, fontSize: 13),
+                                  'Searching ${_deepIndexers.map((i) => i['name']).join(' + ')}...',
+                                  style: const TextStyle(color: Colors.orange, fontSize: 13),
                                 ),
                               ),
                             ] else ...[
@@ -969,7 +1115,7 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                                     Text(
                                       _rutrackerFilteredCount > 0
                                           ? 'Show $_rutrackerFilteredCount hidden RuTracker result${_rutrackerFilteredCount == 1 ? '' : 's'}'
-                                          : 'Also search RuTracker',
+                                          : 'Also search ${_deepIndexers.map((i) => i['name']).join(' + ')}',
                                       style: const TextStyle(color: Color(0xFF00d4ff), fontSize: 13, fontWeight: FontWeight.w500),
                                     ),
                                     Text(
@@ -1006,7 +1152,7 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
                           const Icon(Icons.check_circle_outline, size: 14, color: Colors.green),
                           const SizedBox(width: 6),
                           Text(
-                            '+$_deepResultsAdded results from RuTracker',
+                            '+$_deepResultsAdded results from ${_deepIndexers.map((i) => i['name']).join(' + ')}',
                             style: const TextStyle(color: Colors.green, fontSize: 12),
                           ),
                         ],
@@ -1074,7 +1220,7 @@ class _ProwlarrSearchScreenState extends State<ProwlarrSearchScreen> {
   }
 
   Widget _buildResultsContent() {
-    if (_isLoading) {
+    if (_isLoading && _results.isEmpty) {
       return const Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,

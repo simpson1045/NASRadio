@@ -61,7 +61,11 @@ class FavoritesBatcher {
     Map<int, List<Completer<bool>>> byId,
   ) async {
     try {
-      final result = await _api.checkFavoritesBatch(itemType, ids);
+      // A request that hangs (no answer, no error) left every waiting heart
+      // spinning forever: time out into the "not favorited" fallback below.
+      final result = await _api
+          .checkFavoritesBatch(itemType, ids)
+          .timeout(const Duration(seconds: 15));
       for (final id in ids) {
         _complete(byId[id], result[id] ?? false);
       }

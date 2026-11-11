@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:archive/archive.dart';
+import 'package:flutter/foundation.dart' show ValueNotifier;
 import 'package:http/http.dart' as http;
 import 'package:open_filex/open_filex.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -15,6 +16,7 @@ class UpdateInfo {
   final String changelog;
   final int sizeBytes;
   final String releasedAt;
+  final String channel; // "beta" for beta-channel builds, else "stable"
 
   UpdateInfo({
     required this.version,
@@ -22,7 +24,10 @@ class UpdateInfo {
     required this.changelog,
     required this.sizeBytes,
     required this.releasedAt,
+    this.channel = 'stable',
   });
+
+  bool get isBeta => channel == 'beta';
 }
 
 /// Handles checking, downloading, and applying app updates.
@@ -31,7 +36,20 @@ class UpdateService {
 
   /// Check if a newer version is available on the server.
   /// Returns [UpdateInfo] if an update exists, null if up-to-date.
+  /// "beta" in builds made by scripts/beta.ps1 (--dart-define=CHANNEL=beta);
+  /// empty in public releases. Shown as a BETA chip in Settings.
+  static const String channel = String.fromEnvironment('CHANNEL');
+  static bool get isBeta => channel == 'beta';
+
+  /// Ask the main screen to look for an update again (the home screen's
+  /// refresh button, coming back to the app after a while). Until Nov 9 it
+  /// only looked once, at start-up: an update needed a full close + reopen.
+  static final ValueNotifier<int> recheck = ValueNotifier<int>(0);
+  static DateTime? lastCheck;
+  static void requestRecheck() => recheck.value++;
+
   static Future<UpdateInfo?> checkForUpdate() async {
+    lastCheck = DateTime.now();
     final log = AppLogger.instance;
     try {
       // Fetch our own version FIRST so we can tell the server which build we're
@@ -62,7 +80,15 @@ class UpdateService {
           ? 'windows_size'
           : Platform.isLinux
               ? 'linux_size'
-              : 'android_size';
+              : Platform.isMacOS
+                  ? 'macos_size'
+                  : 'android_size';
+      // No Mac build in this release (macos_size 0) = no update for this
+      // Mac. Without this the Mac would be offered the Android APK.
+      if (Platform.isMacOS && ((data['macos_size'] as num?)?.toInt() ?? 0) == 0) {
+        log.info('Update v$serverVersion+$serverBuild has no macOS build; skipping');
+        return null;
+      }
       log.info(
         'Update available: v$serverVersion+$serverBuild '
         '(current: v$currentVersion+$currentBuild)',
@@ -74,6 +100,7 @@ class UpdateService {
         changelog: data['changelog'] ?? '',
         sizeBytes: data[sizeKey] ?? 0,
         releasedAt: data['released_at'] ?? '',
+        channel: data['channel'] as String? ?? 'stable',
       );
     } catch (e) {
       log.warning('Update check failed: $e');
@@ -90,8 +117,11 @@ class UpdateService {
     String currentVersion,
     int currentBuild,
   ) {
-    final s = serverVersion.split('.').map((p) => int.tryParse(p) ?? 0).toList();
-    final c = currentVersion.split('.').map((p) => int.tryParse(p) ?? 0).toList();
+    // Leading digits of each part: "1.4.18-beta" must read as 1.4.18, not
+    // 1.4.0 (int.tryParse("18-beta") is null, which hid the first beta).
+    int part(String p) => int.tryParse(RegExp(r'^\d+').stringMatch(p) ?? '') ?? 0;
+    final s = serverVersion.split('.').map(part).toList();
+    final c = currentVersion.split('.').map(part).toList();
     while (s.length < 3) { s.add(0); }
     while (c.length < 3) { c.add(0); }
     for (var i = 0; i < 3; i++) {
@@ -118,6 +148,9 @@ class UpdateService {
     } else if (Platform.isLinux) {
       platform = 'linux';
       ext = '.tar.xz';
+    } else if (Platform.isMacOS) {
+      platform = 'macos';
+      ext = '.zip';
     } else {
       platform = 'android';
       ext = '.apk';
@@ -191,6 +224,7 @@ class UpdateService {
   /// Apply the downloaded update.
   /// - Android: opens the APK with the system installer
   /// - Windows: extracts zip, writes update script, launches it, exits app
+  /// - macOS: script swaps the new NASRadio.app into place, relaunches
   static Future<void> applyUpdate(String filePath) async {
     final log = AppLogger.instance;
 
@@ -201,6 +235,8 @@ class UpdateService {
       await _applyWindowsUpdate(filePath);
     } else if (Platform.isLinux) {
       await _applyLinuxUpdate(filePath);
+    } else if (Platform.isMacOS) {
+      await _applyMacUpdate(filePath);
     }
   }
 
@@ -446,6 +482,84 @@ exit 0
       [scriptPath],
       mode: ProcessStartMode.detached,
     );
+    exit(0);
+  }
+
+  /// macOS: swap the whole NASRadio.app bundle and relaunch.
+  ///
+  /// The zip holds one NASRadio.app (made with `ditto -c -k --keepParent`).
+  /// It is extracted with `ditto`, not the Dart archive package, because a
+  /// Mac app's frameworks are full of symlinks that a plain unzip flattens,
+  /// which breaks the code signature and the app won't launch. The script
+  /// waits for this process to exit, moves the running bundle aside to
+  /// `.old`, moves the new one in, and only removes `.old` once the new app
+  /// has launched; on any failure it puts the old bundle back. This needs the
+  /// App Sandbox off (a sandboxed app can't touch /Applications).
+  /// Log: $TMPDIR/nasradio-update.log.
+  static Future<void> _applyMacUpdate(String zipPath) async {
+    final log = AppLogger.instance;
+
+    // .../NASRadio.app/Contents/MacOS/NASRadio -> .../NASRadio.app
+    final appPath = File(Platform.resolvedExecutable).parent.parent.parent.path;
+    if (!appPath.endsWith('.app')) {
+      throw Exception('Not running from an .app bundle ($appPath)');
+    }
+    final tempDir = (await getTemporaryDirectory()).path;
+    final extractDir = '$tempDir/nasradio-update-extracted';
+    final scriptPath = '$tempDir/nasradio-update.sh';
+    final logPath = '$tempDir/nasradio-update.log';
+
+    log.info('Staging macOS update; $zipPath -> $appPath');
+
+    final scriptContent = '''#!/bin/bash
+# Auto-generated by NASRadio update_service.dart macOS branch.
+set -u
+exec > "$logPath" 2>&1
+echo "=== NASRadio macOS update started at \$(date) ==="
+APP="$appPath"
+OLD="$appPath.old"
+
+# Wait (up to 30 s) for the running app to quit.
+for i in \$(seq 1 60); do
+  kill -0 $pid 2>/dev/null || break
+  sleep 0.5
+done
+
+rm -rf "$extractDir"
+mkdir -p "$extractDir"
+if ! ditto -x -k "$zipPath" "$extractDir"; then
+  echo "=== EXTRACT FAILED ==="; open "\$APP"; exit 1
+fi
+NEW=\$(find "$extractDir" -maxdepth 1 -name "*.app" | head -n 1)
+if [ -z "\$NEW" ]; then
+  echo "=== NO .app IN ZIP ==="; open "\$APP"; exit 1
+fi
+
+rm -rf "\$OLD"
+if ! mv "\$APP" "\$OLD"; then
+  echo "=== COULD NOT MOVE OLD APP ASIDE ==="; open "\$APP"; exit 1
+fi
+if ! mv "\$NEW" "\$APP"; then
+  echo "=== COULD NOT INSTALL NEW APP; restoring ==="
+  mv "\$OLD" "\$APP"; open "\$APP"; exit 1
+fi
+xattr -dr com.apple.quarantine "\$APP" 2>/dev/null
+
+if open "\$APP"; then
+  echo "=== UPDATE OK at \$(date) ==="
+  rm -rf "\$OLD" "$extractDir" "$zipPath"
+else
+  echo "=== NEW APP FAILED TO LAUNCH; restoring ==="
+  rm -rf "\$APP"; mv "\$OLD" "\$APP"; open "\$APP"
+fi
+rm -f "$scriptPath"
+exit 0
+''';
+
+    await File(scriptPath).writeAsString(scriptContent);
+    await Process.run('chmod', ['+x', scriptPath]);
+    log.info('Launching update script and exiting (log: $logPath)...');
+    await Process.start('/bin/bash', [scriptPath], mode: ProcessStartMode.detached);
     exit(0);
   }
 }

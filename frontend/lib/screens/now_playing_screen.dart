@@ -23,6 +23,7 @@ import '../widgets/mouse_back_button_wrapper.dart';
 import '../models/song.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import '../widgets/marquee_text.dart';
+import '../widgets/image_zoom.dart';
 import 'playlist_detail_screen.dart';
 import 'favorites_screen.dart';
 import 'stations_screen.dart';
@@ -38,6 +39,7 @@ import '../widgets/devices_sheet.dart';
 import 'tv/tv_now_playing_screen.dart';
 import 'dart:async';
 import 'main_navigation_screen.dart';
+import 'alarms_screen.dart';
 
 class NowPlayingScreen extends StatefulWidget {
   final AudioPlayerService audioPlayerService;
@@ -404,6 +406,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
   bool _lastTargetFull = false;
 
   void _onSyncControlChanged() {
+    _syncSmoothTicker();
     if (!mounted) return;
     final c = globalDeviceSyncService.isController;
     final songId = c ? widget.audioPlayerService.currentSong?.id : null;
@@ -540,6 +543,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
     _lastPositionTime = DateTime.now();
     _lastIsPlaying = newIsPlaying;
     _lastIsBuffering = newIsBuffering;
+    _syncSmoothTicker();
 
     // Gate the interpolated scrubber clock on genuine playback (see
     // _genuinePlaybackStarted). On a song change we re-arm the gate: a
@@ -720,7 +724,25 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
             : svc.position;
       }
     });
-    _smoothTicker!.start();
+    _syncSmoothTicker();
+  }
+
+  /// The scrubber clock asks for a frame every vsync, and on Windows every
+  /// frame redraws the whole window. Run it only while the position can
+  /// actually move: playing and not buffering, or mirroring another device.
+  /// Until Nov 9 it ran from open to close, paused included.
+  void _syncSmoothTicker() {
+    final t = _smoothTicker;
+    if (t == null) return;
+    final svc = widget.audioPlayerService;
+    final moving = (svc.isControlling || (svc.isPlaying && !svc.isBuffering)) &&
+        // A live station shows no scrubber or time: nothing to move.
+        !(svc.currentSong?.isStation ?? false);
+    if (moving && !t.isActive) {
+      t.start();
+    } else if (!moving && t.isActive) {
+      t.stop();
+    }
   }
 
 
@@ -778,6 +800,119 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
   // collide with a song id. An unsaved radio-browser result (synthetic
   // negative id) is auto-saved on favorite — the backend upserts by URL
   // and returns the real station id.
+  /// Long-press Repeat = 'play this song once more', a one-shot on top of
+  /// the repeat mode (Repeat All stays Repeat All). Shows 1x while armed.
+  Widget _withRepeatOnce(Widget repeatButton) {
+    final p = widget.audioPlayerService;
+    return GestureDetector(
+      onLongPress: () {
+        final armed = p.toggleRepeatOnce();
+        setState(() {});
+        final then = switch (p.repeatMode) {
+          RepeatMode.all => 'then Repeat All carries on',
+          RepeatMode.one => 'Repeat One is on anyway',
+          _ => 'then the queue carries on',
+        };
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          duration: const Duration(seconds: 2),
+          content: Text(armed ? 'Plays once more, $then' : 'Repeat once off'),
+        ));
+      },
+      child: Stack(
+        clipBehavior: Clip.none,
+        alignment: Alignment.center,
+        children: [
+          repeatButton,
+          if (p.repeatOnceArmed)
+            Positioned(
+              right: -4,
+              top: -4,
+              child: IgnorePointer(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF00d4ff),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: const Text(
+                    '1×',
+                    style: TextStyle(
+                        color: Colors.black, fontSize: 9, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 👎 next to the heart: tap = 'Not now' (held 30 days, skipped right
+  /// away, with Undo); long-press = also 'Never play this'.
+  Widget _buildNotNowButton(Song song, double size) {
+    if (song.isStation || song.isPodcast) return const SizedBox.shrink();
+    return GestureDetector(
+      onLongPress: () => _notNowMenu(song),
+      child: IconButton(
+        icon: Icon(Icons.thumb_down_alt_outlined, color: Colors.white70, size: size),
+        tooltip: 'Not now (30 days) · hold for more',
+        onPressed: () => _notNow(song, days: 30),
+      ),
+    );
+  }
+
+  Future<void> _notNow(Song song, {int? days = 30}) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await widget.audioPlayerService.holdSong(song, days: days);
+    } catch (_) {
+      // Kept on this phone; the server will hear on the next try.
+    }
+    messenger.showSnackBar(SnackBar(
+      content: Text(days == null
+          ? 'Won\'t play "${song.title}" again'
+          : 'Not playing "${song.title}" for $days days'),
+      action: SnackBarAction(
+        label: 'Undo',
+        onPressed: () => widget.audioPlayerService.unholdSong(song.id),
+      ),
+    ));
+  }
+
+  void _notNowMenu(Song song) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1a2332),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.thumb_down_alt_outlined, color: Colors.white70),
+              title: const Text('Not now', style: TextStyle(color: Colors.white)),
+              subtitle: const Text('Skip it for 30 days',
+                  style: TextStyle(color: Colors.white38)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _notNow(song, days: 30);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.block, color: Colors.redAccent),
+              title: const Text('Never play this', style: TextStyle(color: Colors.white)),
+              subtitle: const Text('Until you lift it in Settings',
+                  style: TextStyle(color: Colors.white38)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _notNow(song, days: null);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildFavoriteButton(Song song, double size) {
     if (!song.isStation) {
       return FavoriteButton(itemType: 'song', itemId: song.id, size: size);
@@ -927,6 +1062,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                         child: CachedNetworkImage(
                           imageUrl: _artworkUrlForSong(next),
                           width: 52,
+                          memCacheWidth: 104,
                           height: 52,
                           fit: BoxFit.cover,
                           errorWidget: (c, u, e) => Container(
@@ -1084,7 +1220,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
     return Scaffold(
       backgroundColor: Colors.black,
       body: AnimatedSwitcher(
-        duration: const Duration(milliseconds: 800),
+        duration: const Duration(milliseconds: 400),
         child: Stack(
           key: ValueKey(song.id),
           fit: StackFit.expand,
@@ -1097,22 +1233,33 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
             // the view (scrubber stuck at 0:00 while audio kept playing; the
             // build-thread heartbeat couldn't see it because the GPU thread was
             // the one stalling).
-            ImageFiltered(
-              imageFilter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
-              child: CachedNetworkImage(
-                // Stations & podcasts have no artist photo — use their own
-                // artwork (station favicon / feed art) so the glassy backdrop
-                // isn't the blue error-gradient. albumArtUrl == _artworkUrlForSong.
-                imageUrl: (song.isPodcast || song.isStation) ? albumArtUrl : artistImageUrl,
-                fit: BoxFit.cover,
-                width: double.infinity,
-                height: double.infinity,
-                errorWidget: (context, url, error) => Container(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                      colors: [const Color(0xFF1a2332), const Color(0xFF0d1b2a)],
+            // RepaintBoundary: the comment above assumed the blur was cached,
+            // but without its own boundary it was re-blurred whenever anything
+            // else on this screen repainted (time text, spinner, up-next ring).
+            // Small decode + no fades inside the blur: it is sigma 30, detail
+            // is gone anyway, and a fade under a blur re-blurs every frame.
+            RepaintBoundary(
+              child: ImageFiltered(
+                imageFilter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
+                child: CachedNetworkImage(
+                  // Stations & podcasts have no artist photo — use their own
+                  // artwork (station favicon / feed art) so the glassy backdrop
+                  // isn't the blue error-gradient. albumArtUrl == _artworkUrlForSong.
+                  imageUrl: (song.isPodcast || song.isStation) ? albumArtUrl : artistImageUrl,
+                  memCacheWidth: 400,
+                  fadeInDuration: Duration.zero,
+                  fadeOutDuration: Duration.zero,
+                  placeholderFadeInDuration: Duration.zero,
+                  fit: BoxFit.cover,
+                  width: double.infinity,
+                  height: double.infinity,
+                  errorWidget: (context, url, error) => Container(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [const Color(0xFF1a2332), const Color(0xFF0d1b2a)],
+                      ),
                     ),
                   ),
                 ),
@@ -1315,6 +1462,8 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                                     : null,
                                 dnaMode: _isJurassicParkTrack(song),
                                 evhStripesMode: _isVanHalenTrack(song),
+                                evhSeed: song.id,
+                                isPlaying: widget.audioPlayerService.isPlaying,
                               )
                             else
                               SliderTheme(
@@ -1469,7 +1618,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                         onPressed: () => widget.audioPlayerService.next(),
                       ),
                       const SizedBox(width: 16),
-                      IconButton(
+                      _withRepeatOnce(IconButton(
                         icon: Icon(
                           widget.audioPlayerService.repeatMode == RepeatMode.one
                               ? Icons.repeat_one
@@ -1483,7 +1632,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                         ),
                         onPressed: () =>
                             widget.audioPlayerService.toggleRepeat(),
-                      ),
+                      )),
                     ],
                   ),
 
@@ -1506,7 +1655,9 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                       ),
                       const SizedBox(width: 28),
                       _buildFavoriteButton(song, 26),
-                      const SizedBox(width: 28),
+                      const SizedBox(width: 12),
+                      _buildNotNowButton(song, 24),
+                      const SizedBox(width: 16),
                       IconButton(
                         icon: const Icon(
                           Icons.playlist_add,
@@ -1834,7 +1985,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                       onPressed: () => widget.audioPlayerService.next(),
                     ),
                     const SizedBox(width: 8),
-                    IconButton(
+                    _withRepeatOnce(IconButton(
                       icon: Icon(
                         widget.audioPlayerService.repeatMode ==
                                 RepeatMode.one
@@ -1848,7 +1999,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                       ),
                       onPressed: () =>
                           widget.audioPlayerService.toggleRepeat(),
-                    ),
+                    )),
                   ],
                 ),
                 const SizedBox(height: 12),
@@ -1921,6 +2072,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                     ),
                     const SizedBox(width: 8),
                     _buildFavoriteButton(song, 22),
+                    _buildNotNowButton(song, 22),
                     const SizedBox(width: 8),
                     IconButton(
                       icon: const Icon(
@@ -2791,38 +2943,56 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                 body: Stack(
                   fit: StackFit.expand,
                   children: [
-                    // Blurred album art background
-                    AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 800),
-                      child: Container(
-                        key: ValueKey('bg_${song.id}'),
-                        decoration: const BoxDecoration(
-                          color: Color(0xFF0a0e27),
-                        ),
-                        child: CachedNetworkImage(
-                          // Station-/podcast-aware: getArtworkUrl(albumId) 404s
-                          // for stations & podcasts (albumId 0) → solid blue.
-                          imageUrl: _artworkUrlForSong(song),
-                          fit: BoxFit.cover,
-                          width: double.infinity,
-                          height: double.infinity,
-                          placeholder: (context, url) => Container(
-                            color: const Color(0xFF0a0e27),
+                    // Blurred album art background, pre-blurred via ImageFiltered
+                    // inside a RepaintBoundary: it rasterizes once and is cached,
+                    // since the image is static. This used to be a live
+                    // BackdropFilter (sigma 80) that re-blurred the WHOLE screen
+                    // on every frame anything in front of it moved (scrubber,
+                    // sparks, the lyrics drift): FRAMEWORK ran hot and the whole
+                    // laptop froze every few minutes (Nov 4, beta 179). Same fix
+                    // as _buildImmersiveFullScreen.
+                    // Song change: until Nov 9 this crossfaded two sigma-80
+                    // blurs for 800 ms over a full-size decode, with
+                    // CachedNetworkImage's own 0.5-1 s fades running INSIDE the
+                    // blur, so it re-blurred the whole window every frame for
+                    // about a second at every song start (the moment FRAMEWORK
+                    // froze). Now: a 400 px decode (it's blurred to nothing),
+                    // no inner fades, a shorter crossfade.
+                    RepaintBoundary(
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 400),
+                        child: Container(
+                          key: ValueKey('bg_${song.id}'),
+                          decoration: const BoxDecoration(
+                            color: Color(0xFF0a0e27),
                           ),
-                          errorWidget: (context, url, error) => Container(
-                            color: const Color(0xFF0a0e27),
+                          child: ImageFiltered(
+                            imageFilter: ImageFilter.blur(sigmaX: 80, sigmaY: 80),
+                            child: CachedNetworkImage(
+                              // Station-/podcast-aware: getArtworkUrl(albumId) 404s
+                              // for stations & podcasts (albumId 0) → solid blue.
+                              imageUrl: _artworkUrlForSong(song),
+                              memCacheWidth: 400,
+                              fadeInDuration: Duration.zero,
+                              fadeOutDuration: Duration.zero,
+                              placeholderFadeInDuration: Duration.zero,
+                              fit: BoxFit.cover,
+                              width: double.infinity,
+                              height: double.infinity,
+                              placeholder: (context, url) => Container(
+                                color: const Color(0xFF0a0e27),
+                              ),
+                              errorWidget: (context, url, error) => Container(
+                                color: const Color(0xFF0a0e27),
+                              ),
+                            ),
                           ),
                         ),
                       ),
                     ),
-                    // Dark overlay + blur
-                    ClipRect(
-                      child: BackdropFilter(
-                        filter: ImageFilter.blur(sigmaX: 80, sigmaY: 80),
-                        child: Container(
-                          color: const Color(0xFF0a0e27).withOpacity(0.65),
-                        ),
-                      ),
+                    // Dark overlay (the blur is baked into the image above)
+                    Container(
+                      color: const Color(0xFF0a0e27).withOpacity(0.65),
                     ),
                     // Actual content
                     _showLyrics
@@ -3101,6 +3271,11 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                     right: 0,
                     child: _buildFavoriteButton(song, 24),
                   ),
+                  if (!widget.audioPlayerService.isPlayingPodcast)
+                  Positioned(
+                    left: 0,
+                    child: _buildNotNowButton(song, 22),
+                  ),
                 ],
               ),
             ),
@@ -3156,6 +3331,8 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                             : null,
                         dnaMode: _isJurassicParkTrack(song),
                         evhStripesMode: _isVanHalenTrack(song),
+                        evhSeed: song.id,
+                        isPlaying: widget.audioPlayerService.isPlaying,
                       )
                     else
                       // Clean slider — orange for podcasts, blue for music. If
@@ -3305,6 +3482,11 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                     right: 0,
                     child: _buildFavoriteButton(song, 28),
                 ),
+                if (!song.isPodcast)
+                  Positioned(
+                    left: 0,
+                    child: _buildNotNowButton(song, 26),
+                  ),
               ],
             ),
           ),
@@ -3385,6 +3567,8 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                           : null,
                       dnaMode: _isJurassicParkTrack(song),
                       evhStripesMode: _isVanHalenTrack(song),
+                      evhSeed: song.id,
+                      isPlaying: widget.audioPlayerService.isPlaying,
                     )
                   else
                     ChapteredSlider(
@@ -3547,7 +3731,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                 constraints: const BoxConstraints(),
                 onPressed: () => _skipRelative(const Duration(seconds: 30)),
               )
-            : IconButton(
+            : _withRepeatOnce(IconButton(
                 icon: Icon(
                   widget.audioPlayerService.repeatMode == RepeatMode.one
                       ? Icons.repeat_one
@@ -3561,7 +3745,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
                 constraints: const BoxConstraints(),
                 onPressed: () =>
                     setState(() => widget.audioPlayerService.toggleRepeat()),
-              ),
+              )),
       ],
     );
   }
@@ -3754,7 +3938,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
             },
           ),
         if (!isPodcast)
-          IconButton(
+          _withRepeatOnce(IconButton(
             icon: Icon(
               widget.audioPlayerService.repeatMode == RepeatMode.one
                   ? Icons.repeat_one
@@ -3768,7 +3952,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
               widget.audioPlayerService.toggleRepeat();
               setState(() {});
             },
-          ),
+          )),
         // Loop the current track (chapter) — one tap sets the A-B loop to the
         // active chapter's bounds. Only for chaptered podcasts.
         if (_podcastHasChapters)
@@ -3943,6 +4127,18 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
           ],
         ),
         actions: [
+          // Bedtime is when you set tomorrow's wake-up.
+          if (Platform.isAndroid)
+            TextButton.icon(
+              onPressed: () {
+                Navigator.pop(context);
+                Navigator.of(this.context).push(
+                  MaterialPageRoute(builder: (_) => const AlarmsScreen()),
+                );
+              },
+              icon: const Icon(Icons.alarm),
+              label: const Text('Wake-up alarms'),
+            ),
           TextButton(
             onPressed: () => Navigator.pop(context),
             child: const Text('Close'),
@@ -4392,87 +4588,14 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
   }
 
   void _showFullArtwork(int albumId, {String? artworkUrl}) {
-    final screenSize = MediaQuery.of(context).size;
-    final maxSize = _isMobile
-        ? screenSize.width * 0.9
-        : screenSize.height * 0.75;
-    // Cap the in-memory decoded bitmap size at the actual rendered pixel
-    // dimensions (logical size × device pixel ratio). Without this,
-    // Flutter decodes the source image at whatever resolution it is —
-    // FLAC-embedded artwork is often 2000×2000+, which means ~16MB of
-    // RGBA decoded synchronously on the UI thread when this dialog
-    // opens. The result is a multi-second UI freeze that looks like a
-    // crash but doesn't actually throw, so the crash handlers never
-    // fire (which is why nasradio_crash.log was empty after the
-    // 2026-05-25 "tapped artwork and the app crashed" report).
-    // _MobileArtwork already does this for the small in-grid tiles;
-    // this fullscreen path was missed because of the assumption that
-    // desktop had spare resources for a single full-res decode.
-    final dpr = MediaQuery.of(context).devicePixelRatio;
-    final cachePx = (maxSize * dpr).ceil();
-
-    showDialog(
-      context: context,
-      barrierColor: Colors.black87,
-      builder: (context) => GestureDetector(
-        onTap: () => Navigator.pop(context),
-        child: Dialog(
-          backgroundColor: Colors.transparent,
-          insetPadding: const EdgeInsets.all(20),
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              ClipRRect(
-                borderRadius: BorderRadius.circular(16),
-                child: CachedNetworkImage(
-                  imageUrl: artworkUrl ??
-                      (widget.audioPlayerService.isPlayingPodcast && widget.audioPlayerService.podcastArtworkUrl != null
-                          ? widget.audioPlayerService.podcastArtworkUrl!
-                          : _apiService.getArtworkUrl(albumId)),
-                  width: maxSize,
-                  height: maxSize,
-                  memCacheWidth: cachePx,
-                  memCacheHeight: cachePx,
-                  fit: BoxFit.cover,
-                  placeholder: (context, url) => Container(
-                    width: 300,
-                    height: 300,
-                    color: const Color(0xFF1a2332),
-                  ),
-                  errorWidget: (context, url, error) => Container(
-                    width: 300,
-                    height: 300,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF1a2332),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: const Icon(
-                      Icons.album,
-                      size: 150,
-                      color: Color(0xFF00d4ff),
-                    ),
-                  ),
-                ),
-              ),
-              Positioned(
-                top: 0,
-                right: 0,
-                child: IconButton(
-                  icon: Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.black54,
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: const Icon(Icons.close, color: Colors.white),
-                  ),
-                  onPressed: () => Navigator.pop(context),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
+    // Shared full-screen pinch-zoom viewer (decode is capped there, so the
+    // old 2026-05-25 full-res-decode UI freeze can't come back).
+    showImageZoom(
+      context,
+      imageUrl: artworkUrl ??
+          (widget.audioPlayerService.isPlayingPodcast && widget.audioPlayerService.podcastArtworkUrl != null
+              ? widget.audioPlayerService.podcastArtworkUrl!
+              : _apiService.getArtworkUrl(albumId)),
     );
   }
 }

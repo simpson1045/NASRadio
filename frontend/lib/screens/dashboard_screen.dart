@@ -1,5 +1,6 @@
 import '../layout_context.dart';
 import 'package:flutter/material.dart';
+import '../utils/player_watch.dart';
 import 'dart:io' show Platform;
 import '../services/api_service.dart';
 import '../services/audio_player_service.dart';
@@ -27,12 +28,14 @@ import '../widgets/explicit_badge.dart';
 import '../widgets/hdcd_badge.dart';
 import '../widgets/surround_badge.dart';
 import '../widgets/design_system.dart';
+import '../widgets/edition_badge.dart';
 import '../services/song_recognition_service.dart';
 import '../widgets/song_recognition_sheet.dart';
 import 'system_logs_screen.dart';
 import 'frontend_logs_screen.dart';
 import '../main.dart' show globalWeatherService;
 import '../services/weather_service.dart';
+import '../services/update_service.dart';
 
 class DashboardScreen extends StatefulWidget {
   final AudioPlayerService audioPlayerService;
@@ -74,9 +77,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
   int? _lastKnownSongId;
   bool? _lastKnownIsPlaying;
 
+  /// What Home shows from the player (the queue button). Until Nov 9 the
+  /// whole Home screen was rebuilt on every 250 ms position tick, even while
+  /// hidden behind another section or Now Playing.
+  late final PlayerWatch _playerShown;
+
   @override
   void initState() {
     super.initState();
+    _playerShown = PlayerWatch(widget.audioPlayerService, () {
+      final s = widget.audioPlayerService;
+      return (s.currentSong?.id, s.isPlaying, s.isLoading, s.queue.length);
+    });
     _loadDashboardData();
     _lastKnownSongId = widget.audioPlayerService.currentSong?.id;
     widget.audioPlayerService.addListener(_updateState);
@@ -122,6 +134,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void dispose() {
     widget.audioPlayerService.removeListener(_updateState);
+    _playerShown.dispose();
     super.dispose();
   }
 
@@ -258,7 +271,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
-      listenable: widget.audioPlayerService,
+      listenable: _playerShown,
       builder: (context, child) {
         return Scaffold(
           appBar: AppBar(
@@ -333,7 +346,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 },
                 child: IconButton(
                   icon: const Icon(Icons.refresh),
-                  onPressed: _loadDashboardData,
+                  onPressed: () {
+                    _loadDashboardData();
+                    // ...and look for an app update (the banner used to need
+                    // a full close + reopen).
+                    UpdateService.requestRecheck();
+                  },
                 ),
               ),
             ],
@@ -1742,26 +1760,29 @@ class _DashboardScreenState extends State<DashboardScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: CachedNetworkImage(
-                      imageUrl: _apiService.getArtworkUrl(album.id),
-                      width: _tile,
-                      height: _tile,
-                      fit: BoxFit.cover,
-                      placeholder: (context, url) => Container(
+                  EditionBadge.over(
+                    album: album,
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: CachedNetworkImage(
+                        imageUrl: _apiService.getArtworkUrl(album.id),
                         width: _tile,
                         height: _tile,
-                        color: const Color(0xFF1a2332),
-                      ),
-                      errorWidget: (context, url, error) => Container(
-                        width: _tile,
-                        height: _tile,
-                        color: const Color(0xFF1a2332),
-                        child: const Icon(
-                          Icons.album,
-                          color: Color(0xFF00d4ff),
-                          size: 48,
+                        fit: BoxFit.cover,
+                        placeholder: (context, url) => Container(
+                          width: _tile,
+                          height: _tile,
+                          color: const Color(0xFF1a2332),
+                        ),
+                        errorWidget: (context, url, error) => Container(
+                          width: _tile,
+                          height: _tile,
+                          color: const Color(0xFF1a2332),
+                          child: const Icon(
+                            Icons.album,
+                            color: Color(0xFF00d4ff),
+                            size: 48,
+                          ),
                         ),
                       ),
                     ),

@@ -1,3 +1,4 @@
+import 'stall_watch.dart';
 import 'dart:async';
 import 'package:media_kit/media_kit.dart';
 import 'playback_engine.dart';
@@ -145,6 +146,7 @@ class MediaKitEngine implements PlaybackEngine {
     Duration startPosition = Duration.zero,
     bool autoPlay = true,
   }) async {
+    final stallId = StallWatch.instance.begin('engine.loadCurrent');
     _reconciling = true;
     try {
       _next = null;
@@ -161,10 +163,12 @@ class MediaKitEngine implements PlaybackEngine {
       // from 0 instead of resuming at the saved position. So when resuming we
       // open PAUSED, wait until the stream reports a duration (seekable by
       // then), seek, and only then start playing.
+      StallWatch.instance.note('mpv.open');
       await _player.open(
         Playlist([Media(item.url)], index: 0),
         play: resuming ? false : autoPlay,
       );
+      StallWatch.instance.note('mpv.setPlaylistMode');
       await _player.setPlaylistMode(PlaylistMode.none);
       if (resuming) {
         if (_player.state.duration <= Duration.zero) {
@@ -173,12 +177,15 @@ class MediaKitEngine implements PlaybackEngine {
               .timeout(const Duration(seconds: 10),
                   onTimeout: () => _player.state.duration);
         }
+        StallWatch.instance.note('mpv.seek');
         await _player.seek(startPosition);
         if (autoPlay) {
+          StallWatch.instance.note('mpv.play');
           await _player.play();
         }
       }
     } finally {
+      StallWatch.instance.end(stallId);
       // Let the index settle before re-enabling advance detection.
       Future.delayed(const Duration(milliseconds: 150), () {
         _reconciling = false;
@@ -189,6 +196,7 @@ class MediaKitEngine implements PlaybackEngine {
 
   @override
   Future<void> setNext(EngineItem? item) async {
+    final stallId = StallWatch.instance.begin('engine.setNext');
     // Reconcile the playlist to exactly [current, item]:
     //   1. trim any finished items before the current index (index 0)
     //   2. drop the existing lookahead at index 1 (if any)
@@ -202,22 +210,26 @@ class MediaKitEngine implements PlaybackEngine {
       //    without interrupting it (verified in media_kit 1.2.6 source).
       var guard = 0;
       while (_player.state.playlist.index > 0 && guard < 8) {
+        StallWatch.instance.note('mpv.remove');
         await _player.remove(0);
         guard++;
       }
       // 2. Drop the existing lookahead (anything after current).
       while (_player.state.playlist.medias.length > 1) {
+        StallWatch.instance.note('mpv.remove');
         await _player.remove(_player.state.playlist.medias.length - 1);
       }
       // 3. Append the new lookahead, if any.
       _next = item;
       if (item != null) {
+        StallWatch.instance.note('mpv.add');
         await _player.add(Media(item.url));
       }
       _lastIndex = 0;
     } catch (e) {
       _errorController.add('setNext failed: $e');
     } finally {
+      StallWatch.instance.end(stallId);
       Future.delayed(const Duration(milliseconds: 120), () {
         _reconciling = false;
         _lastIndex = _player.state.playlist.index;
@@ -226,13 +238,16 @@ class MediaKitEngine implements PlaybackEngine {
   }
 
   @override
-  Future<void> play() => _player.play();
+  Future<void> play() =>
+      StallWatch.instance.track('mpv.play', () => _player.play());
 
   @override
-  Future<void> pause() => _player.pause();
+  Future<void> pause() =>
+      StallWatch.instance.track('mpv.pause', () => _player.pause());
 
   @override
-  Future<void> seek(Duration position) => _player.seek(position);
+  Future<void> seek(Duration position) =>
+      StallWatch.instance.track('mpv.seek', () => _player.seek(position));
 
   @override
   Future<void> stop() async {
@@ -240,6 +255,7 @@ class MediaKitEngine implements PlaybackEngine {
     _next = null;
     _lastIndex = 0;
     try {
+      StallWatch.instance.note('mpv.stop');
       await _player.stop();
     } finally {
       _reconciling = false;
@@ -249,13 +265,13 @@ class MediaKitEngine implements PlaybackEngine {
   @override
   Future<void> setVolume(double volume) {
     _master = volume.clamp(0.0, 1.0);
-    return _applyOut();
+    return StallWatch.instance.track('mpv.volume', _applyOut);
   }
 
   @override
   Future<void> setCurrentGain(double gain) {
     _gain = gain;
-    return _applyOut();
+    return StallWatch.instance.track('mpv.gain', _applyOut);
   }
 
   @override
@@ -291,7 +307,9 @@ class MediaKitEngine implements PlaybackEngine {
       await platform.setProperty('speed', '1.0');
       return;
     }
+    StallWatch.instance.note('mpv.setRate');
     await _player.setRate(_speed);
+    StallWatch.instance.note('mpv.setPitch');
     await _player.setPitch(_pitchCorrection ? 1.0 : _speed);
   }
 
@@ -338,6 +356,7 @@ class MediaKitEngine implements PlaybackEngine {
     await _completedController.close();
     await _errorController.close();
     await _bufferingController.close();
+    StallWatch.instance.note('mpv.dispose');
     await _player.dispose();
   }
 }

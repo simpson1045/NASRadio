@@ -100,8 +100,10 @@ class MainNavigationScreenState extends State<MainNavigationScreen>
       const Duration(seconds: 30),
       (_) => _checkServerHealth(),
     );
-    // Check for app updates (non-blocking)
+    // Check for app updates (non-blocking), and again whenever asked (the
+    // home refresh button, coming back to the app).
     _checkForUpdate();
+    UpdateService.recheck.addListener(_onUpdateRecheck);
     // Listen for weather alerts
     globalWeatherService.onNewAlert = _handleWeatherAlert;
     MainNavigationScreenState.switchToTab = _selectTab;
@@ -131,8 +133,11 @@ class MainNavigationScreenState extends State<MainNavigationScreen>
     ];
   }
 
+  void _onUpdateRecheck() => _checkForUpdate();
+
   @override
   void dispose() {
+    UpdateService.recheck.removeListener(_onUpdateRecheck);
     _focusNode.dispose();
     _switchCtrl.dispose();
     _smtc?.dispose();
@@ -482,14 +487,21 @@ class MainNavigationScreenState extends State<MainNavigationScreen>
       index: _selectedIndex,
       children: List.generate(_screens.length, (i) {
         if (!_visitedTabs.contains(i)) return const SizedBox.shrink();
-        return Navigator(
-          key: _navKeys[i],
-          // Nested navigators need their own HeroController or Hero
-          // flights between pages inside a section silently don't fly.
-          observers: [HeroController()],
-          onGenerateRoute: (settings) => MaterialPageRoute(
-            settings: settings,
-            builder: (_) => _screens[i],
+        // Hidden sections keep their pages but not their animations: an
+        // IndexedStack doesn't stop a hidden child's tickers, so e.g. Now
+        // Playing left open in another section kept redrawing at 60 fps
+        // behind a still screen (Nov 9).
+        return TickerMode(
+          enabled: i == _selectedIndex,
+          child: Navigator(
+            key: _navKeys[i],
+            // Nested navigators need their own HeroController or Hero
+            // flights between pages inside a section silently don't fly.
+            observers: [HeroController()],
+            onGenerateRoute: (settings) => MaterialPageRoute(
+              settings: settings,
+              builder: (_) => _screens[i],
+            ),
           ),
         );
       }),

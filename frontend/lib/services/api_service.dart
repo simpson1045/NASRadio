@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart' show ValueNotifier;
 import 'dart:io' show Platform, File;
 import 'package:http/http.dart' as http;
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'auth_http_client.dart';
 import '../models/artist.dart';
@@ -169,6 +170,57 @@ class ApiService {
   // media GETs only, so a leaked URL can't reach the mutating API.
   static String? mediaToken;
 
+  // When the last network fetch of the media token was attempted; throttles
+  // refreshMediaToken so player retry storms can't hammer the auth endpoint.
+  static DateTime? _lastMediaTokenFetch;
+
+  /// Fetch a fresh read-only media token and install it in [mediaToken].
+  /// Without one, every stream/artwork URL 401s, which the player reads as
+  /// "file missing" and skips (the 2026-10-21 Shrek incident: one failed
+  /// best-effort fetch at startup left the app media-dead until restart).
+  /// Returns true when a usable token is set. Throttled to one network
+  /// attempt per 10 s unless [force] is true.
+  static Future<bool> refreshMediaToken({bool force = false}) async {
+    bool haveToken() => mediaToken != null && mediaToken!.isNotEmpty;
+    final now = DateTime.now();
+    if (!force &&
+        _lastMediaTokenFetch != null &&
+        now.difference(_lastMediaTokenFetch!) < const Duration(seconds: 10)) {
+      return haveToken();
+    }
+    _lastMediaTokenFetch = now;
+    try {
+      final resp =
+          await appHttpClient.get(Uri.parse('$baseUrl/auth/media-token'));
+      if (resp.statusCode == 200) {
+        final t = json.decode(resp.body)['media_token'] as String?;
+        if (t != null && t.isNotEmpty) {
+          mediaToken = t;
+          return true;
+        }
+      }
+    } catch (_) {}
+    return haveToken();
+  }
+
+  /// Album-folder image/booklet (artwork picker, album Images gallery).
+  /// Image.network sends no auth header, so the media token rides in the
+  /// query (as for artwork). [path] may include subfolders ("Scans/b.jpg");
+  /// [thumb] asks for a ≤480 px JPEG.
+  static String localImageUrl(int albumId, String path, {bool thumb = false}) {
+    final encoded = path.split('/').map(Uri.encodeComponent).join('/');
+    final url = '$baseUrl/album/$albumId/local-image/$encoded';
+    return _withMediaToken(thumb ? '$url?size=thumb' : url);
+  }
+
+  /// Images + PDF booklets in an album's folder (cover-like names first).
+  Future<List<Map<String, dynamic>>> getAlbumImages(int albumId) async {
+    final response = await _get('$baseUrl/album/$albumId/images');
+    if (response.statusCode != 200) return [];
+    final data = json.decode(response.body);
+    return (data['images'] as List? ?? const []).cast<Map<String, dynamic>>();
+  }
+
   static String _withMediaToken(String url, {Object? cacheBuster}) {
     var u = url;
     final t = mediaToken;
@@ -207,9 +259,22 @@ class ApiService {
     // Desktop is usually on the same box as the backend, so loopback is the
     // fastest, most reliable route and never touches Cloudflare. Mobile has no
     // local backend, so it only tries the LAN IP.
+    // The LAN host can only answer over Wi-Fi / Ethernet (or a VPN routed
+    // home). On cellular alone, skip the probe: it cost 3 s on every check
+    // (about every 30 s) in the car, and its abandoned socket logged a
+    // 'ping FAILED after 130 s' later (Nov 6).
+    var lanPossible = true;
+    if (!_isDesktop) {
+      try {
+        final r = await Connectivity().checkConnectivity();
+        lanPossible = r.contains(ConnectivityResult.wifi) ||
+            r.contains(ConnectivityResult.ethernet) ||
+            r.contains(ConnectivityResult.vpn);
+      } catch (_) {}
+    }
     final candidates = [
       if (_isDesktop) _localHost,
-      if (_lanHost.isNotEmpty) _lanHost,
+      if (_lanHost.isNotEmpty && lanPossible) _lanHost,
     ];
 
     for (final host in candidates) {
@@ -234,8 +299,9 @@ class ApiService {
 
     // No local host answered. Be sticky: a single miss while already local is
     // almost always a transient hiccup — require two consecutive misses before
-    // falling back to the slow public WAN endpoint.
-    _lanMissStreak++;
+    // falling back to the slow public WAN endpoint. No Wi-Fi at all is not a
+    // hiccup: switch right away.
+    _lanMissStreak = lanPossible ? _lanMissStreak + 1 : 2;
     if (_isOnLan && _lanMissStreak < 2) {
       return; // keep the current local host this round
     }
@@ -425,12 +491,78 @@ class ApiService {
     }
   }
 
+  // Import screen: what a download folder actually contains (tracks, length,
+  // bit depth / sample rate, .nfo source, folder hint).
+  Future<Map<String, dynamic>> getFolderFacts(String path) async {
+    final query = Uri(queryParameters: {'path': path}).query;
+    final response = await _get('$baseUrl/import/folder-facts?$query');
+    if (response.statusCode == 200) return json.decode(response.body);
+    throw Exception('Failed to read the folder');
+  }
+
+  // Editions Available: every MusicBrainz release of an album, by edition
+  // type (Atmos, 5.1, SACD...). Owned album: the ones you have are marked.
+  Future<Map<String, dynamic>> getAlbumEditions(int albumId,
+      {bool refresh = false}) async {
+    final response = await _get(
+        '$baseUrl/albums/$albumId/editions${refresh ? '?refresh=1' : ''}');
+    if (response.statusCode == 200) return json.decode(response.body);
+    throw Exception('Failed to load editions');
+  }
+
+  // Same for an album you don't have yet (Missing Albums), by name.
+  Future<Map<String, dynamic>> getEditionsByName(
+      String artist, String album) async {
+    final query = Uri(queryParameters: {'artist': artist, 'album': album}).query;
+    final response = await _get('$baseUrl/editions?$query');
+    if (response.statusCode == 200) return json.decode(response.body);
+    throw Exception('Failed to load editions');
+  }
+
+  // Remember which edition of an album group this user picked; the group's
+  // card opens straight to it next time.
+  Future<void> setPreferredEdition(int groupId, int albumId) async {
+    await appHttpClient.put(
+      Uri.parse('$baseUrl/album-groups/$groupId/preferred-edition'),
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({'album_id': albumId}),
+    );
+  }
+
   // Get stream URL for a song
   String getStreamUrl(int songId, {String quality = 'lossless'}) {
     if (quality == 'lossless') {
       return _withMediaToken('$baseUrl/stream/$songId');
     }
     return _withMediaToken('$baseUrl/stream/$songId?quality=$quality');
+  }
+
+  /// Ask the server to get a song ready for an offline download in [format]
+  /// (opus160 / high / medium). Returns {status, quality}: fetch
+  /// getStreamUrl(id, quality: quality) next. null = busy / unreachable, try
+  /// later. Its own long timeout: converting a 70-minute track takes a while
+  /// (the shared _post gives up after 15 s).
+  Future<Map<String, dynamic>?> prepareDownload(int songId, String format) async {
+    try {
+      final r = await appHttpClient
+          .post(Uri.parse('$baseUrl/download/$songId/prepare?format=$format'))
+          .timeout(const Duration(minutes: 6));
+      if (r.statusCode == 200 || r.statusCode == 404) {
+        return Map<String, dynamic>.from(json.decode(r.body) as Map);
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Random songs from the local library (wake-up alarm "Shuffle my library").
+  Future<List<dynamic>> getRandomSongs(int limit) async {
+    final response = await _get('$baseUrl/songs/random?limit=$limit');
+    if (response.statusCode != 200) {
+      throw Exception('Failed to load random songs: ${response.statusCode}');
+    }
+    return (json.decode(response.body)['songs'] as List?) ?? [];
   }
 
   /// Live radio stations (Icecast/Shoutcast). The player streams station['url']
@@ -539,6 +671,40 @@ class ApiService {
   // Get thumbnail artwork URL (300px, for lists and grids)
   String getArtworkThumbUrl(int albumId) {
     return _withMediaToken('$baseUrl/artwork/$albumId?size=thumb');
+  }
+
+  // Album references (album_track_refs): list a song on another album too,
+  // at a disc/track slot. Re-linking the same song just moves its slot.
+  Future<void> linkAlbumTrack(
+    int albumId,
+    int songId, {
+    required int trackNumber,
+    int discNumber = 1,
+  }) async {
+    final response = await _post(
+      '$baseUrl/album/$albumId/links',
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({
+        'song_id': songId,
+        'track_number': trackNumber,
+        'disc_number': discNumber,
+      }),
+    );
+    if (response.statusCode != 200) {
+      String detail = '';
+      try {
+        detail = json.decode(response.body)['error'] ?? '';
+      } catch (_) {}
+      throw Exception(detail.isNotEmpty ? detail : 'Failed to link track');
+    }
+  }
+
+  Future<void> unlinkAlbumTrack(int albumId, int songId) async {
+    final response = await appHttpClient
+        .delete(Uri.parse('$baseUrl/album/$albumId/links/$songId'));
+    if (response.statusCode != 200) {
+      throw Exception('Failed to unlink track (${response.statusCode})');
+    }
   }
 
   // Search
@@ -2063,15 +2229,21 @@ class ApiService {
   // Release-group drill-down: the actual releases inside one MB
   // release group (format/date/tracks/disambiguation), so the import
   // screen can show what editions already exist.
-  Future<List<Map<String, dynamic>>> getMbRgReleases(String rgMbid) async {
-    final response = await appHttpClient.get(
-      Uri.parse('$baseUrl/musicbrainz/rg-releases?rgid=$rgMbid'),
-    );
+  /// A release group's releases. With [folderPath] (the folder being
+  /// imported) the server also scores each release against the files and
+  /// returns `match` = {best, candidates, summary}; each release then
+  /// carries `match` = {score, reasons, best, candidate}.
+  Future<Map<String, dynamic>> getMbRgReleases(String rgMbid,
+      {String? folderPath}) async {
+    final pathParam = (folderPath != null && folderPath.isNotEmpty)
+        ? '&path=${Uri.encodeComponent(folderPath)}'
+        : '';
+    final response = await appHttpClient
+        .get(Uri.parse('$baseUrl/musicbrainz/rg-releases?rgid=$rgMbid$pathParam'))
+        .timeout(const Duration(seconds: 45));
     if (response.statusCode == 200) {
-      final body = json.decode(response.body);
-      if (body['success'] == true) {
-        return List<Map<String, dynamic>>.from(body['releases'] ?? []);
-      }
+      final body = json.decode(response.body) as Map<String, dynamic>;
+      if (body['success'] == true) return body;
     }
     throw Exception('Failed to load the release list');
   }
@@ -2325,9 +2497,22 @@ class ApiService {
   // Search Prowlarr indexers
   Future<Map<String, dynamic>> searchProwlarr(String query, {bool deep = false, bool deepOnly = false}) async {
     final extraParam = deepOnly ? '&deep_only=true' : (deep ? '&deep=true' : '');
-    final response = await appHttpClient.get(
-      Uri.parse('$baseUrl/prowlarr/search?query=${Uri.encodeComponent(query)}$extraParam'),
-    );
+    // Bounded: with no limit a slow/stuck indexer left the search spinning
+    // forever (Oct 27). Deep (RuTracker via FlareSolverr) legitimately takes
+    // minutes; the default fast tier answers in seconds.
+    final limit = (deep || deepOnly)
+        ? const Duration(seconds: 150)
+        : const Duration(seconds: 45);
+    final http.Response response;
+    try {
+      response = await appHttpClient
+          .get(Uri.parse(
+              '$baseUrl/prowlarr/search?query=${Uri.encodeComponent(query)}$extraParam'))
+          .timeout(limit);
+    } on TimeoutException {
+      throw Exception(
+          'Prowlarr took longer than ${limit.inSeconds}s to answer. Try the search again.');
+    }
     if (response.statusCode == 200) {
       return json.decode(response.body);
     }
@@ -2339,6 +2524,51 @@ class ApiService {
       if (e is Exception && e.toString().contains('Search failed')) rethrow;
       throw Exception('Search failed (${response.statusCode})');
     }
+  }
+
+  /// Fast (default) and deep (opt-in) indexer lists, for per-indexer search.
+  Future<Map<String, dynamic>> getProwlarrTiers() async {
+    final response = await appHttpClient
+        .get(Uri.parse('$baseUrl/prowlarr/tiers'))
+        .timeout(const Duration(seconds: 15));
+    final body = json.decode(response.body) as Map<String, dynamic>;
+    if (response.statusCode == 200 && body['success'] == true) return body;
+    throw Exception(body['error'] ?? 'Could not reach Prowlarr');
+  }
+
+  /// One indexer's results for [searchId]. Each indexer is its own request so
+  /// results show up as each answers and one slow tracker can't hold the list.
+  /// The server gives Prowlarr [timeoutSec]; the Cancel button stops the
+  /// whole search via [cancelProwlarrSearch].
+  Future<Map<String, dynamic>> searchProwlarrIndexer(
+    String query,
+    int indexerId,
+    String searchId, {
+    int timeoutSec = 25,
+    bool filterRutracker = true,
+  }) async {
+    final uri = Uri.parse('$baseUrl/prowlarr/search'
+        '?query=${Uri.encodeComponent(query)}'
+        '&indexers=$indexerId'
+        '&search_id=${Uri.encodeComponent(searchId)}'
+        '&timeout=$timeoutSec'
+        '${filterRutracker ? '&filter_rutracker=true' : ''}');
+    final response =
+        await appHttpClient.get(uri).timeout(Duration(seconds: timeoutSec + 10));
+    final body = json.decode(response.body) as Map<String, dynamic>;
+    if (response.statusCode == 200) return body;
+    throw Exception(body['error'] ?? 'Search failed (${response.statusCode})');
+  }
+
+  /// Tell the server to stop every in-flight indexer request of [searchId].
+  Future<void> cancelProwlarrSearch(String searchId) async {
+    await appHttpClient
+        .post(
+          Uri.parse('$baseUrl/prowlarr/search/cancel'),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'search_id': searchId}),
+        )
+        .timeout(const Duration(seconds: 10));
   }
 
   // Get Prowlarr indexers
@@ -2421,9 +2651,9 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> getTransmissionTorrents() async {
-    final response = await appHttpClient.get(
-      Uri.parse('$baseUrl/transmission/torrents'),
-    );
+    final response = await appHttpClient
+        .get(Uri.parse('$baseUrl/transmission/torrents'))
+        .timeout(const Duration(seconds: 15));
     if (response.statusCode == 200) {
       return json.decode(response.body);
     }
@@ -2432,11 +2662,13 @@ class ApiService {
 
   // Check if albums exist in library
   Future<Map<String, dynamic>> checkLibraryExists(List<String> queries) async {
-    final response = await appHttpClient.post(
-      Uri.parse('$baseUrl/library/check-exists'),
-      headers: {'Content-Type': 'application/json'},
-      body: json.encode({'queries': queries}),
-    );
+    final response = await appHttpClient
+        .post(
+          Uri.parse('$baseUrl/library/check-exists'),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'queries': queries}),
+        )
+        .timeout(const Duration(seconds: 15));
     if (response.statusCode == 200) {
       return json.decode(response.body);
     }
@@ -3194,6 +3426,33 @@ class ApiService {
   }
 
   // Mark playlist as played
+  /// 👎 holds: songs this user doesn't want coming up. [{song_id, until
+  /// (null = never), title, artist_name, album_title, album_id}].
+  Future<List<Map<String, dynamic>>> getHolds() async {
+    final response = await _get('$baseUrl/holds');
+    if (response.statusCode != 200) throw Exception('Failed to load holds');
+    final data = json.decode(response.body);
+    return List<Map<String, dynamic>>.from(data['holds'] ?? const []);
+  }
+
+  /// Hold a song back for [days] (👎 'Not now'), or for good when null
+  /// ('Never play this').
+  Future<void> holdSong(int songId, {int? days = 30}) async {
+    final r = await _post(
+      '$baseUrl/songs/$songId/hold',
+      headers: {'Content-Type': 'application/json'},
+      body: json.encode({'days': days}),
+    );
+    if (r.statusCode != 200) throw Exception('Failed to hold song');
+  }
+
+  Future<void> unholdSong(int songId) async {
+    final r = await appHttpClient
+        .delete(Uri.parse('$baseUrl/songs/$songId/hold'))
+        .timeout(const Duration(seconds: 15));
+    if (r.statusCode != 200) throw Exception('Failed to lift hold');
+  }
+
   Future<void> markPlaylistPlayed(int playlistId) async {
     await _post('$baseUrl/playlist/$playlistId/played');
   }

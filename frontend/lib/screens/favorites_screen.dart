@@ -14,6 +14,7 @@ import '../widgets/explicit_badge.dart';
 import '../widgets/hdcd_badge.dart';
 import '../widgets/surround_badge.dart';
 import '../widgets/favorite_button.dart';
+import '../widgets/edition_badge.dart';
 
 enum SongSortOption { dateAdded, title, artist, playCount }
 enum AlbumSortOption { dateAdded, title, artist, year }
@@ -558,6 +559,7 @@ class _FavoritesScreenState extends State<FavoritesScreen>
                     child: CachedNetworkImage(
                       imageUrl: _apiService.getArtworkUrl(album.id),
                       width: 50,
+                      memCacheWidth: 100,
                       height: 50,
                       fit: BoxFit.cover,
                       placeholder: (context, url) => Container(
@@ -574,8 +576,13 @@ class _FavoritesScreenState extends State<FavoritesScreen>
                   )
                 : const Icon(Icons.album, size: 40, color: Color(0xFF00d4ff)),
             title: Text(album.title),
-            subtitle: Text(
-              '${album.artistName} • ${album.year ?? "Unknown"} • ${album.songCount} songs',
+            subtitle: EditionBadge.after(
+              album: album,
+              text: Text(
+                '${album.artistName} • ${album.year ?? "Unknown"} • ${album.songCount} songs',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
             ),
             trailing: MusicContextMenu(
               itemType: 'album',
@@ -636,6 +643,7 @@ class _FavoritesScreenState extends State<FavoritesScreen>
                     child: CachedNetworkImage(
                       imageUrl: _apiService.getArtistImageUrl(artist.id),
                       width: 50,
+                      memCacheWidth: 100,
                       height: 50,
                       fit: BoxFit.cover,
                       placeholder: (context, url) => Container(

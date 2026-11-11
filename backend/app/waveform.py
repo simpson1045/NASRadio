@@ -65,15 +65,18 @@ class WaveformGenerator:
             with open(cache_file, "r") as f:
                 return {"status": "ready", "waveform": json.load(f)}
 
-        # Check if a previous generation failed
+        # Check if a previous generation failed. A timeout isn't a broken
+        # file (a big hi-res/surround track on the slow pool): retry it
+        # instead of serving the error forever (Oct 31: 5.1 Dark Side "Time").
         if os.path.exists(error_file):
             with open(error_file, "r") as f:
                 error_msg = f.read()
-            return {
-                "status": "error",
-                "waveform": [0.5] * num_samples,
-                "error": error_msg,
-            }
+            if "timed out" not in error_msg:
+                return {
+                    "status": "error",
+                    "waveform": [0.5] * num_samples,
+                    "error": error_msg,
+                }
 
         # Dedup: if another greenthread/tpool call is already
         # decoding this song, skip spawning a second one.
@@ -151,8 +154,14 @@ class WaveformGenerator:
         cache_file = os.path.join(self.cache_dir, f"{song_id}.json")
         error_file = os.path.join(self.cache_dir, f"{song_id}.error")
         try:
-            # Load audio via ffmpeg (timeout-bounded)
-            y, sr = self._load_audio(audio_path, target_sr=22050, timeout_seconds=60)
+            # Load audio via ffmpeg (timeout-bounded). 60 s plus ~1 s per 2 MB:
+            # a 392 MB 5.1 hi-res FLAC gets ~4 min (it runs in the background).
+            try:
+                size_mb = os.path.getsize(audio_path) / 1e6
+            except OSError:
+                size_mb = 0
+            y, sr = self._load_audio(audio_path, target_sr=22050,
+                                     timeout_seconds=int(60 + size_mb / 2))
 
             # Take absolute values
             y = np.abs(y)
@@ -211,6 +220,9 @@ class WaveformGenerator:
             print(f"Error generating waveform for {audio_path}: {error_msg}")
             # Write error marker so client knows generation failed
             # and we don't keep retrying a broken decode on every request.
+            # Timeouts get no marker: the next request simply tries again.
+            if "timed out" in error_msg:
+                return None
             try:
                 with open(error_file, "w") as f:
                     f.write(error_msg)

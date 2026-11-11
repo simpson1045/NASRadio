@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 import psycopg2
+from app import surround
 from app.subprocess_helper import safe_subprocess_run
 from mutagen import File
 from mutagen.id3 import ID3, APIC
@@ -301,7 +302,9 @@ class MusicScanner:
             artwork_data = None
 
             # Try to extract artwork based on file type
-            if hasattr(audio, "tags") and audio.tags:
+            if isinstance(audio, surround.ProbedAudio):
+                artwork_data = surround.cover_art(audio)
+            elif hasattr(audio, "tags") and audio.tags:
                 # MP3/ID3 tags
                 if isinstance(audio.tags, ID3):
                     for tag in audio.tags.values():
@@ -364,6 +367,9 @@ class MusicScanner:
             conn.close()
 
             audio = File(file_path)
+            if audio is None and file_path.lower().endswith(surround.PROBED_EXTENSIONS):
+                # TrueHD/Atmos disc rips (.mka): mutagen can't open Matroska.
+                audio = surround.probe_audio(file_path)
             if audio is None:
                 return
 
@@ -377,15 +383,25 @@ class MusicScanner:
             if metadata["is_hdcd"]:
                 print(f"  🎵 HDCD detected: {metadata['title']}")
 
-            # Detect Dolby Atmos / JOC (only probes E-AC-3 streams)
-            metadata["is_atmos"] = self.detect_atmos(
+            # Dolby streams (E-AC-3 / AC-3): ffprobe for Atmos (JOC) AND
+            # the real channel count, which mutagen can't read in MP4.
+            metadata["is_atmos"], dolby_channels = self.probe_dolby(
                 file_path, metadata["audio_codec"]
             )
+            if dolby_channels:
+                metadata["audio_channels"] = dolby_channels
             if metadata["is_atmos"]:
                 print(f"  🌌 Atmos detected: {metadata['title']}")
 
             # Add to database and get album_id + whether it's a new album
             album_id, is_new_album = self.add_to_database(metadata)
+
+            # Multichannel that isn't already a Dolby bitstream (FLAC 5.1,
+            # TrueHD rips): make the E-AC-3 5.1 version the TV's Cast player
+            # needs, in the background.
+            if (album_id and (metadata.get("audio_channels") or 2) > 2
+                    and metadata.get("audio_codec") not in ("eac3", "ac3")):
+                surround.queue_cast_sidecar(file_path)
 
             # Extract artwork if we got an album_id
             if album_id:
@@ -436,11 +452,41 @@ class MusicScanner:
 
         return 0
 
-    def detect_atmos(self, file_path, audio_codec):
-        """Detect Dolby Atmos (E-AC-3 JOC). Only probes E-AC-3 streams —
-        ffprobe reports the profile as "Dolby Digital Plus + Dolby Atmos"."""
-        if audio_codec != "eac3":
-            return 0
+    def probe_dolby(self, file_path, audio_codec):
+        """(is_atmos, channels) for Dolby streams via ffprobe; (0, None) for
+        everything else. In an MP4, mutagen reports every E-AC-3/AC-3 track
+        as 2 channels (the sample entry's fixed channelcount; the real layout
+        lives in the dec3/dac3 box it doesn't parse), so a 5.1 Atmos album
+        was stored as stereo. ffprobe reports the profile as "Dolby Digital
+        Plus + Dolby Atmos" and the true channel count."""
+        if audio_codec not in ("eac3", "ac3", "truehd"):
+            return 0, None
+
+        try:
+            ffprobe_path = shutil.which("ffprobe") or "ffprobe"
+            import eventlet
+            import eventlet.tpool
+            result = eventlet.tpool.execute(safe_subprocess_run,
+                [ffprobe_path, "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=profile,channels",
+                 "-of", "default=nw=1", file_path],
+                capture_output=True, text=True, timeout=30
+            )
+            out = result.stdout or ""
+            # "Dolby Digital Plus + Dolby Atmos" / "Dolby TrueHD + Dolby Atmos"
+            atmos = 1 if (audio_codec in ("eac3", "truehd") and "Atmos" in out) else 0
+            channels = None
+            for line in out.splitlines():
+                if line.startswith("channels="):
+                    try:
+                        channels = int(line.split("=", 1)[1]) or None
+                    except ValueError:
+                        pass
+            return atmos, channels
+        except Exception as e:
+            print(f"  ⚠️ Dolby probe error for {file_path}: {e}")
+
+        return 0, None
 
         try:
             ffprobe_path = shutil.which("ffprobe") or "ffprobe"
@@ -464,6 +510,8 @@ class MusicScanner:
 
     def detect_audio_stream_info(self, audio, file_path):
         """Channel count + codec name from mutagen (no subprocess)."""
+        if isinstance(audio, surround.ProbedAudio):
+            return audio.info.codec or "unknown", int(audio.info.channels or 2)
         channels = getattr(audio.info, "channels", None) or 2
         ext = os.path.splitext(file_path)[1].lower().lstrip(".")
         codec = {"m4a": "aac", "mp4": "aac", "ogg": "vorbis", "oga": "vorbis",
@@ -475,6 +523,47 @@ class MusicScanner:
                     codec = name
                     break
         return codec, int(channels)
+
+    def _extract_mp4_tags(self, tags, metadata):
+        """Fill metadata from MP4/M4A atoms. Same rules as the ID3/Vorbis
+        path: every artist value joined with "; ", album artist drives
+        album grouping, track/disc are (number, total) tuples."""
+        def first(key):
+            val = tags.get(key)
+            if isinstance(val, (list, tuple)):
+                val = val[0] if val else None
+            return str(val).strip() if val is not None and str(val).strip() else None
+
+        if first("\xa9nam"):
+            metadata["title"] = first("\xa9nam")
+        artists = [
+            part.strip()
+            for v in tags.get("\xa9ART", [])
+            for part in str(v).split("\x00")
+            if part and part.strip()
+        ]
+        if artists:
+            metadata["artist"] = "; ".join(artists)
+        if first("\xa9alb"):
+            metadata["album"] = first("\xa9alb")
+        if first("aART"):
+            metadata["album_artist"] = first("aART")
+
+        for key, field in (("trkn", "track_number"), ("disk", "disc_number")):
+            val = tags.get(key)
+            if val:
+                try:
+                    if int(val[0][0]) > 0:
+                        metadata[field] = int(val[0][0])
+                except Exception:
+                    pass
+
+        year = first("\xa9day")
+        if year:
+            try:
+                metadata["year"] = int(year[:4])
+            except Exception:
+                pass
 
     def extract_metadata(self, audio, file_path):
         """Extract metadata from audio file"""
@@ -513,8 +602,12 @@ class MusicScanner:
             # Check for explicit content tag
             metadata["is_explicit"] = self.check_explicit_tag(audio)
 
-        # Extract tags based on file type
-        if hasattr(audio, "tags") and audio.tags:
+        # Extract tags based on file type. MP4/M4A atoms (©nam, ©ART, trkn…)
+        # share no names with ID3 or Vorbis, so they get their own reader —
+        # without it every tagged .m4a scanned as "Unknown Title".
+        if isinstance(audio, MP4) and audio.tags:
+            self._extract_mp4_tags(audio.tags, metadata)
+        elif hasattr(audio, "tags") and audio.tags:
             tags = audio.tags
 
             # Try different tag formats
@@ -924,7 +1017,14 @@ class MusicScanner:
             return album_id, is_new_album
 
         except psycopg2.IntegrityError:
-            # Song already exists (duplicate file path)
+            # Song already exists (duplicate file path). It may have been
+            # replaced in place since the first scan (album upgraded from CD
+            # rip to hi-res, MP3 to FLAC, by copying over it): this used to
+            # throw the fresh numbers away, the row kept the old size, and
+            # the stream cut songs off at it (Oct 30, 2026). Refresh what's
+            # physically in the file; never titles/artists/albums.
+            conn.rollback()
+            self._refresh_file_facts(conn, metadata)
             return None, False
         except Exception as e:
             print(f"❌ Database error: {str(e)}")
@@ -932,6 +1032,37 @@ class MusicScanner:
             return None, False
         finally:
             conn.close()
+
+    def _refresh_file_facts(self, conn, metadata):
+        """Update size/bitrate/length/codec/channels/Atmos/HDCD of an existing
+        song whose file changed size on disk (the cheap, reliable sign it was
+        replaced). Tag-derived fields are left alone: they're often edited."""
+        try:
+            cursor = self.db.get_cursor(conn)
+            cursor.execute(
+                """UPDATE songs SET file_size = %s, bitrate = %s, duration = %s,
+                          is_hdcd = %s, audio_codec = %s, audio_channels = %s, is_atmos = %s
+                   WHERE file_path = %s AND file_size IS DISTINCT FROM %s
+                   RETURNING id""",
+                (
+                    metadata["file_size"],
+                    metadata["bitrate"],
+                    metadata["duration"],
+                    metadata["is_hdcd"],
+                    metadata.get("audio_codec"),
+                    metadata.get("audio_channels"),
+                    metadata.get("is_atmos", 0),
+                    metadata["file_path"],
+                    metadata["file_size"],
+                ),
+            )
+            row = cursor.fetchone()
+            conn.commit()
+            if row:
+                print(f"  🔄 File replaced on disk, refreshed song {row['id']}: {metadata['file_path']}")
+        except Exception as e:
+            conn.rollback()
+            print(f"❌ Couldn't refresh file facts for {metadata['file_path']}: {e}")
 
     def update_album_artwork(self, album_id, artwork_filename):
         """Update album with artwork path"""

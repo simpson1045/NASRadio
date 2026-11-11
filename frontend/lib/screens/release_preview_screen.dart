@@ -7,6 +7,7 @@ import '../services/api_service.dart';
 import '../services/audio_player_service.dart';
 import 'prowlarr_search_screen.dart';
 import 'artist_detail_screen.dart';
+import '../widgets/image_zoom.dart';
 
 class ReleasePreviewScreen extends StatefulWidget {
   final AudioPlayerService audioPlayerService;
@@ -186,18 +187,24 @@ class _ReleasePreviewScreenState extends State<ReleasePreviewScreen> {
                           color: Color(0xFF00d4ff),
                         ),
                       ),
-                // Gradient overlay
-                Container(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                      colors: [
-                        Colors.transparent,
-                        const Color(0xFF0d1b2a).withOpacity(0.7),
-                        const Color(0xFF0d1b2a),
-                      ],
-                      stops: const [0.3, 0.7, 1.0],
+                // Gradient overlay (on top of the cover, so it takes the
+                // tap that opens the full-screen zoom)
+                GestureDetector(
+                  onTap: artUrl.isNotEmpty
+                      ? () => showImageZoom(context, imageUrl: artUrl)
+                      : null,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [
+                          Colors.transparent,
+                          const Color(0xFF0d1b2a).withOpacity(0.7),
+                          const Color(0xFF0d1b2a),
+                        ],
+                        stops: const [0.3, 0.7, 1.0],
+                      ),
                     ),
                   ),
                 ),

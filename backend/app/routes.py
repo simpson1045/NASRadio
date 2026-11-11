@@ -248,19 +248,22 @@ def _timed_smb(label, fn, *args, **kwargs):
                   f"you see it repeatedly, the handle dropped)")
 
 
-def _backfill_file_size(song_id, size):
-    """Cache a freshly-stat'd file size back into the DB so the NEXT play of
-    this song skips the SMB stat entirely. Fire-and-forget — failure is
-    harmless, we just stat again next time. (~24% of rows ship without a size.)"""
+def _correct_file_size(song_id, size):
+    """Write the real file size (read off the open file by the stream) onto
+    the song row when it's missing or wrong — a file replaced in place keeps
+    its old size otherwise (Oct 30, 2026). Fire-and-forget: the stream already
+    used the real size; failure just means we correct it next play."""
     try:
         db = get_db()
         conn = db.get_connection()
         cur = db.get_cursor(conn)
         cur.execute(
             "UPDATE songs SET file_size = %s "
-            "WHERE id = %s AND (file_size IS NULL OR file_size = 0)",
-            (int(size), song_id),
+            "WHERE id = %s AND file_size IS DISTINCT FROM %s",
+            (int(size), song_id, int(size)),
         )
+        if cur.rowcount:
+            print(f"🔧 [stream] Song {song_id}: corrected file_size to {int(size)}")
         conn.commit()
         conn.close()
     except Exception:
@@ -479,28 +482,76 @@ def _error_response(e, status=500):
     traceback.print_exc()
     return jsonify({"error": "Internal server error"}), status
 
-# Song recognition: runs ShazamIO in a subprocess to avoid eventlet/asyncio conflicts
+# Song recognition: runs ShazamIO in a subprocess to avoid eventlet/asyncio conflicts.
+# Since ~2026-10-19 Shazam returns zero matches for signatures shorter than 12 s
+# (shazamio-core 1.x defaults to 10 s). 12 s matches instantly, and so does a
+# shorter clip padded with silence out to 12 s (tested 4-10 s of real audio:
+# 12/12 matched), so short clips are padded instead of making the user wait.
+SHAZAM_SEGMENT_SECONDS = 12
+SHAZAM_TIMEOUT_SECONDS = 12
+
+
+class ShazamUnavailable(Exception):
+    """Shazam itself failed (timeout, crash, bad response), as opposed to 'heard it, no match'."""
+
+
+def _pad_for_shazam(audio_path):
+    """Pad a clip with silence to SHAZAM_SEGMENT_SECONDS (longer clips are untouched).
+    Returns the path to send; the caller deletes it if it differs from audio_path."""
+    padded = audio_path + ".pad.wav"
+    result = eventlet.tpool.execute(safe_subprocess_run,
+        ["ffmpeg", "-loglevel", "error", "-y", "-i", audio_path,
+         "-ac", "1", "-ar", "16000", "-af", f"apad=whole_dur={SHAZAM_SEGMENT_SECONDS}", padded],
+        capture_output=True, text=True, timeout=15
+    )
+    if result.returncode != 0 or not os.path.exists(padded):
+        print(f"⚠️ Shazam pad failed, sending the clip as-is: {result.stderr.strip()[:200]}")
+        return audio_path
+    return padded
+
+
 def _recognize_with_shazam(audio_path):
-    """Run ShazamIO in a separate Python process (eventlet monkey-patches break asyncio)."""
+    """Run ShazamIO in a separate Python process (eventlet monkey-patches break asyncio).
+    Raises ShazamUnavailable when Shazam didn't give a real answer."""
     import json as _json
     script = f'''
 import asyncio, json, sys
 from shazamio import Shazam
+from shazamio_core import SearchParams
 
 async def main():
     shazam = Shazam()
-    result = await shazam.recognize(sys.argv[1])
+    result = await shazam.recognize(
+        sys.argv[1], options=SearchParams(segment_duration_seconds={SHAZAM_SEGMENT_SECONDS}))
     print(json.dumps(result))
 
 asyncio.run(main())
 '''
-    result = eventlet.tpool.execute(safe_subprocess_run,
-        ["python", "-c", script, audio_path],
-        capture_output=True, text=True, timeout=30
-    )
+    send_path = _pad_for_shazam(audio_path)
+    try:
+        result = eventlet.tpool.execute(safe_subprocess_run,
+            ["python", "-c", script, send_path],
+            capture_output=True, text=True, timeout=SHAZAM_TIMEOUT_SECONDS
+        )
+    except Exception as e:
+        # safe_subprocess_run raises the UNPATCHED subprocess.TimeoutExpired, a
+        # different class from the eventlet-patched one this module imports.
+        if type(e).__name__ == "TimeoutExpired":
+            raise ShazamUnavailable(f"Shazam didn't answer within {SHAZAM_TIMEOUT_SECONDS} s")
+        raise ShazamUnavailable(f"Shazam error: {e}")
+    finally:
+        if send_path != audio_path:
+            try:
+                os.unlink(send_path)
+            except Exception:
+                pass
     if result.returncode != 0:
-        raise RuntimeError(f"ShazamIO subprocess failed: {result.stderr.strip()}")
-    return _json.loads(result.stdout.strip())
+        err = result.stderr.strip().splitlines()
+        raise ShazamUnavailable(f"Shazam error: {err[-1][:200] if err else 'exit ' + str(result.returncode)}")
+    try:
+        return _json.loads(result.stdout.strip())
+    except ValueError:
+        raise ShazamUnavailable("Shazam sent back something that isn't a result")
 
 # Base directory for the backend (parent of app/)
 APP_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -569,6 +620,18 @@ def auth_login():
 def auth_me():
     """Return the currently-authenticated user (validates the token)."""
     return jsonify({"user": auth.public_user(g.user)})
+
+
+@api.route("/api/auth/refresh", methods=["POST"])
+def auth_refresh():
+    """Trade a valid full session token for a fresh one (new 30-day clock).
+    The app calls this on start/resume and daily, so a device in use never
+    expires. Media tokens can't refresh a session; a revoked token (bumped
+    token_version) never gets this far."""
+    if getattr(g, "token_scope", "full") != "full":
+        return jsonify({"error": "Session token required"}), 403
+    token = auth.generate_token(g.user["id"], g.user["token_version"])
+    return jsonify({"token": token, "user": auth.public_user(g.user)})
 
 
 # ========================
@@ -929,6 +992,198 @@ def get_artists():
     return jsonify(artists)
 
 
+# ── Album editions: one card per group (ALBUM_EDITIONS_SPEC.md §4) ─────
+# Album lists show an edition group as ONE card: the group's title, its
+# earliest (original) year, and the edition the user last picked (else the
+# group's default edition). edition_count / edition_has_atmos /
+# edition_max_channels let the app badge the card. Lookup callers that need
+# every concrete album pass ?editions=all.
+
+def _edition_groups(cursor, group_ids):
+    """{group_id: {"title", "year", "rep_id", "members": [...]}} for these groups."""
+    cursor.execute(
+        """SELECT g.id AS group_id, g.title AS group_title, g.default_album_id,
+                  p.album_id AS preferred_album_id,
+                  a.id, a.edition_label, a.year, a.original_year,
+                  COALESCE(MAX(s.audio_channels), 2) AS max_channels,
+                  COALESCE(MAX(s.is_atmos), 0) AS has_atmos
+           FROM album_groups g
+           JOIN albums a ON a.group_id = g.id
+           LEFT JOIN user_edition_prefs p
+                  ON p.group_id = g.id AND p.user_id = %s
+           LEFT JOIN songs s ON s.album_id = a.id
+           WHERE g.id = ANY(%s)
+           GROUP BY g.id, p.album_id, a.id
+           ORDER BY a.id""",
+        (auth.current_user_id(), list(group_ids)),
+    )
+    groups = {}
+    for r in cursor.fetchall():
+        grp = groups.setdefault(r["group_id"], {
+            "title": r["group_title"], "default": r["default_album_id"],
+            "preferred": r["preferred_album_id"], "members": []})
+        grp["members"].append(dict(r))
+    for grp in groups.values():
+        ids = [m["id"] for m in grp["members"]]
+        unlabeled = [m["id"] for m in grp["members"] if not m["edition_label"]]
+        if grp["preferred"] in ids:
+            grp["rep_id"] = grp["preferred"]
+        elif grp["default"] in ids:
+            grp["rep_id"] = grp["default"]
+        else:
+            grp["rep_id"] = (unlabeled or ids)[0]
+        years = [m["original_year"] or m["year"] for m in grp["members"]
+                 if (m["original_year"] or m["year"] or 0) > 0]
+        grp["year"] = min(years) if years else None
+    return groups
+
+
+def _collapse_editions(cursor, albums, sort_key=None):
+    """Replace every edition-group member in `albums` with one group card,
+    at the position of the group's first member."""
+    if request.args.get("editions") == "all":
+        return albums
+    group_ids = {a["group_id"] for a in albums if a.get("group_id")}
+    if not group_ids:
+        return albums
+    groups = _edition_groups(cursor, group_ids)
+    by_id = {a["id"]: a for a in albums}
+    missing = [g["rep_id"] for g in groups.values() if g["rep_id"] not in by_id]
+    if missing:
+        cursor.execute(
+            """SELECT albums.*, artists.name AS artist_name
+               FROM albums JOIN artists ON albums.artist_id = artists.id
+               WHERE albums.id = ANY(%s)""", (missing,))
+        for r in cursor.fetchall():
+            by_id[r["id"]] = dict(r)
+
+    out, seen = [], set()
+    for a in albums:
+        gid = a.get("group_id")
+        if not gid or gid not in groups:
+            out.append(a)
+            continue
+        if gid in seen:
+            continue
+        seen.add(gid)
+        grp = groups[gid]
+        card = dict(by_id.get(grp["rep_id"], a))
+        card["edition_title"] = card.get("title")
+        card["title"] = grp["title"]
+        card["year"] = card["original_year"] = grp["year"]
+        card["edition_count"] = len(grp["members"])
+        card["edition_has_atmos"] = int(any(m["has_atmos"] for m in grp["members"]))
+        card["edition_max_channels"] = max(m["max_channels"] for m in grp["members"])
+        out.append(card)
+    if sort_key:
+        out.sort(key=sort_key)
+    return out
+
+
+# Count expression: an edition group counts as one album.
+_ALBUM_UNIT_SQL = ("CASE WHEN group_id IS NULL THEN 'a' || id "
+                   "ELSE 'g' || group_id END")
+
+
+@api.route("/api/album-groups/<int:group_id>/preferred-edition", methods=["PUT"])
+def set_preferred_edition(group_id):
+    """Remember the edition this user picked; the group card opens to it.
+    Body: {album_id}."""
+    album_id = (request.get_json(silent=True) or {}).get("album_id")
+    db = get_db()
+    conn = db.get_connection()
+    try:
+        cursor = db.get_cursor(conn)
+        cursor.execute("SELECT 1 FROM albums WHERE id = %s AND group_id = %s",
+                       (album_id, group_id))
+        if not cursor.fetchone():
+            return jsonify({"error": "album is not an edition of this group"}), 400
+        cursor.execute(
+            """INSERT INTO user_edition_prefs (user_id, group_id, album_id)
+               VALUES (%s, %s, %s)
+               ON CONFLICT (user_id, group_id)
+               DO UPDATE SET album_id = EXCLUDED.album_id,
+                             updated_at = CURRENT_TIMESTAMP""",
+            (auth.current_user_id(), group_id, album_id))
+        conn.commit()
+        return jsonify({"ok": True, "group_id": group_id, "album_id": album_id})
+    finally:
+        conn.close()
+
+
+@api.route("/api/holds", methods=["GET"])
+def list_song_holds():
+    """Songs this user is holding back: 👎 'Not now' (until a date) and
+    'Never play this' (until null). Expired holds are dropped on the way."""
+    db = get_db()
+    conn = db.get_connection()
+    try:
+        cursor = db.get_cursor(conn)
+        cursor.execute(
+            "DELETE FROM song_holds WHERE until IS NOT NULL AND until <= CURRENT_TIMESTAMP")
+        conn.commit()
+        cursor.execute(
+            """SELECT h.song_id, h.until, h.created_at, s.title, s.album_id,
+                      al.title AS album_title, ar.name AS artist_name
+               FROM song_holds h
+               JOIN songs s ON s.id = h.song_id
+               LEFT JOIN albums al ON al.id = s.album_id
+               LEFT JOIN artists ar ON ar.id = s.artist_id
+               WHERE h.user_id = %s
+               ORDER BY h.created_at DESC""",
+            (auth.current_user_id(),))
+        holds = []
+        for r in cursor.fetchall():
+            d = dict(r)
+            for k in ("until", "created_at"):
+                d[k] = d[k].isoformat() if d.get(k) else None
+            holds.append(d)
+        return jsonify({"holds": holds})
+    finally:
+        conn.close()
+
+
+@api.route("/api/songs/<int:song_id>/hold", methods=["POST", "DELETE"])
+def song_hold(song_id):
+    """POST {days: 30} = 👎 'Not now' for that long; {days: null} = 'Never
+    play this'. DELETE lifts it."""
+    db = get_db()
+    conn = db.get_connection()
+    try:
+        cursor = db.get_cursor(conn)
+        uid = auth.current_user_id()
+        if request.method == "DELETE":
+            cursor.execute(
+                "DELETE FROM song_holds WHERE user_id = %s AND song_id = %s",
+                (uid, song_id))
+            conn.commit()
+            return jsonify({"ok": True, "song_id": song_id, "held": False})
+        body = request.get_json(silent=True) or {}
+        days = body.get("days", 30)
+        if days is not None:
+            try:
+                days = max(1, min(3650, int(days)))
+            except (TypeError, ValueError):
+                return jsonify({"error": "days must be a number or null"}), 400
+        cursor.execute("SELECT 1 FROM songs WHERE id = %s", (song_id,))
+        if not cursor.fetchone():
+            return jsonify({"error": "no such song"}), 404
+        cursor.execute(
+            """INSERT INTO song_holds (user_id, song_id, until)
+               VALUES (%s, %s, CASE WHEN %s::int IS NULL THEN NULL
+                                    ELSE CURRENT_TIMESTAMP + make_interval(days => %s::int) END)
+               ON CONFLICT (user_id, song_id)
+               DO UPDATE SET until = EXCLUDED.until, created_at = CURRENT_TIMESTAMP
+               RETURNING until""",
+            (uid, song_id, days, days))
+        until = cursor.fetchone()["until"]
+        conn.commit()
+        return jsonify({"ok": True, "song_id": song_id, "held": True,
+                        "until": until.isoformat() if until else None})
+    finally:
+        conn.close()
+
+
 @api.route("/api/artist/<int:artist_id>", methods=["GET"])
 def get_artist(artist_id):
     """Get artist details with albums and featured songs"""
@@ -944,7 +1199,9 @@ def get_artist(artist_id):
     cursor.execute(
         "SELECT * FROM albums WHERE artist_id = %s ORDER BY year, title", (artist_id,)
     )
-    artist["albums"] = [dict(row) for row in cursor.fetchall()]
+    artist["albums"] = _collapse_editions(
+        cursor, [dict(row) for row in cursor.fetchall()],
+        sort_key=lambda a: (a.get("year") or 9999, (a.get("title") or "").lower()))
 
     # Get songs where this artist is associated but the song's ALBUM
     # belongs to a different primary artist. Two cases collapse into one:
@@ -1178,7 +1435,9 @@ def get_albums():
         ORDER BY albums.title
         """
     )
-    albums = [dict(row) for row in cursor.fetchall()]
+    albums = _collapse_editions(
+        cursor, [dict(row) for row in cursor.fetchall()],
+        sort_key=lambda a: (a.get("title") or "").lower())
 
     conn.close()
     return jsonify(albums)
@@ -1336,8 +1595,8 @@ def browse_years():
     cursor = db.get_cursor(conn)
 
     cursor.execute(
-        """
-        SELECT year, COUNT(*) as album_count, SUM(song_count) as song_count
+        f"""
+        SELECT year, COUNT(DISTINCT {_ALBUM_UNIT_SQL}) as album_count, SUM(song_count) as song_count
         FROM albums
         WHERE year IS NOT NULL AND year > 0
         GROUP BY year
@@ -1358,9 +1617,9 @@ def browse_decades():
     cursor = db.get_cursor(conn)
 
     cursor.execute(
-        """
+        f"""
         SELECT (year / 10 * 10) as decade,
-               COUNT(*) as album_count,
+               COUNT(DISTINCT {_ALBUM_UNIT_SQL}) as album_count,
                SUM(song_count) as song_count
         FROM albums
         WHERE year IS NOT NULL AND year > 0
@@ -1391,7 +1650,7 @@ def browse_year_albums(year):
     """,
         (year,),
     )
-    albums = [dict(row) for row in cursor.fetchall()]
+    albums = _collapse_editions(cursor, [dict(row) for row in cursor.fetchall()])
 
     conn.close()
     return jsonify(albums)
@@ -1414,7 +1673,7 @@ def browse_decade_albums(decade):
     """,
         (decade, decade + 10),
     )
-    albums = [dict(row) for row in cursor.fetchall()]
+    albums = _collapse_editions(cursor, [dict(row) for row in cursor.fetchall()])
 
     conn.close()
     return jsonify(albums)
@@ -1457,6 +1716,31 @@ def get_album(album_id):
     )
     songs = [dict(row) for row in cursor.fetchall()]
 
+    # Album references (album_track_refs): songs that live on another album
+    # but are also part of this one, slotted in at their disc/track here.
+    # They stay the same song (one play count, lyrics, analysis); `linked`
+    # + home_album_* let the app mark them and jump to where they live.
+    cursor.execute(
+        """SELECT songs.*, sa.loudness, sa.integrated_loudness_lufs, sa.true_peak_dbfs,
+                  r.disc_number AS ref_disc_number, r.track_number AS ref_track_number,
+                  home.title AS home_album_title
+           FROM album_track_refs r
+           JOIN songs ON songs.id = r.song_id
+           JOIN albums home ON home.id = songs.album_id
+           LEFT JOIN song_analysis sa ON songs.id = sa.song_id
+           WHERE r.album_id = %s""",
+        (album_id,),
+    )
+    linked = [dict(row) for row in cursor.fetchall()]
+    for song in linked:
+        song["linked"] = True
+        song["home_album_id"] = song["album_id"]
+        song["disc_number"] = song.pop("ref_disc_number")
+        song["track_number"] = song.pop("ref_track_number")
+    if linked:
+        songs.extend(linked)
+        songs.sort(key=lambda s: (s.get("disc_number") or 1, s.get("track_number") or 0))
+
     # Add all artists for each song
     for song in songs:
         # Every song here belongs to this album, but `songs.*` carries no
@@ -1464,7 +1748,8 @@ def get_album(album_id):
         # Song.fromJson falls back to "Unknown Album" when playSong rebuilds
         # the queue from this endpoint, which breaks the Now-Playing display
         # and the special-waveform (lightsaber/DNA/EVH) album detection.
-        song["album_title"] = album["title"]
+        # A linked song keeps its HOME album (that's the file playing).
+        song["album_title"] = song.get("home_album_title") or album["title"]
         cursor.execute(
             """
             SELECT artists.id, artists.name
@@ -1490,7 +1775,7 @@ def get_album(album_id):
     # the same group, with a spatial summary so the picker can badge.
     if album.get("group_id"):
         cursor.execute(
-            """SELECT a.id, a.title, a.edition_label,
+            """SELECT a.id, a.title, a.edition_label, a.year, a.original_year,
                       COALESCE(MAX(s.audio_channels), 2) AS max_channels,
                       COALESCE(MAX(s.is_atmos), 0) AS has_atmos,
                       COUNT(s.id) AS song_count
@@ -1500,7 +1785,19 @@ def get_album(album_id):
                ORDER BY a.id""",
             (album["group_id"],),
         )
-        album["editions"] = [dict(r) for r in cursor.fetchall()]
+        editions = [dict(r) for r in cursor.fetchall()]
+        grp = _edition_groups(cursor, [album["group_id"]]).get(album["group_id"])
+        if grp:
+            # The group's own default leads the chip row; the rest by id.
+            default_id = grp["default"] or grp["rep_id"]
+            editions.sort(key=lambda e: (e["id"] != default_id, e["id"]))
+            for e in editions:
+                e["is_default"] = e["id"] == default_id
+            album["group_title"] = grp["title"]
+            album["group_year"] = grp["year"]
+            album["default_edition_id"] = default_id
+            album["preferred_edition_id"] = grp["preferred"]
+        album["editions"] = editions
 
     # Get disc names
     cursor.execute(
@@ -1512,6 +1809,69 @@ def get_album(album_id):
 
     conn.close()
     return jsonify(album)
+
+
+@api.route("/api/album/<int:album_id>/links", methods=["POST"])
+@auth.require_admin
+def link_album_track(album_id):
+    """List an existing song on this album too (album_track_refs), at a
+    disc/track slot. Re-linking the same song just moves its slot."""
+    data = request.get_json(silent=True) or {}
+    try:
+        song_id = int(data["song_id"])
+        track_number = int(data["track_number"])
+        disc_number = int(data.get("disc_number") or 1)
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "song_id and track_number are required"}), 400
+    if track_number < 1 or disc_number < 1:
+        return jsonify({"error": "track and disc numbers start at 1"}), 400
+
+    db = get_db()
+    conn = db.get_connection()
+    try:
+        cursor = db.get_cursor(conn)
+        cursor.execute("SELECT id FROM albums WHERE id = %s", (album_id,))
+        if not cursor.fetchone():
+            return jsonify({"error": "Album not found"}), 404
+        cursor.execute("SELECT id, album_id, title FROM songs WHERE id = %s", (song_id,))
+        song = cursor.fetchone()
+        if not song:
+            return jsonify({"error": "Song not found"}), 404
+        if song["album_id"] == album_id:
+            return jsonify({"error": "That song already lives on this album"}), 400
+        cursor.execute(
+            """INSERT INTO album_track_refs (album_id, song_id, disc_number, track_number)
+               VALUES (%s, %s, %s, %s)
+               ON CONFLICT (album_id, song_id)
+               DO UPDATE SET disc_number = EXCLUDED.disc_number,
+                             track_number = EXCLUDED.track_number""",
+            (album_id, song_id, disc_number, track_number),
+        )
+        conn.commit()
+        return jsonify({"success": True, "album_id": album_id, "song_id": song_id,
+                        "disc_number": disc_number, "track_number": track_number})
+    finally:
+        conn.close()
+
+
+@api.route("/api/album/<int:album_id>/links/<int:song_id>", methods=["DELETE"])
+@auth.require_admin
+def unlink_album_track(album_id, song_id):
+    """Remove a song's listing from this album. The song itself and its
+    home album are untouched."""
+    db = get_db()
+    conn = db.get_connection()
+    try:
+        cursor = db.get_cursor(conn)
+        cursor.execute(
+            "DELETE FROM album_track_refs WHERE album_id = %s AND song_id = %s",
+            (album_id, song_id),
+        )
+        removed = cursor.rowcount
+        conn.commit()
+        return jsonify({"success": True, "removed": removed})
+    finally:
+        conn.close()
 
 
 @api.route("/api/songs", methods=["GET"])
@@ -1600,6 +1960,9 @@ def _get_transcode_paths(song_id, quality):
         "high": ("aac", "320k", "m4a"),
         "medium": ("aac", "128k", "m4a"),
         "low": ("mp3", "96k", "mp3"),
+        # Phone offline downloads (made by the transcode service, see
+        # prepare_download): half the size of AAC 320.
+        "opus160": ("opus", "160k", "opus"),
     }
     preset = quality_presets.get(quality, ("aac", "320k", "m4a"))
     fmt, bitrate, ext_out = preset
@@ -1611,7 +1974,7 @@ def _get_transcode_paths(song_id, quality):
     cache_key = f"{song_id}_{quality}_{bitrate}"
     cache_file = os.path.join(cache_dir, f"{cache_key}.{ext_out}")
     temp_file = cache_file + ".tmp"
-    transcode_mime = "audio/mp4" if fmt == "aac" else "audio/mpeg"
+    transcode_mime = {"aac": "audio/mp4", "opus": "audio/ogg"}.get(fmt, "audio/mpeg")
 
     return fmt, bitrate, cache_file, temp_file, transcode_mime
 
@@ -1702,6 +2065,14 @@ def _transcode_to_cache(file_path, song_id, quality, is_hdcd=False):
             "-vn", "-c:a", "aac", "-b:a", bitrate,
             "-movflags", "+faststart",
             "-f", "mp4", temp_file,
+        ]
+    elif fmt == "opus":
+        ffmpeg_cmd = [
+            ffmpeg_path, "-i", file_path,
+        ] + hdcd_args + cpu_args + [
+            "-vn", "-c:a", "libopus", "-b:a", bitrate,
+            "-ar", "48000", "-ac", "2",
+            "-f", "ogg", temp_file,
         ]
     else:
         ffmpeg_cmd = [
@@ -1800,6 +2171,9 @@ def _trigger_desktop_transcode(song_id, file_path, quality="high", is_hdcd=False
 _RECONCILER_STARTUP_DELAY_S = 120
 _RECONCILER_INTERVAL_S = 1800
 _RECONCILER_CANCEL_GRACE_S = 6 * 3600  # honor an explicit user cancel this long
+_RECONCILE_MAX_ATTEMPTS = 3
+_reconcile_attempts = {}     # song_id -> targeted transcode kicks while still missing
+_reconcile_reported = set()  # song_ids already logged as given up
 
 
 def _reconcile_pipelines():
@@ -1834,13 +2208,30 @@ def _reconcile_pipelines():
             conn.close()
 
         missing = lossless_ids - cached_ids
+        # Forget songs that got cached; give up (until a backend restart) on a
+        # song that's still missing after 3 targeted attempts, so one bad file
+        # can't trigger a batch every 30 minutes forever (Lars interview:
+        # 2,094 runs since Sept).
+        for sid in list(_reconcile_attempts):
+            if sid not in missing:
+                del _reconcile_attempts[sid]
+        given_up = {s for s in missing if _reconcile_attempts.get(s, 0) >= _RECONCILE_MAX_ATTEMPTS}
+        for sid in given_up - _reconcile_reported:
+            print(f"⛔ [reconciler] song {sid} still has no AAC cache after "
+                  f"{_RECONCILE_MAX_ATTEMPTS} transcode attempts — not retrying "
+                  "(see nasradio-transcode logs)")
+            _reconcile_reported.add(sid)
+        missing -= given_up
         if missing:
             if check_transcode_service():
                 print(
                     f"🔁 [reconciler] {len(missing)} lossless songs missing AAC "
-                    "cache — kicking transcode batch"
+                    f"cache — transcoding just those: {sorted(missing)[:10]}"
+                    f"{' …' if len(missing) > 10 else ''}"
                 )
-                start_transcode_background()
+                for sid in missing:
+                    _reconcile_attempts[sid] = _reconcile_attempts.get(sid, 0) + 1
+                start_transcode_background(song_ids=missing)
             else:
                 print(
                     f"⏭️ [reconciler] {len(missing)} songs need transcoding but "
@@ -1944,6 +2335,57 @@ def start_pipeline_reconciler(app):
 
     eventlet.spawn_n(_loop)
     print("🔁 Pipeline reconciler started — transcode/analysis self-heal every 30 min")
+
+
+@api.route("/api/download/<int:song_id>/prepare", methods=["POST"])
+def prepare_download(song_id):
+    """Get one song ready for the phone's offline Downloads.
+
+    The phone asks first, then fetches /api/stream/<id>?quality=<quality>:
+      ready       -> the converted copy exists (that stream is a cache hit)
+      passthrough -> the original is already small (MP3/AAC/Opus): fetch it
+                     with quality=lossless
+      retry (503) -> the transcode service is busy or down; ask again later
+    Converting goes through the dedicated transcode service ONLY, never the
+    NAS-local FFmpeg (that fights playback for the share; see
+    _opportunistic_precache). Without this, an unconverted song's stream
+    serves the full lossless original, and a download would be 6x the size.
+    """
+    fmt = request.args.get("format", "opus160")
+    if fmt not in ("opus160", "high", "medium"):
+        return jsonify({"status": "ready", "quality": "lossless"})
+
+    db = get_db()
+    conn = db.get_connection()
+    cursor = db.get_cursor(conn)
+    cursor.execute(
+        "SELECT file_path, duration, is_hdcd FROM songs WHERE id = %s", (song_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"status": "missing"}), 404
+
+    _, _, cache_file, _, _ = _get_transcode_paths(song_id, fmt)
+    try:
+        if smb_exists(cache_file):
+            return jsonify({"status": "ready", "quality": fmt})
+    except SmbUnavailable:
+        return jsonify({"status": "retry", "reason": "storage"}), 503
+
+    from app.transcode import check_transcode_service, transcode_song
+    if not check_transcode_service():
+        return jsonify({"status": "retry", "reason": "transcode service down"}), 503
+    data = transcode_song(
+        song_id, row["file_path"], fmt,
+        is_hdcd=row.get("is_hdcd") == 1, duration=row.get("duration"),
+    ) or {}
+    status = data.get("status")
+    if status in ("transcoded", "already_cached"):
+        return jsonify({"status": "ready", "quality": fmt})
+    if status == "passthrough":
+        return jsonify({"status": "passthrough", "quality": "lossless"})
+    return jsonify({"status": "retry", "reason": status or "transcode failed"}), 503
 
 
 @api.route("/api/prefetch/<int:song_id>", methods=["POST"])
@@ -2055,7 +2497,7 @@ def stream_song(song_id):
     cursor = db.get_cursor(conn)
     cursor.execute(
         "SELECT file_path, duration, is_hdcd, source_type, file_size, "
-        "resolved_url, resolved_url_expires_at, source_url "
+        "resolved_url, resolved_url_expires_at, source_url, audio_codec "
         "FROM songs WHERE id = %s",
         (song_id,),
     )
@@ -2106,6 +2548,19 @@ def stream_song(song_id):
     # receiver (a compressed bitstream mutes+relocks on any stall; PCM just
     # absorbs the same hiccup).
     _serving_sidecar = False
+    # quality=bitstream: the untouched original for passthrough renderers
+    # (ELKO's mpv / a Shield) that hand Dolby bitstreams to the AVR.
+    # TrueHD otherwise: nothing else here can play it (the TV's Cast player,
+    # phones, media_kit), so serve the DD+ 5.1 Cast sidecar, or a lossy
+    # transcode until the sidecar exists.
+    if quality == "bitstream":
+        quality = "lossless"
+    elif (row.get("audio_codec") or "").lower() == "truehd" and quality in ("lossless", "cast"):
+        try:
+            _has_sidecar = smb_exists(os.path.splitext(file_path)[0] + ".cast.m4a")
+        except SmbUnavailable:
+            _has_sidecar = False
+        quality = "cast" if _has_sidecar else "high"
     if quality == "cast":
         _cast_sidecar = os.path.splitext(file_path)[0] + ".cast.m4a"
         try:
@@ -2174,6 +2629,7 @@ def stream_song(song_id):
         ".wv": "audio/wavpack",
         ".dsf": "audio/dsf",
         ".dff": "audio/dff",
+        ".mka": "audio/x-matroska",
     }
     mime_type = mime_types.get(ext, "audio/mpeg")
 
@@ -2193,20 +2649,30 @@ def stream_song(song_id):
         eventlet.spawn_n(_opportunistic_precache, file_path, song_id, "high", is_hdcd)
 
     elapsed = time.time() - t_start
-    # Size: prefer the value already in the DB so we skip an SMB stat on the hot
-    # path entirely. Only stat (and backfill) when the row doesn't have it.
-    size = row.get("file_size") or 0
-    if not size:
+    # Size comes from the FILE, not the DB. Until Oct 30, 2026 the DB size was
+    # trusted as-is: albums upgraded in place (CD rip -> hi-res, MP3 -> FLAC)
+    # kept the first scan's size, and the stream ended at that many bytes, so
+    # 191 songs cut off early (Van Halen "Panama" at ~25 s). A GET opens the
+    # file first and reads the size off the open handle (fstat: no extra
+    # lookup); a HEAD (rare) stats the path. A wrong row is corrected.
+    db_size = row.get("file_size") or 0
+    fh = None
+    if request.method == "HEAD":
         try:
             size = _timed_smb(f"getsize song {song_id}", smb_getsize, file_path)
         except SmbUnavailable:
             print(f"🔴 [stream] Song {song_id}: SMB share unreachable on getsize({file_path})")
             return jsonify({"error": "Storage unavailable"}), 503
-        if not _serving_sidecar:   # never write the sidecar's size onto the song row
-            eventlet.spawn_n(_backfill_file_size, song_id, size)
-        size_src = "stat" if _serving_sidecar else "stat+backfill"
     else:
-        size_src = "db"
+        fh = _open_stream_fh(file_path, 0, song_id)
+        if fh is None:
+            print(f"🔴 [stream] Song {song_id}: SMB unreachable on open (after retry)")
+            return jsonify({"error": "Storage unavailable"}), 503
+        size = os.fstat(fh.fileno()).st_size
+    size_src = "stat" if fh is None else "fstat"
+    if size != db_size and not _serving_sidecar:  # never put a sidecar's size on the row
+        eventlet.spawn_n(_correct_file_size, song_id, size)
+        size_src += f", db had {db_size}"
     print(f"📁 [stream] Song {song_id}: serving original {ext} — {size} bytes ({size_src}), {request.method} Range={range_header} ({elapsed:.3f}s)")
 
     # Parse the HTTP Range (the player + the cast device both seek/stream via
@@ -2225,6 +2691,8 @@ def stream_song(song_id):
         except ValueError:
             start, end = 0, size - 1
         if start >= size or start > end:
+            if fh is not None:
+                eventlet.tpool.execute(fh.close)
             return Response("", status=416,
                             headers={"Content-Range": f"bytes */{size}"})
         end = min(end, size - 1)
@@ -2248,10 +2716,8 @@ def stream_song(song_id):
         resp.headers["Content-Length"] = str(length)
         return resp
 
-    fh = _open_stream_fh(file_path, start, song_id)
-    if fh is None:
-        print(f"🔴 [stream] Song {song_id}: SMB unreachable on open (after retry)")
-        return jsonify({"error": "Storage unavailable"}), 503
+    if start:
+        eventlet.tpool.execute(fh.seek, start)
 
     return Response(
         stream_with_context(_tpool_file_stream(fh, length)),
@@ -2337,7 +2803,7 @@ def search():
     """,
         (search_term, search_term, normalized_query, search_term),
     )
-    albums = [dict(row) for row in cursor.fetchall()]
+    albums = _collapse_editions(cursor, [dict(row) for row in cursor.fetchall()])
 
     # Search songs - split query into terms and match all across title/artist/album
     # Use regexp_replace to strip punctuation from DB values (matches normalize_text_for_search)
@@ -2789,7 +3255,15 @@ def scan_new_files():
 @api.route("/api/cleanup-missing", methods=["POST"])
 @auth.require_admin
 def cleanup_missing_files():
-    """Remove database entries for files that no longer exist"""
+    """REPORT ONLY: count and log songs whose files can't be found.
+
+    This used to DELETE every song whose file it couldn't see, with its
+    playlist entries, favorites and play history. Run while the old Synology
+    disks were failing (May-July 2026) it wiped real albums whose files were
+    fine (7 Songs. among them), and it also treated stream/podcast rows (URL
+    paths) as missing. Removing a song is now an explicit Delete song/album;
+    keeping files out of the library is the Excluded Files list.
+    """
 
     operation_id = f"cleanup_{uuid.uuid4().hex[:8]}"
 
@@ -2814,8 +3288,10 @@ def cleanup_missing_files():
                 },
             )
 
-            # Get all songs
-            cursor.execute("SELECT id, title, file_path FROM songs")
+            # Local files only: stream/podcast rows have URL paths.
+            cursor.execute(
+                "SELECT id, title, file_path FROM songs WHERE source_type = 'local'"
+            )
             songs = cursor.fetchall()
             total = len(songs)
             missing_ids = []
@@ -2842,6 +3318,7 @@ def cleanup_missing_files():
                 # file_path is already absolute in the database
                 if not os.path.exists(file_path):
                     missing_ids.append(song_id)
+                    print(f"🔎 [missing-files] song {song_id} {title!r}: {file_path}")
 
                 if i % 100 == 0:
                     progress_tracker.operations[operation_id]["total"] = total
@@ -2862,93 +3339,24 @@ def cleanup_missing_files():
                         },
                     )
 
-            progress_tracker.update_progress(
-                operation_id,
-                total,
-                f"Found {len(missing_ids)} missing files. Cleaning up...",
+            msg = (
+                f"{len(missing_ids)} songs point at files that can't be found "
+                "(listed in the server log). Nothing was deleted."
+                if missing_ids
+                else "No missing files found"
             )
-
-            if missing_ids:
-                # NOTE: previously these used f"... IN ({','.join('%s' * N)})"
-                # which is BROKEN — '%s' * N is a string like '%s%s%s' (no
-                # separator), and join then comma-separates each *character*,
-                # producing '%,s,%,s,%,s'. psycopg2 saw '%,' and threw
-                # "unsupported format character ','". Rewritten to use
-                # WHERE col = ANY(%s) which takes a Python list directly,
-                # no placeholder gymnastics, and works for any list length.
-                cursor.execute(
-                    "DELETE FROM playlist_songs WHERE song_id = ANY(%s)",
-                    (missing_ids,),
-                )
-                cursor.execute(
-                    "DELETE FROM song_artists WHERE song_id = ANY(%s)",
-                    (missing_ids,),
-                )
-                cursor.execute(
-                    "DELETE FROM favorites WHERE item_type = 'song' AND item_id = ANY(%s)",
-                    (missing_ids,),
-                )
-                cursor.execute(
-                    "DELETE FROM play_history WHERE song_id = ANY(%s)",
-                    (missing_ids,),
-                )
-                cursor.execute(
-                    "DELETE FROM songs WHERE id = ANY(%s)",
-                    (missing_ids,),
-                )
-
-                # Clean up orphaned albums (albums with no songs)
-                cursor.execute(
-                    """
-                    DELETE FROM albums WHERE id NOT IN (SELECT DISTINCT album_id FROM songs)
-                """
-                )
-                orphaned_albums = cursor.rowcount
-
-                # Clean up orphaned artists (artists with no songs or albums)
-                cursor.execute(
-                    """
-                    DELETE FROM artists WHERE id NOT IN (
-                        SELECT DISTINCT artist_id FROM songs
-                        UNION
-                        SELECT DISTINCT artist_id FROM albums
-                        UNION
-                        SELECT DISTINCT artist_id FROM song_artists
-                    )
-                """
-                )
-                orphaned_artists = cursor.rowcount
-
-                conn.commit()
-
-                progress_tracker.complete_operation(
-                    operation_id,
-                    f"Removed {len(missing_ids)} missing songs, {orphaned_albums} empty albums, {orphaned_artists} orphaned artists",
-                )
-                safe_emit(
-                    "cleanup_progress",
-                    {
-                        "operation_id": operation_id,
-                        "current": total,
-                        "total": total,
-                        "message": f"Removed {len(missing_ids)} songs, {orphaned_albums} albums, {orphaned_artists} artists",
-                        "status": "complete",
-                        "missing_count": len(missing_ids),
-                    },
-                )
-            else:
-                progress_tracker.complete_operation(operation_id, "No missing files found")
-                safe_emit(
-                    "cleanup_progress",
-                    {
-                        "operation_id": operation_id,
-                        "current": total,
-                        "total": total,
-                        "message": "No missing files found",
-                        "status": "complete",
-                        "missing_count": 0,
-                    },
-                )
+            progress_tracker.complete_operation(operation_id, msg)
+            safe_emit(
+                "cleanup_progress",
+                {
+                    "operation_id": operation_id,
+                    "current": total,
+                    "total": total,
+                    "message": msg,
+                    "status": "complete",
+                    "missing_count": len(missing_ids),
+                },
+            )
         finally:
             conn.close()
 
@@ -2956,7 +3364,7 @@ def cleanup_missing_files():
     thread.daemon = True
     thread.start()
 
-    return jsonify({"message": "Cleanup started", "operation_id": operation_id})
+    return jsonify({"message": "Missing-file check started", "operation_id": operation_id})
 
 
 @api.route("/api/enrich-explicit", methods=["POST"])
@@ -3169,7 +3577,7 @@ def get_stats():
     cursor.execute("SELECT COUNT(*) as count FROM artists")
     artist_count = cursor.fetchone()["count"]
 
-    cursor.execute("SELECT COUNT(*) as count FROM albums")
+    cursor.execute(f"SELECT COUNT(DISTINCT {_ALBUM_UNIT_SQL}) as count FROM albums")
     album_count = cursor.fetchone()["count"]
 
     cursor.execute("SELECT COUNT(*) as count FROM songs")
@@ -3980,6 +4388,42 @@ def get_song(song_id):
 
     conn.close()
     return jsonify(song)
+
+
+@api.route("/api/songs/random", methods=["GET"])
+def get_random_songs():
+    """Random songs from the local library (no podcasts/stations), for the
+    wake-up alarm's "Shuffle my library". Same song shape as /api/songs.
+    Skips albums flagged exclude_from_shuffle, like the living-room artist
+    shuffle (today that's only the isolated "Van Halen - Vocals" stems;
+    instrumentals stay in on purpose)."""
+    limit = min(max(request.args.get("limit", 60, type=int), 1), 200)
+    db = get_db()
+    conn = db.get_connection()
+    try:
+        cursor = db.get_cursor(conn)
+        cursor.execute(
+            """
+            SELECT songs.id, songs.title, songs.artist_id, songs.album_id, songs.track_number,
+                   songs.disc_number, songs.duration, songs.file_path, songs.file_size, songs.bitrate,
+                   songs.is_explicit, songs.is_hdcd, songs.audio_codec, songs.audio_channels, songs.is_atmos,
+                   artists.name as artist_name, albums.title as album_title
+            FROM songs
+            JOIN artists ON songs.artist_id = artists.id
+            JOIN albums ON songs.album_id = albums.id
+            WHERE songs.source_type = 'local'
+              AND NOT COALESCE(albums.exclude_from_shuffle, FALSE)
+            ORDER BY random()
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        songs = [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+    for song in songs:
+        song["artists"] = [{"id": song["artist_id"], "name": song["artist_name"]}]
+    return jsonify({"songs": songs})
 
 
 @api.route("/api/songs/<int:song_id>/chapters", methods=["GET"])
@@ -5603,6 +6047,12 @@ def get_favorite_albums():
 
     favorites = Favorites()
     albums = favorites.get_favorite_albums()
+    db = get_db()
+    conn = db.get_connection()
+    try:
+        albums = _collapse_editions(db.get_cursor(conn), albums)
+    finally:
+        conn.close()
 
     return jsonify(albums)
 
@@ -6324,14 +6774,86 @@ def search_prowlarr():
     # origin is down. The deep modes pass this through so the user
     # can still opt in via "Also search RuTracker."
     filter_rutracker = not (is_deep_request or explicit_indexers)
+    # The app's per-indexer fast search names one indexer at a time but still
+    # wants the default-mode RuTracker-proxy filter.
+    if request.args.get("filter_rutracker", "").lower() == "true":
+        filter_rutracker = True
+
+    # Per-indexer searches from the app pass a short `timeout` (one slow
+    # tracker can't hold the list) and a `search_id` the Cancel button can
+    # stop. Prowlarr has no cancel API, so a cancel answers the app at once
+    # and drops the result; Prowlarr's own query ends within `timeout`.
+    try:
+        timeout = max(5, min(int(request.args.get("timeout", 120)), 150))
+    except ValueError:
+        timeout = 120
+    search_id = (request.args.get("search_id") or "").strip()[:64]
+    if search_id and search_id in _prowlarr_cancelled:
+        return jsonify({"success": False, "cancelled": True, "results": []})
+
     # Prowlarr search makes blocking HTTP requests — run in real thread
-    result = eventlet.tpool.execute(
-        client.search, query, indexer_ids, None, filter_rutracker
-    )
+    gt = eventlet.spawn(eventlet.tpool.execute,
+                        client.search, query, indexer_ids, None, filter_rutracker,
+                        timeout)
+    if search_id:
+        _prowlarr_inflight[search_id] = _prowlarr_inflight.get(search_id, 0) + 1
+        try:
+            while not gt.dead:
+                if search_id in _prowlarr_cancelled:
+                    return jsonify({"success": False, "cancelled": True, "results": []})
+                eventlet.sleep(0.2)
+        finally:
+            n = _prowlarr_inflight.get(search_id, 1) - 1
+            if n <= 0:
+                _prowlarr_inflight.pop(search_id, None)
+            else:
+                _prowlarr_inflight[search_id] = n
+    try:
+        result = gt.wait()
+    except Exception as e:
+        result = {"success": False, "error": str(e)}
 
     if result["success"]:
         return jsonify(result)
     return jsonify(result), 500
+
+
+# search_id -> in-flight request count / cancelled ids (cancel holds 10 min so
+# late-arriving per-indexer requests for the same search are refused too).
+_prowlarr_inflight = {}
+_prowlarr_cancelled = {}
+
+
+@api.route("/api/prowlarr/search/cancel", methods=["POST"])
+def cancel_prowlarr_search():
+    """The app's red ❌: stop every in-flight indexer request of a search."""
+    data = request.get_json(silent=True) or {}
+    search_id = (data.get("search_id") or "").strip()[:64]
+    if not search_id:
+        return jsonify({"error": "search_id required"}), 400
+    now = time.time()
+    for sid, ts in list(_prowlarr_cancelled.items()):
+        if now - ts > 600:
+            del _prowlarr_cancelled[sid]
+    _prowlarr_cancelled[search_id] = now
+    return jsonify({"success": True, "stopped": _prowlarr_inflight.get(search_id, 0)})
+
+
+@api.route("/api/prowlarr/tiers", methods=["GET"])
+def prowlarr_tiers():
+    """Enabled indexers split into the default (fast) and opt-in (deep) sets,
+    so the app can search each indexer on its own and show results as they
+    arrive."""
+    from app.prowlarr import ProwlarrClient
+
+    client = ProwlarrClient()
+    try:
+        idx = client._enabled_indexers()
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Could not reach Prowlarr: {e}"}), 502
+    fast = [{"id": i["id"], "name": i["name"]} for i in idx if not client._is_deep(i["name"])]
+    deep = [{"id": i["id"], "name": i["name"]} for i in idx if client._is_deep(i["name"])]
+    return jsonify({"success": True, "fast": fast, "deep": deep})
 
 
 @api.route("/api/transmission/add", methods=["POST"])
@@ -7048,6 +7570,7 @@ def import_youtube_download():
         except Exception as e:
             print(f"Could not trigger analysis for imported song: {e}")
 
+        eventlet.spawn_n(_relink_after_import, artist_name)
         return jsonify(
             {
                 "success": True,
@@ -7115,6 +7638,8 @@ def import_youtube_as_album():
         target_album_id=target_album_id,
     )
 
+    if result.get("success"):
+        eventlet.spawn_n(_relink_after_import, album_meta.get("artist"))
     status = 200 if result.get("success") else 500
     return jsonify(result), status
 
@@ -7551,6 +8076,25 @@ def analyze_multi_disc_structure(folder_path, cue_files, audio_files):
     return result
 
 
+def _skip_import_folder(item_path):
+    """Folders the import list ignores: dot-folders (e.g. a read-only loop
+    mount of a disc image) and raw Blu-ray disc folders (BDMV), which are
+    kept as-is for NASCinema, not imported as music. .iso files are never
+    listed anyway (only folders are)."""
+    name = os.path.basename(item_path)
+    if name.startswith("."):
+        return True
+    try:
+        if os.path.isdir(os.path.join(item_path, "BDMV")):
+            return True
+        for sub in os.listdir(item_path):
+            if os.path.isdir(os.path.join(item_path, sub, "BDMV")):
+                return True
+    except OSError:
+        return True
+    return False
+
+
 @api.route("/api/imports/pending", methods=["GET"])
 def get_pending_imports():
     """Get list of folders in downloads ready for import"""
@@ -7566,7 +8110,7 @@ def get_pending_imports():
     if os.path.exists(downloads_path):
         for item in os.listdir(downloads_path):
             item_path = os.path.join(downloads_path, item)
-            if os.path.isdir(item_path):
+            if os.path.isdir(item_path) and not _skip_import_folder(item_path):
                 # Get folder info
                 audio_files = []
                 cue_files = []
@@ -7592,6 +8136,7 @@ def get_pending_imports():
                             ".dsf",
                             ".dff",
                             ".mpc",
+                            ".mka",
                         ]:
                             audio_files.append(f)
                             if ext in [
@@ -7646,7 +8191,7 @@ def get_pending_imports():
     if os.path.exists(lidarr_path):
         for item in os.listdir(lidarr_path):
             item_path = os.path.join(lidarr_path, item)
-            if os.path.isdir(item_path):
+            if os.path.isdir(item_path) and not _skip_import_folder(item_path):
                 audio_files = []
                 cue_files = []
                 flac_files = []
@@ -7671,6 +8216,7 @@ def get_pending_imports():
                             ".dsf",
                             ".dff",
                             ".mpc",
+                            ".mka",
                         ]:
                             audio_files.append(f)
                             if ext in [
@@ -10522,28 +11068,19 @@ def get_lyrics(song_id):
         conn.close()
         conn = None
 
+    # Same lookup as the TV (exact match, then search, retries on overload).
+    # LRCLIB being down is not "no lyrics": say so, and cache nothing.
+    from app.cast_sender import LyricsLookupFailed, lrclib_lookup, note_lyrics_failure
     try:
-        response = mb_requests.get(
-            "https://lrclib.net/api/get",
-            params={
-                "artist_name": artist_name,
-                "track_name": track_title,
-                "duration": duration,
-            },
-            headers={
-                "User-Agent": "NASRadio/1.0 (https://github.com/simpson1045/nasradio)"
-            },
-            timeout=10,
-        )
-    except mb_requests.exceptions.Timeout:
-        return jsonify({"success": False, "error": "LRCLIB timeout"})
-    except mb_requests.exceptions.RequestException as e:
-        return _error_response(e)
-
-    if response.status_code != 200:
+        data = lrclib_lookup(artist_name, track_title, duration)
+    except LyricsLookupFailed as e:
+        print(f"🎤 [lyrics] song {song_id}: {e} (queued for backfill)")
+        note_lyrics_failure(song_id)
+        return jsonify({"success": False, "retry": True,
+                        "error": "Lyrics service is busy, try again in a bit"})
+    if not data:
         return jsonify({"success": False, "error": "No lyrics found"})
 
-    data = response.json()
     synced = data.get("syncedLyrics")
     plain = data.get("plainLyrics")
 
@@ -10556,7 +11093,7 @@ def get_lyrics(song_id):
         cursor.execute(
             """
             INSERT INTO lyrics (song_id, synced_lyrics, plain_lyrics, source)
-            VALUES (%s, %s, %s, 'lrclib')
+            VALUES (%s, %s, %s, 'lrclib') ON CONFLICT DO NOTHING
             """,
             (song_id, synced, plain),
         )
@@ -10610,7 +11147,7 @@ def get_recently_added():
             """,
             (days, limit),
         )
-        albums = [dict(row) for row in cursor.fetchall()]
+        albums = _collapse_editions(cursor, [dict(row) for row in cursor.fetchall()])
 
         return jsonify({"albums": albums, "count": len(albums), "days": days})
     finally:
@@ -12078,6 +12615,7 @@ def _get_folder_quality(folder_path):
         ".wma": "WMA",
         ".dsf": "DSD",
         ".dff": "DSD",
+        ".mka": "TrueHD",
         ".alac": "ALAC",
         ".wv": "WavPack",
         ".ape": "APE",
@@ -12134,6 +12672,7 @@ def check_import_duplicates():
         ".aiff",
         ".dsf",
         ".dff",
+        ".mka",
     ]
 
     try:
@@ -12191,7 +12730,7 @@ def check_import_duplicates():
                 # bitstreams in mp4 — ec-3 sample entries come back as
                 # channels=2 — so confirm with ffprobe: real channel
                 # count plus the profile string, which names Atmos
-                # explicitly (same trick as scanner.detect_atmos).
+                # explicitly (same trick as scanner.probe_dolby).
                 # One probe per pending folder, tpool-wrapped.
                 if audio_files:
                     try:
@@ -13522,37 +14061,38 @@ def get_aggregated_missing_albums():
         conn.close()
 
 
-@api.route("/api/playlists/relink-missing", methods=["POST"])
-def relink_missing_playlist_songs():
-    """Re-scan all missing playlist songs and try to link them to library tracks"""
+def _relink_missing_playlist_songs(user_id=None, artist_hint=None):
+    """Link missing playlist songs (song_id NULL, e.g. Spotify-import
+    placeholders) to library tracks that now match, using the
+    SpotifyImporter's matcher. user_id = only that user's playlists (None =
+    everyone's). artist_hint = only rows whose artist mentions it (after an
+    import, so it doesn't re-check every missing song). Returns
+    {success, checked, linked, details[:50]}."""
     from app.spotify_import import SpotifyImporter
 
     db = get_db()
     conn = db.get_connection()
     cursor = db.get_cursor(conn)
-
     try:
-        # Get all missing playlist songs in the current user's playlists
+        where = ["song_id IS NULL", "spotify_track_name IS NOT NULL"]
+        params = []
+        if user_id is not None:
+            where.append("playlist_id IN (SELECT id FROM playlists WHERE user_id = %s)")
+            params.append(user_id)
+        if artist_hint:
+            where.append("spotify_artist ILIKE %s")
+            params.append(f"%{artist_hint}%")
         cursor.execute(
-            """
-            SELECT id, playlist_id, spotify_track_name, spotify_artist, spotify_album
-            FROM playlist_songs
-            WHERE song_id IS NULL
-            AND spotify_track_name IS NOT NULL
-            AND playlist_id IN (SELECT id FROM playlists WHERE user_id = %s)
-            """,
-            (auth.current_user_id(),),
+            "SELECT id, playlist_id, spotify_track_name, spotify_artist, spotify_album "
+            "FROM playlist_songs WHERE " + " AND ".join(where),
+            params,
         )
-
         missing_songs = cursor.fetchall()
         print(f"🔍 Found {len(missing_songs)} missing playlist songs to check")
 
-        # Use the SpotifyImporter's matching logic
         importer = SpotifyImporter()
-
         linked_count = 0
         linked_details = []
-
         for row in missing_songs:
             track_name = row["spotify_track_name"]
             # Split artist string into list (might be "Artist1, Artist2")
@@ -13561,12 +14101,8 @@ def relink_missing_playlist_songs():
                 if row["spotify_artist"]
                 else []
             )
-
-            # Try to find a match in the library
             local_song = importer.search_song_in_library(track_name, artist_names)
-
             if local_song:
-                # Found a match! Update the playlist_songs entry
                 cursor.execute(
                     "UPDATE playlist_songs SET song_id = %s WHERE id = %s",
                     (local_song["id"], row["id"]),
@@ -13584,22 +14120,19 @@ def relink_missing_playlist_songs():
                 print(
                     f"  ✅ Linked: '{track_name}' -> '{local_song['title']}' by {local_song['artist_name']}"
                 )
-
         conn.commit()
 
         # Update playlist song counts
         if linked_count > 0:
-            # Get affected playlist IDs
             affected_playlists = set(d["playlist_id"] for d in linked_details)
             for playlist_id in affected_playlists:
-                # Recalculate song count and duration
                 cursor.execute(
                     """
-                    UPDATE playlists SET 
+                    UPDATE playlists SET
                         song_count = (SELECT COUNT(*) FROM playlist_songs WHERE playlist_id = %s AND song_id IS NOT NULL),
-                        total_duration = (SELECT COALESCE(SUM(songs.duration), 0) 
-                                         FROM playlist_songs 
-                                         JOIN songs ON playlist_songs.song_id = songs.id 
+                        total_duration = (SELECT COALESCE(SUM(songs.duration), 0)
+                                         FROM playlist_songs
+                                         JOIN songs ON playlist_songs.song_id = songs.id
                                          WHERE playlist_songs.playlist_id = %s)
                     WHERE id = %s
                     """,
@@ -13610,25 +14143,46 @@ def relink_missing_playlist_songs():
         print(
             f"🎉 Relink complete! Linked {linked_count} of {len(missing_songs)} missing songs"
         )
-
-        return jsonify(
-            {
-                "success": True,
-                "checked": len(missing_songs),
-                "linked": linked_count,
-                "details": linked_details[
-                    :50
-                ],  # Limit details to first 50 for response size
-            }
-        )
-
-    except Exception as e:
-
-        traceback.print_exc()
+        return {
+            "success": True,
+            "checked": len(missing_songs),
+            "linked": linked_count,
+            "details": linked_details[:50],  # Limit details for response size
+        }
+    except Exception:
         conn.rollback()
-        return _error_response(e)
+        raise
     finally:
         conn.close()
+
+
+def _relink_after_import(artist_name):
+    """Background, after an album / YouTube import: the new tracks may be
+    what some playlist was missing, so link them and the slot fills in by
+    itself (until Nov 9 that took the Missing Albums 'Re-link' button or a
+    manual link). Only that artist's missing songs are checked; a
+    'Various Artists' import checks them all."""
+    try:
+        hint = (artist_name or "").strip()
+        if hint.lower() in ("", "various artists", "various"):
+            hint = None
+        r = _relink_missing_playlist_songs(user_id=None, artist_hint=hint)
+        print(
+            f"🔗 [relink] after importing {artist_name!r}: linked {r['linked']} "
+            f"of {r['checked']} missing playlist songs"
+        )
+    except Exception as e:
+        print(f"🔗 [relink] after importing {artist_name!r} failed: {e}")
+
+
+@api.route("/api/playlists/relink-missing", methods=["POST"])
+def relink_missing_playlist_songs():
+    """Re-scan all missing playlist songs and try to link them to library tracks"""
+    try:
+        return jsonify(_relink_missing_playlist_songs(user_id=auth.current_user_id()))
+    except Exception as e:
+        traceback.print_exc()
+        return _error_response(e)
 
 
 @api.route("/api/library/search-song", methods=["GET"])
@@ -14015,11 +14569,76 @@ def clear_all_exclusions():
         conn.close()
 
 
+def _alac_pcm_md5(path):
+    """md5 of the first audio stream decoded to 32-bit PCM. Equal for an
+    ALAC file and its FLAC conversion iff the samples are identical."""
+    out = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", "0:a:0",
+         "-c:a", "pcm_s32le", "-f", "md5", "-"],
+        capture_output=True, text=True, timeout=900,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(f"md5 decode failed: {out.stderr.strip()[:200]}")
+    return out.stdout.strip()
+
+
+def _alac_to_flac(src_file, m4a_dest):
+    """Replace an imported ALAC .m4a with a bit-identical FLAC.
+
+    Android has no ALAC decoder: the phone "plays" a raw ALAC file as
+    silence with no error (2026-10-08, every ALAC song in the library).
+    FLAC gets the whole working pipeline (Wi-Fi lossless, the AAC cache on
+    cellular, Cast). Converts from the download (src_file), checks the
+    decoded audio matches, then removes the copied .m4a. Returns the .flac
+    path, or None to keep the ALAC (the import never fails over this).
+    """
+    flac_dest = os.path.splitext(m4a_dest)[0] + ".flac"
+    if os.path.exists(flac_dest):
+        print(f"⚠️ [import] ALAC kept, {flac_dest} already exists")
+        return None
+    tmp = flac_dest + ".part"
+    base = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src_file, "-map_metadata", "0"]
+    try:
+        # Embedded cover first; audio-only if the picture won't mux.
+        r = subprocess.run(
+            base + ["-map", "0:a:0", "-map", "0:v?", "-c:a", "flac", "-c:v", "copy",
+                    "-disposition:v", "attached_pic", "-f", "flac", tmp],
+            capture_output=True, text=True, timeout=900,
+        )
+        if r.returncode != 0:
+            r = subprocess.run(
+                base + ["-map", "0:a:0", "-c:a", "flac", "-f", "flac", tmp],
+                capture_output=True, text=True, timeout=900,
+            )
+            if r.returncode != 0:
+                raise RuntimeError(f"ffmpeg failed: {r.stderr.strip()[:200]}")
+        if _alac_pcm_md5(src_file) != _alac_pcm_md5(tmp):
+            raise RuntimeError("decoded audio differs")
+        os.replace(tmp, flac_dest)
+        os.remove(m4a_dest)
+        print(f"🔁 [import] ALAC → FLAC (bit-identical): {os.path.basename(flac_dest)}")
+        return flac_dest
+    except Exception as e:
+        print(f"⚠️ [import] ALAC kept for {os.path.basename(m4a_dest)}: {e}")
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return None
+
+
 @api.route("/api/imports/import", methods=["POST"])
 def import_album():
     """Import a downloaded album into the library"""
 
     from mutagen import File as MutagenFile
+    from app import surround
+    from app.scanner import MusicScanner
+
+    def _read_import_audio(path):
+        # .mka (TrueHD/Atmos disc rips): mutagen can't open Matroska, so
+        # these go through the scanner's ffprobe reader instead.
+        if os.path.splitext(path)[1].lower() in surround.PROBED_EXTENSIONS:
+            return surround.probe_audio(path)
+        return MutagenFile(path, easy=True)
 
     data = request.get_json()
     source_path = data.get("source_path")
@@ -14052,6 +14671,7 @@ def import_album():
     db = get_db()
     conn = db.get_connection()
     cursor = db.get_cursor(conn)
+    _import_scanner = MusicScanner(db)
 
     try:
         # 1. Find or create artist
@@ -14139,7 +14759,7 @@ def import_album():
         # unplayable junk that needed manual cleanup.
         _preflight_audio_exts = {
             ".flac", ".mp3", ".m4a", ".wav", ".ogg", ".opus",
-            ".aac", ".wma", ".wv", ".ape", ".aiff", ".dsf", ".dff",
+            ".aac", ".wma", ".wv", ".ape", ".aiff", ".dsf", ".dff", ".mka",
         }
         if selected_files:
             _preflight_files = [
@@ -14172,7 +14792,7 @@ def import_album():
                 _validation_errors.append((_base, "0 bytes (empty file)"))
                 continue
             try:
-                _audio = MutagenFile(_src, easy=True)
+                _audio = _read_import_audio(_src)
             except Exception as _e:
                 # FLACNoHeaderError / MP4StreamInfoError / etc., including
                 # the all-zeros-but-right-size case from torrent pre-alloc.
@@ -14274,8 +14894,12 @@ def import_album():
             ".aiff",
             ".dsf",
             ".dff",
+            ".mka",
         }
-        image_extensions = {".jpg", ".jpeg", ".png", ".gif", ".bmp"}
+        image_extensions = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+        # Extras kept with the album for its Images gallery (scans, booklets)
+        # but not offered in the artwork picker.
+        extra_extensions = {".tif", ".tiff", ".pdf"}
 
         # Check for CUE files - only skip if single-file album
         cue_source_files = set()
@@ -14354,8 +14978,8 @@ def import_album():
 
             ext = os.path.splitext(filename)[1].lower()
 
-            # Copy audio files and images
-            if ext in audio_extensions or ext in image_extensions:
+            # Copy audio files, images and booklets/scans
+            if ext in audio_extensions or ext in image_extensions or ext in extra_extensions:
                 dest_file = os.path.join(dest_path, filename)
 
                 # Handle duplicates
@@ -14388,12 +15012,17 @@ def import_album():
                         # all-songs-duration-0 album in simpson1045's library
                         # (Maniac, Goldmine, Hendrix, Depeche, etc. —
                         # see the 2026-05-30 audit).
-                        audio = MutagenFile(src_file, easy=True)
+                        audio = _read_import_audio(src_file)
                         print(
                             f"DEBUG DB: {filename} - audio={audio}, type={type(audio)}"
                         )
 
-                        if audio:
+                        # `is not None`, NOT truthiness: a mutagen file with
+                        # zero tags is falsy, so `if audio:` rejected valid
+                        # tag-less files (2026-10-07, a Bon Jovi Atmos rip
+                        # tagged only by filename) and the filename fallbacks
+                        # below were unreachable. Pre-flight uses `is None` too.
+                        if audio is not None:
                             # Get title - prefer tag, fallback to filename
                             if audio.get("title"):
                                 title = audio.get("title")[0]
@@ -14458,9 +15087,28 @@ def import_album():
                                 if audio.info and hasattr(audio.info, "bitrate")
                                 else 0
                             )
+                            # Codec, real channel count and Atmos, same as a
+                            # library scan (the import used to store none of
+                            # it, so surround imports showed as stereo).
+                            codec, channels, is_atmos = None, None, 0
+                            try:
+                                codec, channels = _import_scanner.detect_audio_stream_info(audio, src_file)
+                                is_atmos, dolby_ch = _import_scanner.probe_dolby(src_file, codec)
+                                if dolby_ch:
+                                    channels = dolby_ch
+                            except Exception as e:
+                                print(f"DEBUG: stream probe failed for {filename}: {e}")
+                            if codec == "alac":
+                                flac_file = _alac_to_flac(src_file, dest_file)
+                                if flac_file:
+                                    dest_file = flac_file
+                                    codec = "flac"
+                                    file_size = os.path.getsize(dest_file)
+                                    if duration:
+                                        bitrate = int(file_size * 8 / duration)
                             cursor.execute(
-                                """INSERT INTO songs (title, artist_id, album_id, track_number, disc_number, duration, file_path, file_size, bitrate)
-                                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                                """INSERT INTO songs (title, artist_id, album_id, track_number, disc_number, duration, file_path, file_size, bitrate, audio_codec, audio_channels, is_atmos)
+                                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                                 (
                                     title,
                                     artist_id,
@@ -14471,8 +15119,16 @@ def import_album():
                                     dest_file,
                                     file_size,
                                     bitrate,
+                                    codec,
+                                    channels,
+                                    is_atmos or 0,
                                 ),
                             )
+                            # Multichannel that isn't a Dolby bitstream (FLAC
+                            # 5.1, TrueHD): the E-AC-3 5.1 file the TV's Cast
+                            # player needs, made in the background.
+                            if (channels or 2) > 2 and codec not in ("eac3", "ac3"):
+                                surround.queue_cast_sidecar(dest_file)
                             tracks_added += 1
                             print(f"DEBUG: tracks_added now = {tracks_added}")
                         else:
@@ -14592,6 +15248,7 @@ def import_album():
 
         conn.commit()
         print(f"DEBUG: COMMIT successful! Returning success response")
+        eventlet.spawn_n(_relink_after_import, artist_name)
 
         return jsonify(
             {
@@ -15256,6 +15913,7 @@ def get_folder_contents():
         ".wv",
         ".aiff",
         ".aif",
+        ".mka",
     ]
 
     files = []
@@ -15295,7 +15953,11 @@ def get_folder_contents():
         elif ext in audio_extensions:
             formats_found.add(ext.upper().replace(".", ""))
             try:
-                audio = MutagenFile(item_path)
+                if ext == ".mka":
+                    from app import surround
+                    audio = surround.probe_audio(item_path)
+                else:
+                    audio = MutagenFile(item_path)
                 if audio:
                     file_info["duration"] = (
                         int(audio.info.length)
@@ -15587,37 +16249,139 @@ def get_musicbrainz_tracks(release_group_id):
         return _error_response(e)
 
 
+_ALBUM_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+_ALBUM_DOC_EXTS = {".pdf"}
+_COVER_NAMES = ["cover", "folder", "front", "album", "artwork"]
+
+
+def _album_dir(cursor, album_id):
+    """The album's folder on disk: albums.folder_path when set (imports),
+    else the common folder of its own songs (multi-disc subfolders collapse
+    to the album root). Never a shallow catch-all like /music/<Artist>."""
+    cursor.execute("SELECT folder_path FROM albums WHERE id = %s", (album_id,))
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    if row["folder_path"] and os.path.isdir(row["folder_path"]):
+        return row["folder_path"]
+    cursor.execute(
+        "SELECT file_path FROM songs WHERE album_id = %s AND source_type = 'local'",
+        (album_id,),
+    )
+    dirs = [os.path.dirname(r["file_path"]) for r in cursor.fetchall() if r["file_path"]]
+    if not dirs:
+        return None
+    try:
+        common = os.path.commonpath(dirs)
+    except ValueError:
+        common = None
+    root = Config.MUSIC_LIBRARY_PATH.rstrip("/")
+    # Too shallow (e.g. a bucket album spread across artists): use the folder
+    # most of its songs are in.
+    if not common or common.rstrip("/").count("/") <= root.count("/") + 1:
+        common = max(set(dirs), key=dirs.count)
+    return common if os.path.isdir(common) else None
+
+
+@api.route("/api/album/<int:album_id>/images", methods=["GET"])
+def get_album_images(album_id):
+    """Every image/booklet in the album's folder (and up to 2 subfolder
+    levels: Scans/, Artwork/…), cover-like names first. Served by
+    /api/album/<id>/local-image/<path> (media token works there)."""
+    db = get_db()
+    conn = db.get_connection()
+    cursor = db.get_cursor(conn)
+    try:
+        base = _album_dir(cursor, album_id)
+    finally:
+        conn.close()
+    if not base:
+        return jsonify({"images": []})
+    items = []
+    base_depth = base.rstrip("/").count("/")
+    for root, dirs, files in os.walk(base):
+        if root.rstrip("/").count("/") - base_depth >= 2:
+            dirs[:] = []
+        dirs[:] = [d for d in dirs if not d.startswith((".", "@", "#"))]
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext not in _ALBUM_IMAGE_EXTS and ext not in _ALBUM_DOC_EXTS:
+                continue
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, base).replace(os.sep, "/")
+            stem = os.path.splitext(f)[0].lower()
+            pri = next((i for i, n in enumerate(_COVER_NAMES) if n in stem), 99)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            items.append({
+                "path": rel,
+                "name": f,
+                "folder": os.path.dirname(rel),
+                "kind": "pdf" if ext in _ALBUM_DOC_EXTS else "image",
+                "size": size,
+                "size_formatted": format_size(size),
+                "_sort": (0 if "/" not in rel else 1, pri, rel.lower()),
+            })
+            if len(items) >= 300:
+                break
+    items.sort(key=lambda x: x.pop("_sort"))
+    return jsonify({"images": items})
+
+
 @api.route("/api/album/<int:album_id>/local-image/<path:filename>", methods=["GET"])
 def get_album_local_image(album_id, filename):
-    """Serve a local image from an album's folder"""
+    """Serve an image/booklet from an album's folder (subfolders allowed,
+    locked inside it). TIFF converts to JPEG (phones can't show it);
+    ?size=thumb returns a ≤480 px JPEG for galleries of big scans."""
     from flask import send_file
+    import io
 
     db = get_db()
     conn = db.get_connection()
     cursor = db.get_cursor(conn)
-
     try:
-        cursor.execute("SELECT folder_path FROM albums WHERE id = %s", (album_id,))
-        album = cursor.fetchone()
-
-        if not album or not album["folder_path"]:
-            return jsonify({"error": "Album not found"}), 404
-
-        # Security: sanitize filename to prevent directory traversal
-        safe_filename = os.path.basename(filename)
-        image_path = os.path.join(album["folder_path"], safe_filename)
-
-        if not os.path.exists(image_path):
-            return jsonify({"error": "Image not found"}), 404
-
-        # Verify it's actually an image
-        ext = os.path.splitext(safe_filename)[1].lower()
-        if ext not in [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]:
-            return jsonify({"error": "Not an image file"}), 400
-
-        return send_file(image_path)
+        base = _album_dir(cursor, album_id)
     finally:
         conn.close()
+    if not base:
+        return jsonify({"error": "Album not found"}), 404
+
+    # Security: stay inside the album folder (no ../, no absolute paths)
+    rel = os.path.normpath(filename).lstrip("/\\")
+    image_path = os.path.realpath(os.path.join(base, rel))
+    if not image_path.startswith(os.path.realpath(base) + os.sep):
+        return jsonify({"error": "Invalid path"}), 400
+    if not os.path.isfile(image_path):
+        return jsonify({"error": "Image not found"}), 404
+
+    ext = os.path.splitext(image_path)[1].lower()
+    if ext in _ALBUM_DOC_EXTS:
+        return send_file(image_path, mimetype="application/pdf")
+    if ext not in _ALBUM_IMAGE_EXTS:
+        return jsonify({"error": "Not an image file"}), 400
+
+    thumb = request.args.get("size") == "thumb"
+    if not thumb and ext not in (".tif", ".tiff"):
+        return send_file(image_path)
+
+    def _render():
+        from PIL import Image
+        with Image.open(image_path) as im:
+            im = im.convert("RGB")
+            if thumb:
+                im.thumbnail((480, 480))
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=85 if thumb else 92)
+            return buf.getvalue()
+
+    try:
+        data = eventlet.tpool.execute(_render)
+    except Exception as e:
+        print(f"[album-image] render failed for {image_path}: {e}")
+        return jsonify({"error": "Could not read image"}), 500
+    return send_file(io.BytesIO(data), mimetype="image/jpeg")
 
 
 @api.route("/api/album/<int:album_id>/set-local-artwork", methods=["POST"])
@@ -16379,6 +17143,10 @@ def recognize_song():
         tmp_path = tmp.name
         audio_file.save(tmp_path)
 
+    # The app shows this so a broken Shazam doesn't look like "still listening":
+    # "ok" = Shazam answered (matched or honestly no match), "down" = it didn't.
+    shazam_status = "ok"
+    shazam_detail = ""
     try:
         # Primary: ShazamIO (runs in subprocess to avoid eventlet/asyncio conflicts)
         try:
@@ -16413,6 +17181,8 @@ def recognize_song():
                     "shazam_url": track.get("url", ""),
                 })
         except Exception as e:
+            shazam_status = "down"
+            shazam_detail = str(e) if isinstance(e, ShazamUnavailable) else f"Shazam error: {e}"
             print(f"⚠️ ShazamIO failed: {e}, trying AcoustID fallback...")
 
         # Fallback: AcoustID + Chromaprint
@@ -16429,12 +17199,22 @@ def recognize_song():
                             "artist": artist or "Unknown Artist",
                             "album": "",
                             "score": round(score, 2),
+                            "shazam": shazam_status,
+                            "shazam_detail": shazam_detail,
                         })
             print("⚠️ AcoustID: no match or no API key configured")
         except Exception as e:
             print(f"⚠️ AcoustID fallback failed: {e}")
 
-        return jsonify({"error": "Could not identify the song. Try holding the mic closer."}), 404
+        if shazam_status == "down":
+            error = "Shazam isn't responding right now, and the backup (AcoustID) didn't find it either."
+        else:
+            error = "Could not identify the song. Try holding the mic closer."
+        return jsonify({
+            "error": error,
+            "shazam": shazam_status,
+            "shazam_detail": shazam_detail,
+        }), 404
 
     finally:
         # Clean up temp file
@@ -17757,3 +18537,56 @@ def rss_recently_played():
         return _error_response(e)
     finally:
         conn.close()
+
+
+# ---- Editions Available (Nov 2026) -----------------------------------------
+# Every release of an album on MusicBrainz sorted into edition types (Dolby
+# Atmos, 5.1, SACD, DVD-Audio, Blu-ray, hi-res, Japan / SHM-CD, vinyl,
+# remaster / deluxe); see app/editions.py. Cached per release group (7 days).
+from app import editions as _editions
+
+
+@api.route("/api/albums/<int:album_id>/editions", methods=["GET"])
+def api_album_editions(album_id):
+    """Editions of an album you own; `owned` marks the ones you have.
+    ?refresh=1 skips the cache."""
+    try:
+        out = _editions.album_editions(
+            get_db(), album_id, refresh=request.args.get("refresh") == "1")
+        if out is None:
+            return jsonify({"error": "Album not found"}), 404
+        return jsonify(out)
+    except Exception as e:
+        traceback.print_exc()
+        return _error_response(e)
+
+
+@api.route("/api/editions", methods=["GET"])
+def api_editions_by_name():
+    """Editions of an album you don't have: ?artist=...&album=..."""
+    artist = (request.args.get("artist") or "").strip()
+    album = (request.args.get("album") or "").strip()
+    if not artist or not album:
+        return jsonify({"error": "artist and album are required"}), 400
+    try:
+        return jsonify(_editions.editions_by_name(
+            get_db(), artist, album, refresh=request.args.get("refresh") == "1"))
+    except Exception as e:
+        traceback.print_exc()
+        return _error_response(e)
+
+
+@api.route("/api/editions/gaps", methods=["GET"])
+def api_editions_gaps():
+    """Atmos / surround you own that MusicBrainz doesn't list. Answers
+    instantly from the caches; ?scan=1 starts a background scan that looks
+    up everything not cached yet (scan_running says whether one is on)."""
+    try:
+        if request.args.get("scan") == "1":
+            _editions.start_gaps_scan(get_db())
+        out = _editions.gaps_report(get_db(), max_fetch=0)
+        out["scan_running"] = _editions.gaps_scan_running()
+        return jsonify(out)
+    except Exception as e:
+        traceback.print_exc()
+        return _error_response(e)

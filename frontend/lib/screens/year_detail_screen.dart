@@ -5,6 +5,7 @@ import '../services/api_service.dart';
 import '../services/audio_player_service.dart';
 import '../widgets/breadcrumb_bar.dart';
 import '../widgets/music_context_menu.dart';
+import '../widgets/edition_badge.dart';
 import 'album_detail_screen.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 
@@ -185,14 +186,37 @@ class _YearDetailScreenState extends State<YearDetailScreen> {
         children: [
           // Album artwork
           Expanded(
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: album.artworkPath != null && album.artworkPath!.isNotEmpty
-                  ? CachedNetworkImage(
-                      imageUrl: _apiService.getArtworkUrl(album.id),
-                      width: double.infinity,
-                      fit: BoxFit.cover,
-                      placeholder: (context, url) => Container(
+            child: EditionBadge.over(
+              album: album,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: album.artworkPath != null && album.artworkPath!.isNotEmpty
+                    ? CachedNetworkImage(
+                        imageUrl: _apiService.getArtworkUrl(album.id),
+                        width: double.infinity,
+                        fit: BoxFit.cover,
+                        placeholder: (context, url) => Container(
+                          color: const Color(0xFF1a2332),
+                          child: const Center(
+                            child: Icon(
+                              Icons.album,
+                              color: Color(0xFF00d4ff),
+                              size: 40,
+                            ),
+                          ),
+                        ),
+                        errorWidget: (context, url, error) => Container(
+                          color: const Color(0xFF1a2332),
+                          child: const Center(
+                            child: Icon(
+                              Icons.album,
+                              color: Color(0xFF00d4ff),
+                              size: 40,
+                            ),
+                          ),
+                        ),
+                      )
+                    : Container(
                         color: const Color(0xFF1a2332),
                         child: const Center(
                           child: Icon(
@@ -202,27 +226,7 @@ class _YearDetailScreenState extends State<YearDetailScreen> {
                           ),
                         ),
                       ),
-                      errorWidget: (context, url, error) => Container(
-                        color: const Color(0xFF1a2332),
-                        child: const Center(
-                          child: Icon(
-                            Icons.album,
-                            color: Color(0xFF00d4ff),
-                            size: 40,
-                          ),
-                        ),
-                      ),
-                    )
-                  : Container(
-                      color: const Color(0xFF1a2332),
-                      child: const Center(
-                        child: Icon(
-                          Icons.album,
-                          color: Color(0xFF00d4ff),
-                          size: 40,
-                        ),
-                      ),
-                    ),
+              ),
             ),
           ),
           const SizedBox(height: 6),

@@ -1,6 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show Platform;
+import 'dart:io' show Platform, HttpDate, File;
+import 'package:path_provider/path_provider.dart'
+    show getApplicationSupportDirectory;
+import 'stall_watch.dart';
+import 'auth_http_client.dart' show appHttpClient;
+import 'auth_service.dart' show AuthService;
 import 'app_logger.dart';
 import 'dart:math' show pi, cos, sin, pow, min, log, ln10;
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -15,12 +20,14 @@ import 'package:uuid/uuid.dart';
 import '../models/song.dart';
 import '../models/rss_feed.dart';
 import 'api_service.dart';
+import 'app_visibility.dart';
 import 'cast_service.dart';
 import 'widget_service.dart';
 import 'windows_wakelock.dart';
 import 'package:flutter/foundation.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:audio_session/audio_session.dart';
+import 'offline_service.dart';
 
 enum RepeatMode { off, one, all }
 
@@ -71,8 +78,21 @@ class AudioPlayerService extends ChangeNotifier {
   int? _adoptingRemoteId;
   List<Song>? _preJoinQueue;
   int _preJoinIndex = 0;
+  Duration _preJoinPosition = Duration.zero;
+  // What the phone had at the instant a cast connected. joinedExisting only
+  // flips true AFTER the connect edge (which stops the local engine and
+  // lets the TV's position sync in), so parking reads this snapshot.
+  List<Song>? _castEdgeQueue;
+  int _castEdgeIndex = 0;
+  Duration _castEdgePosition = Duration.zero;
 
   void _onCastStateChanged() {
+    // Joined someone else's cast: park the phone's own queue + position
+    // FIRST (before the position sync below overwrites _position with the
+    // TV's), so every way out of the cast can hand it back.
+    if (isCasting && _castService!.joinedExisting && _preJoinQueue == null) {
+      _parkPreJoin();
+    }
     // Joined someone else's cast: follow whatever the receiver is on.
     if (isCasting && _castService!.joinedExisting) {
       final rx = _castService!.receiverSongId;
@@ -95,6 +115,12 @@ class AudioPlayerService extends ChangeNotifier {
       return;
     }
     if (isCasting) {
+      if (!_wasCastConnected) {
+        final localPos = _hasLoadedCurrent ? _active.position : Duration.zero;
+        _castEdgeQueue = List<Song>.from(_queue);
+        _castEdgeIndex = _currentIndex;
+        _castEdgePosition = localPos > _position ? localPos : _position;
+      }
       if (!_wasCastConnected && _hasLoadedCurrent) {
         // Cast (re)connected — the TV owns audio now. HARD-stop the
         // local engine: a play command landing in a drop window can
@@ -229,10 +255,7 @@ class AudioPlayerService extends ChangeNotifier {
     try {
       final song = await _apiService.getSongById(songId);
       if (!isCasting || !(_castService?.joinedExisting ?? false)) return;
-      _preJoinQueue ??= List<Song>.from(_queue);
-      if (_preJoinQueue!.isNotEmpty && _preJoinQueue!.length == _queue.length) {
-        _preJoinIndex = _currentIndex;
-      }
+      if (_preJoinQueue == null) _parkPreJoin();
       _queue = [song];
       _currentIndex = 0;
       _currentSong = song;
@@ -250,14 +273,46 @@ class AudioPlayerService extends ChangeNotifier {
     }
   }
 
-  /// Leave a joined cast: the TV keeps playing, the phone goes quiet.
+  /// Leave a joined cast: the TV keeps playing, the phone goes back to
+  /// its own queue, paused.
   void leaveJoinedCast() {
     _castService?.disconnect(); // no STOP while joined
-    _isPlaying = false;
-    _wasCastConnected = false;
+    _handBackToPhone();
+  }
+
+  /// The red Disconnect button. Always comes back PAUSED: a joined cast
+  /// hands back the phone's own pre-join queue and position; a cast this
+  /// phone started keeps its queue at the TV's position.
+  Future<void> disconnectCast() async {
+    await _castService?.disconnect();
+    _handBackToPhone();
+  }
+
+  /// The cast was ended from elsewhere (ADMS/backend stop, TV remote).
+  /// Same hand-back as a disconnect — never resumes playing by itself.
+  void handleCastEndedRemotely() {
+    AppLogger.instance.info('📺 [Cast] Ended remotely — back to phone, paused');
+    _handBackToPhone();
+  }
+
+  void _handBackToPhone() {
     _restorePreJoinQueue();
-    savePlaybackState();
-    notifyListeners();
+    stopCasting(); // reloads the local deck paused at _position
+  }
+
+  void _parkPreJoin() {
+    final edge = _castEdgeQueue;
+    if (edge != null) {
+      _preJoinQueue = edge;
+      _preJoinIndex = _castEdgeIndex;
+      _preJoinPosition = _castEdgePosition;
+    } else {
+      _preJoinQueue = List<Song>.from(_queue);
+      _preJoinIndex = _currentIndex;
+      final localPos = _hasLoadedCurrent ? _active.position : Duration.zero;
+      _preJoinPosition = localPos > _position ? localPos : _position;
+    }
+    _castEdgeQueue = null;
   }
 
   /// Replace the joined cast with the phone's own queue: the phone becomes
@@ -275,7 +330,9 @@ class AudioPlayerService extends ChangeNotifier {
     _queue = parked;
     _currentIndex = _preJoinIndex.clamp(0, _queue.length - 1);
     _currentSong = _queue[_currentIndex];
-    _position = Duration.zero;
+    _position = _preJoinPosition;
+    _duration = Duration(seconds: _currentSong!.duration);
+    _preJoinPosition = Duration.zero;
   }
 
   /// Sync the app to the song the RECEIVER is on. With UP_NEXT the TV
@@ -353,7 +410,12 @@ class AudioPlayerService extends ChangeNotifier {
     // fast and seekable. Using filePath here was why resume-after-restart
     // re-chased the whole tracker chain and took forever every time.
     final String url;
-    if (song.isStation) {
+    final local = OfflineService.instance.localFileFor(song);
+    if (local != null) {
+      // Downloaded or cached on the phone (offline_service.dart): plays with
+      // no signal and doesn't touch the network.
+      url = Uri.file(local).toString();
+    } else if (song.isStation) {
       // Live radio: play the Icecast/Shoutcast URL straight from filePath —
       // never the backend /stream/<id> proxy (there's no library row for it).
       url = song.filePath;
@@ -445,8 +507,12 @@ class AudioPlayerService extends ChangeNotifier {
   /// cast receiver (via updateStationNowPlaying on poll change + cast start).
   /// For a live station with a polled track that's the track; otherwise the
   /// item's own title/artist.
+  // Both use the crossfade-aware currentSong (switches when a fade STARTS),
+  // like the artwork does. _currentSong only switches when the fade ends, so
+  // the status-bar chip / lock screen / car showed the new art with the old
+  // title for the length of the fade (Nov 9).
   String get displayTitle {
-    final s = _currentSong;
+    final s = currentSong;
     if (s == null) return '';
     if (s.isStation && (_stationTrackTitle?.isNotEmpty ?? false)) {
       return _stationTrackTitle!;
@@ -455,7 +521,7 @@ class AudioPlayerService extends ChangeNotifier {
   }
 
   String get displayArtist {
-    final s = _currentSong;
+    final s = currentSong;
     if (s == null) return '';
     if (s.isStation && (_stationTrackTitle?.isNotEmpty ?? false)) {
       final a = _stationTrackArtist;
@@ -468,6 +534,15 @@ class AudioPlayerService extends ChangeNotifier {
   int _streamRetryCount = 0;
   static const int _maxStreamRetries = 3;
   bool _isRetrying = false;
+
+  // Set when the SYSTEM paused us: audio focus lost (e.g. Android Auto took
+  // the audio) or the audio output went away (car / Bluetooth off).
+  // Automatic recovery (stream-retry) must not resume while it's set; any
+  // real play (user, media button, Android Auto) clears it in the playing
+  // listener. Without this the retry restarted a focus-paused player from
+  // the background, Android refused it focus, and it played silently in the
+  // car (2026-10-06, recurring since July).
+  bool _pausedBySystem = false;
 
   // Waveform pre-fetch cache. Capped — see _trimPrefetchedWaveforms.
   // Without a cap this grows forever as the user listens; after a few
@@ -537,6 +612,36 @@ class AudioPlayerService extends ChangeNotifier {
   Timer? _saveTimer;
   bool _isRestoring = false;
 
+  // 👎 held songs ('Not now' 30 days / 'Never play this'): every queue steps
+  // over them (_nextPlayableIndex); a direct pick still plays. Kept in prefs
+  // too, so it works with no signal.
+  final Set<int> _held = {};
+  static const _kHeldPrefs = 'held_song_ids';
+  bool isHeld(int songId) => _held.contains(songId);
+
+  // Repeat once (Matt, Nov 9): a one-shot on top of the repeat mode. The
+  // armed song plays one more time, then whatever mode you had (Repeat All,
+  // Off...) carries on. Cleared when the replay starts, on Next, or once a
+  // different song is current.
+  int? _repeatOnceSongId;
+  bool get repeatOnceArmed =>
+      _repeatOnceSongId != null && _repeatOnceSongId == currentSong?.id;
+
+  /// Arm / disarm repeat-once for the current song; returns the new state.
+  bool toggleRepeatOnce() {
+    _repeatOnceSongId = repeatOnceArmed ? null : currentSong?.id;
+    AppLogger.instance.info('🔂 [repeat once] ${repeatOnceArmed ? 'armed' : 'off'}');
+    _refreshLookahead();
+    notifyListeners();
+    return repeatOnceArmed;
+  }
+
+  // Completes once the startup restore (last queue + position) has run, so a
+  // voice request that cold-started the app isn't replaced by it a moment
+  // later (handler.playFromSearch waits on this, with a timeout).
+  final Completer<void> _restoredOnce = Completer<void>();
+  Future<void> get restoredOnce => _restoredOnce.future;
+
   // Sleep timer
   Timer? _sleepTimer;
   Timer? _fadeTimer;
@@ -603,9 +708,9 @@ class AudioPlayerService extends ChangeNotifier {
   static const Duration _initialLoadStallThreshold = Duration(seconds: 35);
   static const Duration _stallCheckInterval = Duration(seconds: 2);
 
-  // Position update throttling for mobile performance
+  // Position update throttling (all platforms; see the position listener)
   DateTime _lastPositionNotify = DateTime.now();
-  static const _mobileThrottleMs = 250; // Only notify every 250ms on mobile
+  static const _positionThrottleMs = 250; // Only notify every 250ms while visible
   bool get _isMobile => Platform.isAndroid || Platform.isIOS;
 
   // Stream subscriptions
@@ -773,6 +878,10 @@ class AudioPlayerService extends ChangeNotifier {
     // ---- position ----------------------------------------------------
     _engineSubs.add(deck.positionStream.listen((position) {
       if (_isBuffering) return;
+      // Nothing loaded yet = an idle deck reporting 0:00. Taking that wiped
+      // the restored spot before the first play (Nov 9 log: restored at
+      // 3:29, then saved at 0s and first play at 0:00 after an update).
+      if (!_hasLoadedCurrent) return;
       _position = position;
       _lastActivityTime = DateTime.now();
       // Stall watchdog: track the last time position genuinely *advanced*
@@ -822,15 +931,18 @@ class AudioPlayerService extends ChangeNotifier {
       // Crossfade detection — dual-deck ping-pong (task #5, implemented).
       _maybeStartCrossfade(position);
 
-      // Throttle UI updates on mobile.
-      if (_useJustAudio) {
-        final now = DateTime.now();
-        if (now.difference(_lastPositionNotify).inMilliseconds <
-            _mobileThrottleMs) {
-          return;
-        }
-        _lastPositionNotify = now;
+      // Throttle position-only UI updates on every platform. Desktop used to
+      // notify on every media_kit position event (dozens/s), redrawing every
+      // listener even while minimized (~7% GPU on FRAMEWORK after the ticker
+      // fix). Smooth bars interpolate on their own between notifications;
+      // 1/s is plenty while nobody can see the app.
+      final now = DateTime.now();
+      final throttleMs =
+          AppVisibility.instance.visible.value ? _positionThrottleMs : 1000;
+      if (now.difference(_lastPositionNotify).inMilliseconds < throttleMs) {
+        return;
       }
+      _lastPositionNotify = now;
       notifyListeners();
     }));
 
@@ -870,6 +982,7 @@ class AudioPlayerService extends ChangeNotifier {
             DateTime.now().difference(_lastSongChangeTime).inMilliseconds;
         if (msSinceChange < 1500) return;
       }
+      if (playing) _pausedBySystem = false;
       _isPlaying = playing;
       notifyListeners();
     }));
@@ -890,7 +1003,7 @@ class AudioPlayerService extends ChangeNotifier {
       if (_isCrossfading) return;
       final prevSong = _currentSong;
       if (prevSong != null) {
-        _apiService.trackComplete(prevSong.id, 100).catchError((e) {});
+        _apiService.trackComplete(prevSong.id, 100).ignore();
       }
 
       // Promote to exactly the index we put in the lookahead — the engine
@@ -904,6 +1017,7 @@ class AudioPlayerService extends ChangeNotifier {
       if (_queue.isEmpty) return;
       if (_currentIndex >= _queue.length) _currentIndex = _queue.length - 1;
       _currentSong = _queue[_currentIndex];
+      _repeatOnceSongId = null; // a repeat-once replay starts here: used up
 
       _position = Duration.zero;
       _lastSongChangeTime = DateTime.now();
@@ -923,7 +1037,7 @@ class AudioPlayerService extends ChangeNotifier {
         '[player.advance] onAdvanced → queueIdx=$_currentIndex '
         'song="${_currentSong!.title}"',
       );
-      _apiService.trackPlay(_currentSong!.id).catchError((e) {});
+      _apiService.trackPlay(_currentSong!.id).ignore();
 
       // Hand the engine the next-next lookahead.
       _refreshLookahead();
@@ -992,6 +1106,10 @@ class AudioPlayerService extends ChangeNotifier {
           _streamRetryCount < _maxStreamRetries) {
         _isRetrying = true;
         _streamRetryCount++;
+        // Resume only if we were actually playing. A paused player (user
+        // pause, or the system paused us on focus loss) is just reloaded so
+        // it's ready, never restarted behind anyone's back.
+        final resumePlayback = _isPlaying && !_pausedBySystem;
         final backoffMs = 500 * _streamRetryCount;
         AppLogger.instance.info(
           '[player.stream-retry] start attempt $_streamRetryCount/'
@@ -1000,6 +1118,12 @@ class AudioPlayerService extends ChangeNotifier {
         await Future.delayed(Duration(milliseconds: backoffMs));
         try {
           if (_useJustAudio) await ApiService.detectNetwork();
+          // A missing/expired media token makes every stream 401, which the
+          // engine reports as "failed to open" — indistinguishable from a
+          // missing file. Refresh it before rebuilding the URL: loadCurrent
+          // re-mints the URL via getStreamUrl, so a fresh token takes effect
+          // on this very retry (throttled inside refreshMediaToken).
+          await ApiService.refreshMediaToken();
           final savedPosition = _position;
           // Unified: reload the current song into slot 0 and re-establish the
           // lookahead. loadCurrent handles both backends — no _buildPlaylist /
@@ -1007,12 +1131,13 @@ class AudioPlayerService extends ChangeNotifier {
           await deck.loadCurrent(
             _engineItemFor(_currentSong!),
             startPosition: savedPosition,
-            autoPlay: true,
+            autoPlay: resumePlayback,
           );
           _applyVolume();
           await _refreshLookahead();
           AppLogger.instance.info(
-            '[player.stream-retry] OK resumed at ${_formatDuration(savedPosition)}',
+            '[player.stream-retry] OK ${resumePlayback ? 'resumed' : 'reloaded, staying paused'} '
+            'at ${_formatDuration(savedPosition)}',
           );
         } catch (e) {
           AppLogger.instance.error('[player.stream-retry] failed: $e');
@@ -1080,9 +1205,90 @@ class AudioPlayerService extends ChangeNotifier {
   /// the engine fires onCompleted and we handle it there.
   int? _computeNextIndex() {
     if (_repeatMode == RepeatMode.one) return null;
-    if (_currentIndex < _queue.length - 1) return _currentIndex + 1;
-    if (_repeatMode == RepeatMode.all && _queue.isNotEmpty) return 0;
+    if (repeatOnceArmed) return _currentIndex; // the same song once more
+    return _nextPlayableIndex(_currentIndex);
+  }
+
+  /// The next queue index after [from] that isn't held back (👎), wrapping
+  /// to the start with repeat-all. null = nothing playable left. Every
+  /// automatic route uses this: the gapless lookahead, Next, the crossfade.
+  /// Stations and podcast episodes are never held.
+  int? _nextPlayableIndex(int from) {
+    final n = _queue.length;
+    if (n == 0) return null;
+    for (var step = 1; step <= n; step++) {
+      var i = from + step;
+      if (i >= n) {
+        if (_repeatMode != RepeatMode.all) return null;
+        i -= n;
+      }
+      final s = _queue[i];
+      if (s.isStation || s.isPodcast || !_held.contains(s.id)) return i;
+    }
     return null;
+  }
+
+  /// Held songs from prefs (instant, offline), then the server's list.
+  Future<void> loadHolds() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _held
+        ..clear()
+        ..addAll((prefs.getStringList(_kHeldPrefs) ?? const [])
+            .map(int.tryParse)
+            .whereType<int>());
+    } catch (_) {}
+    try {
+      final holds = await _apiService.getHolds();
+      _held
+        ..clear()
+        ..addAll(holds.map((h) => (h['song_id'] as num).toInt()));
+      await _saveHolds();
+      _refreshLookahead();
+    } catch (_) {
+      // Offline: keep the saved list.
+    }
+  }
+
+  Future<void> _saveHolds() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(
+          _kHeldPrefs, _held.map((id) => '$id').toList());
+    } catch (_) {}
+  }
+
+  /// 👎 'Not now' ([days], default 30) or 'Never play this' (days: null).
+  /// Skips it if it's playing. Throws if the server didn't take it (the
+  /// hold is kept on this phone either way).
+  Future<void> holdSong(Song song, {int? days = 30}) async {
+    if (song.isStation || song.isPodcast) return;
+    await holdSongById(song.id, title: song.title, days: days);
+  }
+
+  /// [holdSong] for callers that only know the id (song menus).
+  Future<void> holdSongById(int songId, {String title = '', int? days = 30}) async {
+    if (songId <= 0) return;
+    _held.add(songId);
+    await _saveHolds();
+    AppLogger.instance.info(
+        '👎 [holds] ${days == null ? 'never' : '$days days'}: "$title" ($songId)');
+    final playingIt = currentSong?.id == songId;
+    if (playingIt) {
+      await next();
+    } else {
+      _refreshLookahead();
+    }
+    notifyListeners();
+    await _apiService.holdSong(songId, days: days);
+  }
+
+  Future<void> unholdSong(int songId) async {
+    _held.remove(songId);
+    await _saveHolds();
+    _refreshLookahead();
+    notifyListeners();
+    await _apiService.unholdSong(songId);
   }
 
   /// Recompute and hand the active deck its lookahead. This is the single
@@ -1130,7 +1336,7 @@ class AudioPlayerService extends ChangeNotifier {
       _duration = Duration(seconds: song.duration);
     }
     _streamRetryCount = 0;
-    _apiService.trackPlay(song.id).catchError((e) {});
+    _apiService.trackPlay(song.id).ignore();
     try {
       await _active.loadCurrent(
         _engineItemFor(song),
@@ -1179,6 +1385,14 @@ class AudioPlayerService extends ChangeNotifier {
     _sourceId = sourceId;
     _sourceName = sourceName;
 
+    // Every way of starting a playlist counts as "played" (the Playlists
+    // screen's Recently played row). Until Nov 6 only tapping a song on the
+    // playlist screen did; Play / Shuffle / the playlist cards / the car
+    // never told the server (Laid Back's last play was stuck at May 30).
+    if (sourceType == 'playlist' && sourceId != null && !_isRestoring) {
+      _apiService.markPlaylistPlayed(sourceId).catchError((_) {});
+    }
+
     _queue = songs;
     _originalQueue = List.from(songs);
     _currentIndex = startIndex;
@@ -1196,7 +1410,7 @@ class AudioPlayerService extends ChangeNotifier {
     // Chromecast: send current song to cast device (no local engine).
     if (isCasting) {
       _isPlaying = true;
-      _apiService.trackPlay(_currentSong!.id).catchError((e) {});
+      _apiService.trackPlay(_currentSong!.id).ignore();
       _castService!.loadAndPlay(_currentSong!,
           quality: _streamQuality, podcastArtworkUrl: _podcastArtworkUrl);
       _startSaveTimer();
@@ -1301,7 +1515,7 @@ class AudioPlayerService extends ChangeNotifier {
     // Chromecast: send to cast device instead of local engine.
     if (isCasting) {
       _isPlaying = true;
-      _apiService.trackPlay(song.id).catchError((e) {});
+      _apiService.trackPlay(song.id).ignore();
       await _castService!.loadAndPlay(song,
           quality: _streamQuality, podcastArtworkUrl: _podcastArtworkUrl);
       // Tuning to a station WHILE casting: re-push the live track once the
@@ -1366,10 +1580,26 @@ class AudioPlayerService extends ChangeNotifier {
       return;
     }
 
+    // Startup: a play that arrives while the restore is still running
+    // (Android Auto starts the app and sends play the moment it connects)
+    // waits for it instead of being refused. Refusing left the car spinning
+    // until you pressed play yourself, which worked because by then the
+    // restore was done (Nov 9).
+    if (!isPlaying &&
+        !_restoredOnce.isCompleted &&
+        (_isLoading || (_currentSong != null && _queue.isEmpty) || _currentSong == null)) {
+      AppLogger.instance.info('⏳ [player] play waiting for the restore to finish');
+      await _restoredOnce.future
+          .timeout(const Duration(seconds: 15), onTimeout: () {});
+      AppLogger.instance.info(
+          '⏳ [player] restore done: song="${_currentSong?.title}" loading=$_isLoading');
+    }
+
     // Don't allow play if we're still loading or queue isn't ready
     if (_isLoading || (_currentSong != null && _queue.isEmpty)) {
-      print(
-        '⏳ Play blocked - still loading (isLoading: $_isLoading, queue empty: ${_queue.isEmpty})',
+      AppLogger.instance.info(
+        '⏳ [player] play refused: still loading (isLoading=$_isLoading, '
+        'queue empty=${_queue.isEmpty})',
       );
       return;
     }
@@ -1386,6 +1616,8 @@ class AudioPlayerService extends ChangeNotifier {
         _currentIndex = _queue.isEmpty ? 0 : _queue.length - 1;
       }
       if (!_isShuffled) _originalQueue = List.from(_queue);
+      AppLogger.instance.info(
+          '▶ [restore] first play of "${_currentSong?.title}" at ${_formatDuration(savedPosition)}');
       await _playCurrentIndex(autoPlay: true, startPosition: savedPosition);
       _isBuffering = false;
       if (_currentEpisodeId != null) {
@@ -1895,7 +2127,7 @@ class AudioPlayerService extends ChangeNotifier {
           ? (_position.inSeconds / _duration.inSeconds * 100).round()
           : 0;
       if (pct < 80) {
-        _apiService.trackSkip(_currentSong!.id).catchError((e) {});
+        _apiService.trackSkip(_currentSong!.id).ignore();
       }
     }
 
@@ -2243,6 +2475,7 @@ class AudioPlayerService extends ChangeNotifier {
     }
     _cancelCrossfade(); // Cancel any in-progress crossfade
     _crossfadeTriggered = false;
+    _repeatOnceSongId = null; // Next = move on, not repeat
 
     // Track skip / complete for the outgoing song.
     if (_currentSong != null) {
@@ -2250,9 +2483,9 @@ class AudioPlayerService extends ChangeNotifier {
           ? (_position.inSeconds / _duration.inSeconds * 100).round()
           : 0;
       if (pct < 80) {
-        _apiService.trackSkip(_currentSong!.id).catchError((e) {});
+        _apiService.trackSkip(_currentSong!.id).ignore();
       } else {
-        _apiService.trackComplete(_currentSong!.id, pct).catchError((e) {});
+        _apiService.trackComplete(_currentSong!.id, pct).ignore();
       }
     }
 
@@ -2267,15 +2500,11 @@ class AudioPlayerService extends ChangeNotifier {
       return;
     }
 
-    // Compute the next index (repeat-all wraps to 0).
-    final int target;
-    if (_currentIndex < _queue.length - 1) {
-      target = _currentIndex + 1;
-    } else if (_repeatMode == RepeatMode.all && _queue.isNotEmpty) {
-      target = 0;
-    } else {
-      return; // End of queue, no repeat.
-    }
+    // Compute the next index (repeat-all wraps to 0), stepping over held
+    // songs.
+    final nextPlayable = _nextPlayableIndex(_currentIndex);
+    if (nextPlayable == null) return; // End of queue, no repeat.
+    final int target = nextPlayable;
     _currentIndex = target;
     _currentSong = _queue[target];
     _position = Duration.zero;
@@ -2289,7 +2518,7 @@ class AudioPlayerService extends ChangeNotifier {
       _isPlaying = true;
       _syncLocalPlayerIndex(_currentIndex);
       notifyListeners();
-      _apiService.trackPlay(_currentSong!.id).catchError((e) {});
+      _apiService.trackPlay(_currentSong!.id).ignore();
       await _castService!.loadAndPlay(_currentSong!,
           quality: _streamQuality, podcastArtworkUrl: _podcastArtworkUrl);
       savePlaybackState();
@@ -2356,7 +2585,7 @@ class AudioPlayerService extends ChangeNotifier {
           ? (_position.inSeconds / _duration.inSeconds * 100).round()
           : 0;
       if (pct < 80) {
-        _apiService.trackSkip(_currentSong!.id).catchError((e) {});
+        _apiService.trackSkip(_currentSong!.id).ignore();
       }
     }
 
@@ -2388,7 +2617,7 @@ class AudioPlayerService extends ChangeNotifier {
       _isPlaying = true;
       _syncLocalPlayerIndex(_currentIndex);
       notifyListeners();
-      _apiService.trackPlay(_currentSong!.id).catchError((e) {});
+      _apiService.trackPlay(_currentSong!.id).ignore();
       await _castService!.loadAndPlay(_currentSong!,
           quality: _streamQuality, podcastArtworkUrl: _podcastArtworkUrl);
       savePlaybackState();
@@ -2553,18 +2782,14 @@ class AudioPlayerService extends ChangeNotifier {
       if (_currentSong == null) return null;
       final currentQueueIdx =
           _queue.indexWhere((s) => s.id == _currentSong!.id);
-      if (currentQueueIdx >= 0 && currentQueueIdx < _queue.length - 1) {
-        return currentQueueIdx + 1;
-      } else if (_repeatMode == RepeatMode.all && currentQueueIdx >= 0) {
-        return 0;
+      if (currentQueueIdx >= 0) {
+        return repeatOnceArmed
+            ? currentQueueIdx
+            : _nextPlayableIndex(currentQueueIdx);
       }
     } else {
       // For media_kit, queue index is straightforward
-      if (_currentIndex < _queue.length - 1) {
-        return _currentIndex + 1;
-      } else if (_repeatMode == RepeatMode.all) {
-        return 0;
-      }
+      return repeatOnceArmed ? _currentIndex : _nextPlayableIndex(_currentIndex);
     }
     return null;
   }
@@ -2723,7 +2948,7 @@ class AudioPlayerService extends ChangeNotifier {
   /// idle (stopped, NOT disposed — it's reused for the next ping-pong).
   void _completeCrossfade(int nextIndex, Song nextSong) {
     if (_currentSong != null) {
-      _apiService.trackComplete(_currentSong!.id, 100).catchError((e) {});
+      _apiService.trackComplete(_currentSong!.id, 100).ignore();
     }
 
     final outgoing = _active;
@@ -2747,6 +2972,7 @@ class AudioPlayerService extends ChangeNotifier {
     }
     _currentIndex = nextIndex;
     _currentSong = _queue[_currentIndex];
+    _repeatOnceSongId = null; // a repeat-once replay starts here: used up
     _duration = _active.duration.inMilliseconds > 0
         ? _active.duration
         : (_currentSong!.duration > 0
@@ -2758,7 +2984,7 @@ class AudioPlayerService extends ChangeNotifier {
     _lastObservedPosition = _position;
     _lastPositionAdvance = DateTime.now();
 
-    _apiService.trackPlay(_currentSong!.id).catchError((e) {});
+    _apiService.trackPlay(_currentSong!.id).ignore();
 
     // Reset crossfade state for the next cycle.
     _isCrossfading = false;
@@ -2832,9 +3058,33 @@ class AudioPlayerService extends ChangeNotifier {
           return;
         }
         print('🔊 [AudioSession] BECOMING NOISY — pausing playback (BT disconnect / headphone unplug)');
+        AppLogger.instance.info('🔊 [AudioSession] becoming noisy, isPlaying=$_isPlaying');
         if (_isPlaying) {
+          _pausedBySystem = true;
           _active.pause();
         }
+      });
+
+      // (f) An external output went away (car stereo, Bluetooth, USB, wired)
+      // while we were playing: pause, so the music doesn't carry on out of
+      // the phone speaker. Belt-and-braces for outputs that don't send
+      // "becoming noisy" (some car connections). Bluetooth SCO is the
+      // call-only channel: it drops when a call ends, so it's ignored.
+      session.devicesChangedEventStream.listen((event) {
+        if (isCasting || !_isPlaying) return;
+        final gone = event.devicesRemoved.where((d) =>
+            d.isOutput &&
+            d.type != AudioDeviceType.builtInSpeaker &&
+            d.type != AudioDeviceType.builtInSpeakerSafe &&
+            d.type != AudioDeviceType.builtInEarpiece &&
+            d.type != AudioDeviceType.telephony &&
+            d.type != AudioDeviceType.bluetoothSco);
+        if (gone.isEmpty) return;
+        AppLogger.instance.info(
+          '🔊 [AudioSession] output removed (${gone.map((d) => d.type.name).join(', ')}), pausing',
+        );
+        _pausedBySystem = true;
+        _active.pause();
       });
 
       // Listen for audio interruptions (phone calls, navigation prompts, notifications).
@@ -2855,6 +3105,9 @@ class AudioPlayerService extends ChangeNotifier {
           return;
         }
         print('🔊 [AudioSession] Interruption: begin=${event.begin}, type=${event.type}, isPlaying=$_isPlaying');
+        AppLogger.instance.info(
+          '🔊 [AudioSession] interruption begin=${event.begin} type=${event.type.name} isPlaying=$_isPlaying',
+        );
         if (event.begin) {
           _wasPlayingBeforeInterruption = _isPlaying;
           if (event.type == AudioInterruptionType.duck) {
@@ -2864,7 +3117,15 @@ class AudioPlayerService extends ChangeNotifier {
             print('🔊 [AudioSession] Ducking volume');
           } else {
             // Pause for full interruptions (phone calls, etc.)
+            _pausedBySystem = true;
             _active.pause();
+            // Permanent loss (e.g. Android Auto took the audio): drop our
+            // session so the next play genuinely asks Android for focus.
+            // Otherwise the session keeps believing it holds focus and a
+            // later play starts sound without it (silent in the car).
+            if (event.type == AudioInterruptionType.unknown) {
+              session.setActive(false);
+            }
           }
         } else {
           // Interruption ended
@@ -3198,11 +3459,23 @@ class AudioPlayerService extends ChangeNotifier {
 
     _deviceName = savedName;
 
-    await restorePlaybackState();
+    unawaited(loadHolds());
+    try {
+      await restorePlaybackState();
+    } finally {
+      if (!_restoredOnce.isCompleted) _restoredOnce.complete();
+    }
   }
 
-  Future<void> savePlaybackState({bool includeFullQueue = true}) async {
+  Future<void> savePlaybackState({bool includeFullQueue = true}) =>
+      StallWatch.instance.track('save.playbackState',
+          () => _savePlaybackState(includeFullQueue: includeFullQueue));
+
+  Future<void> _savePlaybackState({bool includeFullQueue = true}) async {
     if (_deviceId == null) return;
+    // Joined someone else's cast: the queue is theirs. Keep the phone's
+    // saved playback as it was before joining — that's what comes back.
+    if (_preJoinQueue != null) return;
 
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -3220,6 +3493,8 @@ class AudioPlayerService extends ChangeNotifier {
           json.encode(_currentSong!.toJson()),
         );
         await prefs.setInt('last_position_ms', _position.inMilliseconds);
+        await prefs.setInt(
+            'last_saved_at_ms', DateTime.now().toUtc().millisecondsSinceEpoch);
         await prefs.setInt('last_queue_index', _currentIndex);
         await prefs.setBool('last_shuffle_mode', _isShuffled);
         await prefs.setInt('last_repeat_mode', _repeatMode.index);
@@ -3248,18 +3523,35 @@ class AudioPlayerService extends ChangeNotifier {
         // when the queue actually changed (includeFullQueue), NOT on the every-3s
         // position autosave — re-encoding the full queue every 3 seconds janked
         // the UI thread and made the scrubber stutter/pause rhythmically.
+        //
+        // Nov 9: and only when the queue is different from the one already
+        // saved (this ran on every song change, pause, and on Windows every
+        // time the window lost focus). On desktop it goes to its own file:
+        // the Windows shared_preferences rewrites the WHOLE prefs file for
+        // every single set call, ~19 per save, so with the queue inside it
+        // even the 3 s position save rewrote the full queue.
         if (includeFullQueue) {
-          try {
-            await prefs.setString(
-              'last_queue_songs_json',
-              json.encode(_queue.map((s) => s.toJson()).toList()),
-            );
-            await prefs.setString(
-              'last_original_queue_songs_json',
-              json.encode(_originalQueue.map((s) => s.toJson()).toList()),
-            );
-          } catch (e) {
-            print('⚠️ Queue songs cache too large to save: $e');
+          final queueSig = Object.hash(
+            Object.hashAll(queueIds),
+            Object.hashAll(originalQueueIds),
+          );
+          if (queueSig != _savedQueueSig) {
+            try {
+              final queueSongs =
+                  json.encode(_queue.map((s) => s.toJson()).toList());
+              final originalSongs =
+                  json.encode(_originalQueue.map((s) => s.toJson()).toList());
+              if (_queueCacheInFile) {
+                await _writeQueueCache(prefs, queueSongs, originalSongs);
+              } else {
+                await prefs.setString('last_queue_songs_json', queueSongs);
+                await prefs.setString(
+                    'last_original_queue_songs_json', originalSongs);
+              }
+              _savedQueueSig = queueSig;
+            } catch (e) {
+              print('⚠️ Queue songs cache too large to save: $e');
+            }
           }
         }
       }
@@ -3499,6 +3791,23 @@ class AudioPlayerService extends ChangeNotifier {
     }
   }
 
+  /// The server copy of the playback state needs the login token. This
+  /// service is created in main() before the app's widgets exist, and
+  /// AuthService.init() (which loads the token) runs in the first build, so
+  /// the restore always asked first and got a 401: "💾 [restore] failed" on
+  /// every cold start, every device (Nov 9), and no cross-device handoff.
+  /// Wait for the token (or for auth to finish with none), at most 10 s.
+  Future<void> _waitForAuthToken() async {
+    for (var i = 0; i < 100; i++) {
+      if ((appHttpClient.token ?? '').isNotEmpty ||
+          AuthService.instance.initialized) {
+        return;
+      }
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    AppLogger.instance.info('💾 [restore] no login token after 10 s; trying anyway');
+  }
+
   Future<void> restorePlaybackState() async {
     if (_deviceId == null) return;
 
@@ -3508,7 +3817,11 @@ class AudioPlayerService extends ChangeNotifier {
     // If something's already loaded (user started playing before restore
     // completed), skip restore.
     if (_hasLoadedCurrent || _isPlaying) {
-      print('💾 Skipping restore - player already active');
+      AppLogger.instance.info('💾 [restore] skipped: player already active');
+      // _isLoading was set above; left on, every later play was refused
+      // ('Play blocked') for the rest of the session.
+      _isLoading = false;
+      notifyListeners();
       return;
     }
 
@@ -3516,8 +3829,21 @@ class AudioPlayerService extends ChangeNotifier {
 
     // First, quickly load from local cache for instant mini player display
     await _restoreFromLocalCache();
+    // The phone's own copy, to compare with the server's below. It's
+    // written first on every save; the server's is a slow network call that
+    // an app update can kill mid-flight, leaving the server's copy stale.
+    final localSongId = _currentSong?.id;
+    final localPosition = _position;
+    DateTime? localSavedAt;
+    try {
+      final ms = (await SharedPreferences.getInstance()).getInt('last_saved_at_ms');
+      if (ms != null && ms > 0) {
+        localSavedAt = DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
+      }
+    } catch (_) {}
 
     try {
+      await _waitForAuthToken();
       final state = await _apiService.getPlaybackState(_deviceId!);
 
       if (state['exists'] != true) {
@@ -3536,7 +3862,8 @@ class AudioPlayerService extends ChangeNotifier {
       if (queueIds.isNotEmpty) {
         // Double-check: if user started playing during the API call, abort
         if (_hasLoadedCurrent) {
-          print('💾 Aborting restore - player became active during fetch');
+          AppLogger.instance.info('💾 [restore] server copy ignored: playback started at '
+              '${_formatDuration(_position)} before it arrived');
           return;
         }
 
@@ -3601,6 +3928,33 @@ class AudioPlayerService extends ChangeNotifier {
           }
           final positionMs = state['position_ms'] ?? 0;
           _position = Duration(milliseconds: positionMs);
+
+          // The phone's copy wins when it's newer (Nov 9: updating the app
+          // killed it before the server save landed; the stale server copy
+          // then restored Like a Prayer at 0:00 instead of mid-song).
+          var from = 'server';
+          DateTime? serverAt;
+          try {
+            serverAt = HttpDate.parse('${state['updated_at']}');
+          } catch (_) {}
+          if (!isPodcastRestore &&
+              localSongId != null &&
+              localSavedAt != null &&
+              (serverAt == null ||
+                  localSavedAt.isAfter(serverAt.add(const Duration(seconds: 2))))) {
+            final i = _queue.indexWhere((s) => s.id == localSongId);
+            if (i >= 0) {
+              _currentIndex = i;
+              _currentSong = _queue[i];
+              _position = localPosition;
+              from = 'phone (newer)';
+            }
+          }
+          AppLogger.instance.info(
+            '💾 [restore] "${_currentSong?.title}" at ${_formatDuration(_position)} '
+            'from the $from copy (phone ${localSavedAt?.toIso8601String() ?? '-'}, '
+            'server ${serverAt?.toIso8601String() ?? '-'})',
+          );
 
           // Cold-start podcast auto-sync. The per-device playback_state
           // above is THIS device's snapshot, but a podcast episode's
@@ -3698,7 +4052,7 @@ class AudioPlayerService extends ChangeNotifier {
 
       notifyListeners();
     } catch (e) {
-      print('❌ Failed to restore playback state: $e');
+      AppLogger.instance.info('💾 [restore] failed: $e');
     } finally {
       _isRestoring = false;
       _isLoading = false;
@@ -3725,16 +4079,15 @@ class AudioPlayerService extends ChangeNotifier {
       _repeatMode = RepeatMode.values[prefs.getInt('last_repeat_mode') ?? 0];
 
       // Restore full queue from cached Song objects (instant, no API needed)
-      final queueSongsJson = prefs.getString('last_queue_songs_json');
+      final queueSongsJson = await _readQueueCache(prefs, 'last_queue_songs');
       if (queueSongsJson != null) {
         final List<dynamic> songsData = json.decode(queueSongsJson);
         _queue = songsData.map((s) => Song.fromJson(s)).toList();
         print('⚡ Restored queue with ${_queue.length} songs from cache');
       }
 
-      final originalQueueSongsJson = prefs.getString(
-        'last_original_queue_songs_json',
-      );
+      final originalQueueSongsJson =
+          await _readQueueCache(prefs, 'last_original_queue_songs');
       if (originalQueueSongsJson != null) {
         final List<dynamic> songsData = json.decode(originalQueueSongsJson);
         _originalQueue = songsData.map((s) => Song.fromJson(s)).toList();
@@ -3800,7 +4153,7 @@ class AudioPlayerService extends ChangeNotifier {
       }
 
       print('⚡ Instant restore from cache: ${_currentSong!.title} (index $_currentIndex)');
-      AppLogger.instance.info('Restore: ${_currentSong!.title} (idx=$_currentIndex, queue=${_queue.length}, podcast=${_currentEpisodeId != null})');
+      AppLogger.instance.info('Restore: ${_currentSong!.title} at ${_formatDuration(_position)} from the phone copy (idx=$_currentIndex, queue=${_queue.length}, podcast=${_currentEpisodeId != null}, saved ${prefs.getInt('last_saved_at_ms') ?? 'unstamped'})');
 
       // Cold-start restored a station? Start now-playing polling here — this
       // restore path bypasses playSong's station branch where it normally begins.
@@ -3849,15 +4202,72 @@ class AudioPlayerService extends ChangeNotifier {
     return '$minutes:${seconds.toString().padLeft(2, '0')}';
   }
 
+  /// Desktop keeps the saved queue (full Song JSON) in its own files instead
+  /// of shared_preferences; see savePlaybackState. Phones keep it in prefs
+  /// (their prefs don't rewrite the whole file per value).
+  bool get _queueCacheInFile => !(Platform.isAndroid || Platform.isIOS);
+
+  /// Hash of the queue ids last written, so an unchanged queue isn't
+  /// re-encoded and re-written.
+  int? _savedQueueSig;
+
+  Future<File> _queueCacheFile(String name) async {
+    final dir = await getApplicationSupportDirectory();
+    return File('${dir.path}${Platform.pathSeparator}$name.json');
+  }
+
+  Future<void> _writeQueueCache(
+      SharedPreferences prefs, String queueSongs, String originalSongs) async {
+    for (final (name, data) in [
+      ('last_queue_songs', queueSongs),
+      ('last_original_queue_songs', originalSongs),
+    ]) {
+      // Temp file + rename: a crash mid-write can't leave half a queue.
+      final file = await _queueCacheFile(name);
+      // Own temp name per write: two saves at once must not share one.
+      final tmp = File('${file.path}.${DateTime.now().microsecondsSinceEpoch}.tmp');
+      await tmp.writeAsString(data, flush: true);
+      try {
+        await tmp.rename(file.path);
+      } catch (_) {
+        if (await file.exists()) await file.delete();
+        await tmp.rename(file.path);
+      }
+    }
+    // Once: drop the old copies from prefs (read as a fallback on restore).
+    if (prefs.containsKey('last_queue_songs_json') ||
+        prefs.containsKey('last_original_queue_songs_json')) {
+      await prefs.remove('last_queue_songs_json');
+      await prefs.remove('last_original_queue_songs_json');
+    }
+  }
+
+  /// The saved queue: desktop's own file first, then the old prefs copy (an
+  /// install from before Nov 9, or a phone).
+  Future<String?> _readQueueCache(SharedPreferences prefs, String name) async {
+    if (_queueCacheInFile) {
+      try {
+        final file = await _queueCacheFile(name);
+        if (await file.exists()) return await file.readAsString();
+      } catch (_) {}
+    }
+    return prefs.getString('${name}_json');
+  }
+
   // Lightweight autosave for the 3-second timer: writes ONLY the resume
   // position locally — no song/queue JSON encoding and no network call. The
   // full state is persisted on real events (song change, play/pause, seek,
   // queue change). Doing the full save every 3s janked the scrubber.
-  Future<void> _savePositionOnly() async {
+  Future<void> _savePositionOnly() =>
+      StallWatch.instance.track('save.positionOnly', _savePositionOnlyImpl);
+
+  Future<void> _savePositionOnlyImpl() async {
     if (_deviceId == null || _currentSong == null || _isRestoring) return;
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setInt('last_position_ms', _position.inMilliseconds);
+      await prefs.setInt(
+          'last_saved_at_ms', DateTime.now().toUtc().millisecondsSinceEpoch);
       await prefs.setInt('last_queue_index', _currentIndex);
     } catch (_) {}
   }
@@ -4021,16 +4431,27 @@ class AudioPlayerService extends ChangeNotifier {
     }
     _lastWidgetUpdate = now;
 
+    // currentSong, not _currentSong: it switches when a crossfade STARTS
+    // (like the lock screen and the car). _currentSong only switches when the
+    // fade completes, so the widget's art and titles lagged ~7 s behind its
+    // own scrubber (position/duration are crossfade-aware) (Nov 9).
+    final song = currentSong;
     _widgetService.updateWidget(
-      songTitle: _currentSong?.title,
-      artistName: _currentSong?.artistsFormatted,
-      albumName: _currentSong?.albumTitle,
-      format: isPlayingPodcast ? '' : _currentSong?.fileFormat,
-      albumId: _currentSong?.albumId,
+      songTitle: song?.title,
+      artistName: song?.artistsFormatted,
+      albumName: song?.albumTitle,
+      format: isPlayingPodcast ? '' : song?.fileFormat,
+      albumId: song?.albumId,
       isPlaying: _isPlaying,
       position: position,
       duration: duration,
       artworkUrl: isPlayingPodcast ? _podcastArtworkUrl : null,
+      songId: song?.id,
+      waveform: song == null ? null : prefetchedWaveforms[song.id],
+      shuffleOn: _isShuffled,
+      repeatMode: repeatMode == RepeatMode.one
+          ? 2
+          : (repeatMode == RepeatMode.all ? 1 : 0),
     );
   }
 
@@ -4049,6 +4470,9 @@ class AudioPlayerService extends ChangeNotifier {
   @override
   void notifyListeners() {
     super.notifyListeners();
+    // The home-screen widget is Android only; on desktop this started a
+    // pointless 1 s timer whenever music played.
+    if (!Platform.isAndroid) return;
     _updateHomeWidget();
     // Manage progress timer based on playing state
     if (_isPlaying && _widgetProgressTimer == null) {

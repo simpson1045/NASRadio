@@ -34,12 +34,28 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
   String _filterStatus = 'all'; // all, downloading, seeding, stopped
   String _searchQuery = '';
 
+  // False while another section or page covers this one, or the app is
+  // minimized (TickerMode): the torrent refresh skips then (Nov 9 audit).
+  bool _visible = true;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final visible = TickerMode.of(context);
+    if (visible && !_visible) _loadTorrents(showLoading: false);
+    _visible = visible;
+  }
+
   @override
   void initState() {
     super.initState();
-    _loadSettings();
     _loadTorrents();
-    _startTimers();
+    // Timers after the saved settings: they started first, so the saved
+    // refresh interval and auto-stop switch were ignored until you opened
+    // the settings dialog.
+    _loadSettings().then((_) {
+      if (mounted) _startTimers();
+    });
   }
 
   @override
@@ -80,6 +96,7 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
     _refreshTimer = Timer.periodic(Duration(seconds: _refreshIntervalSeconds), (
       _,
     ) {
+      if (!_visible) return;
       _loadTorrents(showLoading: false);
     });
 
@@ -1165,8 +1182,13 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                         Icon(Icons.arrow_upward, size: 10,
                           color: seeders > 0 ? Colors.green : Colors.red[300]),
                         const SizedBox(width: 2),
+                        // Tracker's count for the WHOLE swarm, not who we're
+                        // connected to (that's the Connected chip), so they're
+                        // labelled apart: "8 seed, 2 leech, 2 peers" read as nonsense.
                         Text(
-                          '$seeders seed',
+                          leechers > 0
+                              ? 'Swarm $seeders seed · $leechers leech'
+                              : 'Swarm $seeders seed',
                           style: TextStyle(
                             color: seeders > 0 ? Colors.green : Colors.red[300],
                             fontSize: 10,
@@ -1175,26 +1197,6 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                       ],
                     ),
                   ),
-                  // Leechers badge
-                  if (leechers > 0)
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: Colors.grey.withOpacity(0.1),
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.arrow_downward, size: 10, color: Colors.grey[500]),
-                          const SizedBox(width: 2),
-                          Text(
-                            '$leechers leech',
-                            style: TextStyle(color: Colors.grey[500], fontSize: 10),
-                          ),
-                        ],
-                      ),
-                    ),
                   // Peers badge — always shown. Tracker seeder counts are
                   // claims; "0 peers" on an active torrent is the one number
                   // that proves nobody has actually shown up.
@@ -1211,7 +1213,7 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                         Icon(Icons.people, size: 10, color: peersColor),
                         const SizedBox(width: 2),
                         Text(
-                          '$peers peers',
+                          'Connected $peers',
                           style: TextStyle(color: peersColor, fontSize: 10),
                         ),
                       ],

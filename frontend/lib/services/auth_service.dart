@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -11,11 +12,31 @@ class AuthService extends ChangeNotifier {
   AuthService._();
   static final AuthService instance = AuthService._();
 
-  final FlutterSecureStorage _storage = const FlutterSecureStorage();
+  // macOS: the default "data protection" keychain needs a paid Apple
+  // developer signature; on our self-signed build every write failed, so
+  // the Mac login was never remembered. The regular login keychain works.
+  final FlutterSecureStorage _storage = const FlutterSecureStorage(
+    mOptions: MacOsOptions(useDataProtectionKeyChain: false),
+  );
   static const String _tokenKey = 'nasradio_auth_token';
 
   Map<String, dynamic>? _user;
   bool _initialized = false;
+
+  // Sliding session: the token is traded for a fresh 30-day one on start,
+  // on resume and about daily while running (/api/auth/refresh), so a device
+  // in use never expires. Oct 26: the phone's non-sliding 30-day token died
+  // mid-day and Android Auto showed "playing" with no audio.
+  DateTime? _lastRefresh;
+  Timer? _refreshTimer;
+  static const _refreshEvery = Duration(hours: 20);
+  static const _refreshThrottle = Duration(hours: 1);
+
+  /// True after a stored session was rejected (expired/revoked) until the
+  /// next sign-in: the login screen says why, and the player/Android Auto
+  /// stop pretending to play.
+  bool _sessionExpired = false;
+  bool get sessionExpired => _sessionExpired;
 
   Map<String, dynamic>? get user => _user;
   bool get isLoggedIn =>
@@ -44,29 +65,48 @@ class AuthService extends ChangeNotifier {
   Future<void> _loadMe() async {
     try {
       await ApiService.detectNetwork();
+      // Bounded: on a timeout the catch below keeps the token and the app
+      // carries on instead of sitting on the startup spinner.
       final resp = await appHttpClient
-          .get(Uri.parse('${ApiService.baseUrl}/auth/me'));
+          .get(Uri.parse('${ApiService.baseUrl}/auth/me'))
+          .timeout(const Duration(seconds: 15));
       if (resp.statusCode == 200) {
         _user = jsonDecode(resp.body)['user'] as Map<String, dynamic>;
         await _fetchMediaToken();
         await ApiService.loadClientConfig();
+        unawaited(refreshSession(force: true));
+        _startRefreshTimer();
       }
       // A 401 here triggers _handleUnauthorized via the client, clearing token.
     } catch (_) {
-      // Network error — keep the token; we'll validate on next use.
+      // Network error or timeout: keep the token and let the app open. The
+      // media token has its own retry ladder, and a successful refresh fills
+      // in the user (admin features) later.
+      unawaited(_fetchMediaToken());
+      _startRefreshTimer();
+      unawaited(Future.delayed(const Duration(seconds: 10),
+          () => refreshSession(force: true)));
     }
   }
 
-  /// Fetch the read-only media token used in stream/artwork URLs. Best-effort:
-  /// if it fails, media just won't load until the next attempt.
+  /// Fetch the read-only media token used in stream/artwork URLs. The fetch
+  /// itself lives in ApiService.refreshMediaToken so the player's stream
+  /// retry can call it too. A failed attempt retries on a backoff ladder
+  /// instead of leaving the app media-dead until the next restart (without a
+  /// token every stream/artwork URL 401s, which looks exactly like every
+  /// file in the library going missing).
   Future<void> _fetchMediaToken() async {
-    try {
-      final resp = await appHttpClient
-          .get(Uri.parse('${ApiService.baseUrl}/auth/media-token'));
-      if (resp.statusCode == 200) {
-        ApiService.mediaToken = jsonDecode(resp.body)['media_token'] as String?;
-      }
-    } catch (_) {}
+    if (await ApiService.refreshMediaToken(force: true)) return;
+    unawaited(_retryMediaToken());
+  }
+
+  Future<void> _retryMediaToken() async {
+    const delaysSec = [5, 15, 30, 60, 120, 300];
+    for (final d in delaysSec) {
+      await Future.delayed(Duration(seconds: d));
+      if (ApiService.mediaToken != null) return; // fixed meanwhile
+      if (await ApiService.refreshMediaToken(force: true)) return;
+    }
   }
 
   /// Returns null on success, or a user-facing error message.
@@ -120,9 +160,62 @@ class AuthService extends ChangeNotifier {
       await _storage.write(key: _tokenKey, value: token);
     } catch (_) {}
     appHttpClient.setToken(token);
+    _sessionExpired = false;
+    _lastRefresh = DateTime.now();
+    _startRefreshTimer();
     await _fetchMediaToken();
     await ApiService.loadClientConfig();
     notifyListeners();
+  }
+
+  /// Trade the current session token for a fresh one (new 30-day clock) and
+  /// re-fetch the 7-day media token. Throttled to once an hour unless
+  /// [force]. Called at startup, on app resume and by the ~daily timer. A
+  /// 401 here means the token already died: the client's onUnauthorized
+  /// handler signs out, same as any other request.
+  Future<void> refreshSession({bool force = false}) async {
+    if (!isLoggedIn) return;
+    final now = DateTime.now();
+    if (!force &&
+        _lastRefresh != null &&
+        now.difference(_lastRefresh!) < _refreshThrottle) {
+      return;
+    }
+    try {
+      await ApiService.detectNetwork();
+      final resp = await appHttpClient
+          .post(Uri.parse('${ApiService.baseUrl}/auth/refresh'))
+          .timeout(const Duration(seconds: 10));
+      if (resp.statusCode != 200) return;
+      final body = jsonDecode(resp.body) as Map<String, dynamic>;
+      final token = body['token'] as String?;
+      if (token == null || token.isEmpty) return;
+      // Fills in the user when the startup /auth/me timed out.
+      if (_user == null && body['user'] is Map) {
+        _user = Map<String, dynamic>.from(body['user'] as Map);
+        notifyListeners();
+      }
+      try {
+        await _storage.write(key: _tokenKey, value: token);
+      } catch (_) {}
+      appHttpClient.setToken(token);
+      _lastRefresh = now;
+      await ApiService.refreshMediaToken(force: true);
+    } catch (_) {
+      // Offline: keep the current token, the timer / next resume retries.
+    }
+  }
+
+  /// Checks hourly; refreshes once the last refresh is ~a day old. Hourly
+  /// ticks (not one 20 h timer) survive the device sleeping through it.
+  void _startRefreshTimer() {
+    _refreshTimer?.cancel();
+    _refreshTimer = Timer.periodic(const Duration(hours: 1), (_) {
+      if (_lastRefresh == null ||
+          DateTime.now().difference(_lastRefresh!) >= _refreshEvery) {
+        refreshSession(force: true);
+      }
+    });
   }
 
   String? _errorFrom(String body) {
@@ -137,6 +230,9 @@ class AuthService extends ChangeNotifier {
     try {
       await _storage.delete(key: _tokenKey);
     } catch (_) {}
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    _sessionExpired = false;
     appHttpClient.setToken(null);
     ApiService.mediaToken = null;
     _user = null;
@@ -144,7 +240,13 @@ class AuthService extends ChangeNotifier {
   }
 
   void _handleUnauthorized() {
+    // Only the first 401 counts: after it the token is gone, and the app's
+    // other in-flight requests come back 401 too.
+    if (!isLoggedIn) return;
     _storage.delete(key: _tokenKey).catchError((_) {});
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    _sessionExpired = true;
     appHttpClient.setToken(null);
     ApiService.mediaToken = null;
     _user = null;

@@ -194,7 +194,8 @@ class _QueueScreenState extends State<QueueScreen> {
         });
       }
     }
-    setState(() {});
+    // No setState here: build() is already a ListenableBuilder on the
+    // service, so this rebuilt the queue twice per notify (8x/s).
   }
 
   void _onScroll() {
@@ -415,6 +416,7 @@ class _QueueScreenState extends State<QueueScreen> {
                   ? CachedNetworkImage(
                       imageUrl: artworkUrl,
                       width: 50,
+                      memCacheWidth: 100,
                       height: 50,
                       fit: BoxFit.cover,
                       placeholder: (context, url) => Container(
@@ -626,6 +628,7 @@ class _QueueScreenState extends State<QueueScreen> {
                                       ? widget.audioPlayerService.podcastArtworkUrl!
                                       : _apiService.getArtworkUrl(song.albumId),
                                   width: 50,
+                                  memCacheWidth: 100,
                                   height: 50,
                                   fit: BoxFit.cover,
                                   placeholder: (context, url) => Container(

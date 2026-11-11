@@ -130,6 +130,7 @@ class Config:
         ".aiff",
         ".dsf",
         ".dff",
+        ".mka",  # TrueHD/Atmos disc rips (read via ffprobe, see surround.py)
     ]
 
     # Album artwork
@@ -164,7 +165,9 @@ class Config:
     # kept OFF the default fast search and exposed behind the app's opt-in
     # "Also search RuTracker" button. Matched case-insensitively as a substring
     # of the indexer name. See ProwlarrClient.fast_indexer_ids()/.deep_indexer_ids().
-    PROWLARR_DEEP_INDEXER_NAMES = ["rutracker"]
+    # 1337x sits behind Cloudflare (FlareSolverr): 17-35 s cold, which held the
+    # whole default search for ~50 s (Oct 27). It's searched with "deep".
+    PROWLARR_DEEP_INDEXER_NAMES = ["rutracker", "1337x"]
 
     TRANSMISSION_URL = Setting("TRANSMISSION_URL")
     TRANSMISSION_USER = Setting("TRANSMISSION_USER")

@@ -1,4 +1,6 @@
+import 'dart:async' show Timer;
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart' show Ticker;
 import 'dart:io' show Platform;
 import '../services/audio_player_service.dart';
 import '../services/api_service.dart';
@@ -25,67 +27,54 @@ class MiniPlayer extends StatefulWidget {
   State<MiniPlayer> createState() => _MiniPlayerState();
 }
 
-class _MiniPlayerState extends State<MiniPlayer>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _animationController;
-  Duration _lastKnownPosition = Duration.zero;
-  DateTime _lastUpdateTime = DateTime.now();
+class _MiniPlayerState extends State<MiniPlayer> {
   bool _disposed = false;
+  Object? _shown;
 
   @override
   void initState() {
     super.initState();
-    _lastKnownPosition = widget.audioPlayerService.position;
-    _lastUpdateTime = DateTime.now();
-
-    // Listen for audio service updates
+    // Rebuilds on real state changes only (song, play/pause, favorites...).
+    // The per-frame progress lives in _MiniProgressBar: this whole widget
+    // used to setState every frame forever, ~23% GPU on FRAMEWORK.
     widget.audioPlayerService.addListener(_onAudioStateChanged);
+  }
 
-    // Use AnimationController for buttery smooth 60fps
-    _animationController =
-        AnimationController(vsync: this, duration: const Duration(hours: 24))
-          ..addListener(() {
-            if (mounted) {
-              setState(() {}); // Trigger repaint at screen refresh rate
-            }
-          });
-
-    _animationController.repeat();
+  /// Everything the mini player shows from the service. The service notifies
+  /// 4x/s for position alone; rebuild only when one of these changes (the
+  /// progress strip below has its own clock). Until Nov 9 the whole mini
+  /// player rebuilt on every position tick.
+  Object _shownState() {
+    final s = widget.audioPlayerService;
+    return (
+      s.currentSong,
+      s.currentSong?.id,
+      s.isPlaying,
+      s.isLoading,
+      s.isCasting,
+      s.isPlayingPodcast,
+      s.currentEpisodeId,
+      s.podcastTitle,
+      s.podcastEpisodeTitle,
+      s.podcastArtworkUrl,
+      s.stationTrackTitle,
+      s.stationTrackArtist,
+    );
   }
 
   void _onAudioStateChanged() {
-    if (_disposed) return;
-    if (mounted) {
-      setState(() {
-        _lastKnownPosition = widget.audioPlayerService.position;
-        _lastUpdateTime = DateTime.now();
-      });
-    }
+    if (_disposed || !mounted) return;
+    final shown = _shownState();
+    if (shown == _shown) return;
+    _shown = shown;
+    setState(() {});
   }
 
   @override
   void dispose() {
     _disposed = true;
     widget.audioPlayerService.removeListener(_onAudioStateChanged);
-    _animationController.stop();
-    _animationController.dispose();
     super.dispose();
-  }
-
-  Duration get _smoothPosition {
-    if (!widget.audioPlayerService.isPlaying || widget.audioPlayerService.isBuffering) {
-      return _lastKnownPosition;
-    }
-    final now = DateTime.now();
-    final elapsed = now.difference(_lastUpdateTime);
-    final smoothPos = _lastKnownPosition + elapsed;
-
-    final duration = widget.audioPlayerService.duration;
-
-    if (smoothPos > duration) {
-      return duration;
-    }
-    return smoothPos;
   }
 
   bool get _isMobile => Platform.isAndroid || Platform.isIOS;
@@ -102,10 +91,6 @@ class _MiniPlayerState extends State<MiniPlayer>
     }
 
     final isPlaying = widget.audioPlayerService.isPlaying;
-    final duration = widget.audioPlayerService.duration;
-    final progress = duration.inMilliseconds > 0
-        ? _smoothPosition.inMilliseconds / duration.inMilliseconds
-        : 0.0;
 
     return SafeArea(
       top: false,
@@ -131,8 +116,8 @@ class _MiniPlayerState extends State<MiniPlayer>
           ),
           child: Column(
             children: [
-              // Smooth progress bar with sparks
-              SparkProgressBar(progress: progress.clamp(0.0, 1.0)),
+              // Smooth progress bar with sparks (own widget + repaint layer)
+              _MiniProgressBar(audioPlayerService: widget.audioPlayerService),
 
               // Main content
               Expanded(
@@ -173,9 +158,14 @@ class _MiniPlayerState extends State<MiniPlayer>
                                       imageUrl: currentSong.isStation &&
                                               (currentSong.stationArtworkUrl ?? '').isNotEmpty
                                           ? currentSong.stationArtworkUrl!
-                                          : apiService.getArtworkUrl(currentSong.albumId),
+                                          : apiService.getArtworkThumbUrl(currentSong.albumId),
                                       width: _isMobile ? 44 : 50,
                                       height: _isMobile ? 44 : 50,
+                                      // 300 px thumb, decoded at 2x the tile:
+                                      // the full-size cover (up to ~3000 px,
+                                      // ~36 MB decoded) was loaded for a 50 px
+                                      // square on every song change.
+                                      memCacheWidth: 100,
                                       fit: BoxFit.cover,
                                       placeholder: (context, url) => Container(
                                         width: _isMobile ? 44 : 50,
@@ -435,6 +425,116 @@ class _MiniPlayerState extends State<MiniPlayer>
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// The mini player's progress bar, on its own so only this 3 px strip redraws
+/// instead of the whole mini player.
+///
+/// Desktop: a 12.5 Hz Timer, no sparks. On Windows every frame re-draws and
+/// re-presents the WHOLE window, and a vsync Ticker asks for a frame 60 times
+/// a second for as long as a song plays, on every screen: that was ~33% of a
+/// core on FRAMEWORK's raster thread (Nov 9), with heat and whole-machine
+/// stalls. The bar moves ~10 px a second, so 12.5 updates look the same.
+/// Phone: the per-frame ticker + sparks as before. Either way it runs only
+/// while a song is actually playing and stops when the app can't be seen
+/// (TickerMode / AppVisibility).
+class _MiniProgressBar extends StatefulWidget {
+  final AudioPlayerService audioPlayerService;
+  const _MiniProgressBar({required this.audioPlayerService});
+
+  @override
+  State<_MiniProgressBar> createState() => _MiniProgressBarState();
+}
+
+class _MiniProgressBarState extends State<_MiniProgressBar>
+    with SingleTickerProviderStateMixin {
+  static const Duration _desktopStep = Duration(milliseconds: 80);
+
+  late final Ticker _ticker;
+  Timer? _timer;
+  bool _visible = true;
+  Duration _lastKnownPosition = Duration.zero;
+  DateTime _lastUpdateTime = DateTime.now();
+
+  AudioPlayerService get _svc => widget.audioPlayerService;
+  bool get _running => _svc.isPlaying && !_svc.isBuffering;
+  bool get _isMobile => Platform.isAndroid || Platform.isIOS;
+
+  @override
+  void initState() {
+    super.initState();
+    _ticker = createTicker((_) => setState(() {}));
+    _lastKnownPosition = _svc.position;
+    _svc.addListener(_onAudioStateChanged);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Muted (minimized / covered): a Timer isn't stopped by TickerMode.
+    _visible = TickerMode.of(context);
+    _syncClock();
+  }
+
+  void _onAudioStateChanged() {
+    if (!mounted) return;
+    setState(() {
+      _lastKnownPosition = _svc.position;
+      _lastUpdateTime = DateTime.now();
+    });
+    _syncClock();
+  }
+
+  void _syncClock() {
+    final run = _running && _visible;
+    if (_isMobile) {
+      if (run && !_ticker.isActive) {
+        _ticker.start();
+      } else if (!run && _ticker.isActive) {
+        _ticker.stop();
+      }
+      return;
+    }
+    if (run) {
+      _timer ??= Timer.periodic(_desktopStep, (_) {
+        if (mounted) setState(() {});
+      });
+    } else {
+      _timer?.cancel();
+      _timer = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    _svc.removeListener(_onAudioStateChanged);
+    _timer?.cancel();
+    _ticker.dispose();
+    super.dispose();
+  }
+
+  Duration get _smoothPosition {
+    if (!_running) return _lastKnownPosition;
+    final smoothPos =
+        _lastKnownPosition + DateTime.now().difference(_lastUpdateTime);
+    final duration = _svc.duration;
+    return smoothPos > duration ? duration : smoothPos;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final duration = _svc.duration;
+    final progress = duration.inMilliseconds > 0
+        ? _smoothPosition.inMilliseconds / duration.inMilliseconds
+        : 0.0;
+    return RepaintBoundary(
+      child: SparkProgressBar(
+        progress: progress.clamp(0.0, 1.0),
+        // Sparks are a per-frame animation: phone only (see above).
+        active: _running && _isMobile,
       ),
     );
   }

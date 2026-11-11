@@ -470,45 +470,107 @@ def rg_releases():
                         r"[0-9a-f]{4}-[0-9a-f]{12}", rgid):
         return jsonify({"error": "rgid must be a MusicBrainz UUID"}), 400
 
+    # Optional ?path=<staging folder>: score every release against the
+    # folder's files and flag the best match (release_match.py).
+    folder = (request.args.get("path") or "").strip()
+    real = None
+    if folder:
+        real = os.path.realpath(folder)
+        if not any(real == r or real.startswith(r + "/")
+                   for r in ALLOWED_FOLDER_ROOTS) or not os.path.isdir(real):
+            real = None
+
     cached = _RG_CACHE.get(rgid)
     if cached and time.time() - cached[0] < _RG_TTL:
-        return jsonify({"success": True, "releases": cached[1],
-                        "cached": True})
+        releases = cached[1]
+    else:
+        import requests
+        raw = []
+        try:
+            # inc=recordings brings per-track lengths (the strongest
+            # "which master is this" signal); labels for the .nfo check.
+            offset = 0
+            while True:
+                resp = requests.get(
+                    "https://musicbrainz.org/ws/2/release",
+                    params={"release-group": rgid, "limit": "100",
+                            "offset": str(offset), "fmt": "json",
+                            "inc": "media+recordings+labels"},
+                    headers={"User-Agent": user_agent()},
+                    timeout=20,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                page = payload.get("releases", [])
+                raw.extend(page)
+                offset += len(page)
+                if not page or offset >= (payload.get("release-count") or 0) or offset >= 300:
+                    break
+                time.sleep(1.1)  # MusicBrainz: 1 request/second
+        except Exception as e:
+            return jsonify({"error": f"MusicBrainz lookup failed: {e}"}), 502
 
-    import requests
+        releases = []
+        for r in raw:
+            media = r.get("media") or []
+            formats = sorted({m.get("format") or "?" for m in media})
+            lengths = [t.get("length") or (t.get("recording") or {}).get("length")
+                       for m in media for t in (m.get("tracks") or [])]
+            releases.append({
+                "id": r.get("id"),
+                "title": r.get("title"),
+                "date": r.get("date") or "",
+                "country": r.get("country") or "",
+                "disambiguation": r.get("disambiguation") or "",
+                "formats": [f for f in formats if f != "?"],
+                "track_count": sum(m.get("track-count") or 0 for m in media),
+                "track_lengths": lengths,
+                "labels": sorted({(li.get("label") or {}).get("name")
+                                  for li in (r.get("label-info") or [])
+                                  if (li.get("label") or {}).get("name")}),
+            })
+        # Newest-dated first; undated sink to the bottom.
+        releases.sort(key=lambda r: r["date"] or "0000", reverse=True)
+        _RG_CACHE[rgid] = (time.time(), releases)
+
+    out = {"success": True, "count": len(releases)}
+    if real:
+        import copy
+        from app.release_match import analyze_folder, score_releases
+        try:
+            scored = copy.deepcopy(releases)
+            out["match"] = score_releases(scored, analyze_folder(real))
+            releases = scored
+        except Exception as e:
+            out["match_error"] = str(e)[:200]
+    out["releases"] = releases
+    return jsonify(out)
+
+
+@mb_seed_api.route("/api/import/folder-facts", methods=["GET"])
+def import_folder_facts():
+    """What a download actually contains, for the import screen's "In this
+    download" line: track count, total length, bit depth / sample rate, the
+    .nfo source + label, the folder-name hint (release_match.analyze_folder)
+    and the audio file types."""
+    if not _require_full_token():
+        return jsonify({"error": "Full authentication required"}), 401
+    folder = (request.args.get("path") or "").strip()
+    real = os.path.realpath(folder) if folder else ""
+    if not real or not os.path.isdir(real) or not any(
+            real == r or real.startswith(r + "/") for r in ALLOWED_FOLDER_ROOTS):
+        return jsonify({"error": "path must be a folder under /downloads or /music"}), 400
+    from app.release_match import analyze_folder, AUDIO_EXTENSIONS
     try:
-        resp = requests.get(
-            "https://musicbrainz.org/ws/2/release",
-            params={"release-group": rgid, "limit": "100",
-                    "fmt": "json", "inc": "media"},
-            headers={"User-Agent":
-                     user_agent()},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
+        facts = analyze_folder(real)
     except Exception as e:
-        return jsonify({"error": f"MusicBrainz lookup failed: {e}"}), 502
-
-    releases = []
-    for r in payload.get("releases", []):
-        media = r.get("media") or []
-        formats = sorted({m.get("format") or "?" for m in media})
-        releases.append({
-            "id": r.get("id"),
-            "title": r.get("title"),
-            "date": r.get("date") or "",
-            "country": r.get("country") or "",
-            "disambiguation": r.get("disambiguation") or "",
-            "formats": [f for f in formats if f != "?"],
-            "track_count": sum(m.get("track-count") or 0 for m in media),
-        })
-    # Newest-dated first; undated sink to the bottom.
-    releases.sort(key=lambda r: r["date"] or "0000", reverse=True)
-
-    _RG_CACHE[rgid] = (time.time(), releases)
-    return jsonify({"success": True, "releases": releases,
-                    "count": len(releases)})
+        return jsonify({"error": f"Couldn't read the files: {str(e)[:200]}"}), 500
+    lengths = facts.get("lengths") or []
+    facts["total_seconds"] = round(sum(lengths) / 1000) if lengths else None
+    facts["file_types"] = sorted({
+        os.path.splitext(f)[1].lower().lstrip(".") for f in os.listdir(real)
+        if os.path.splitext(f)[1].lower() in AUDIO_EXTENSIONS})
+    return jsonify({"success": True, "facts": facts})
 
 
 @mb_seed_api.route("/api/musicbrainz/callback", methods=["GET"])

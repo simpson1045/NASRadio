@@ -1,5 +1,6 @@
 import os
-from flask import Flask, send_from_directory, abort
+import time
+from flask import Flask, send_from_directory, abort, g, request
 from flask_cors import CORS
 from app.extensions import socketio, safe_emit
 from app.config import Config, cors_allowed_origins
@@ -24,6 +25,25 @@ def create_app():
     # Enable CORS for Flutter app — restrict to known origins
     # (CORS_ALLOWED_ORIGINS in .env replaces this list for self-hosters)
     CORS(app, origins=cors_allowed_origins(DEFAULT_CORS_ORIGINS))
+
+    # Slow-request log: any API call the server took >2 s to answer, so an app
+    # that "sat there dead" (Oct 27: 12 s startup, a Prowlarr search that spun
+    # forever) leaves a trail. Time to the response object, so a long stream
+    # download isn't counted; stream routes are skipped anyway.
+    @app.before_request
+    def _start_timer():
+        g._t0 = time.monotonic()
+
+    @app.after_request
+    def _log_slow_request(response):
+        t0 = getattr(g, "_t0", None)
+        if t0 is not None and not request.path.startswith(("/api/stream/", "/api/rss/stream/")):
+            secs = time.monotonic() - t0
+            if secs > 2.0:
+                ua = (request.headers.get("User-Agent") or "")[:40]
+                print(f"🐢 [slow] {request.method} {request.path} -> {response.status_code} "
+                      f"in {secs:.1f}s ({ua})")
+        return response
 
     # Security headers
     @app.after_request
@@ -67,8 +87,29 @@ def create_app():
     from app.device_sync import register_handlers as register_device_sync
     register_device_sync()
 
+    # Cast sessions to the NASRadio TV app (ELKO) over Socket.IO
+    from app.cast_relay import register_handlers as register_cast_relay
+    register_cast_relay()
+
     # Serve Chromecast custom receiver files from /cast/
     cast_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'cast')
+
+    @app.route('/cast/tv.html')
+    def serve_cast_tv():
+        """The cast screen for the NASRadio TV app: receiver.html with Google's
+        CAF SDK swapped for caf_local.js, so the TV and ELKO share one page."""
+        from flask import Response
+        with open(os.path.join(cast_dir, 'receiver.html'), encoding='utf-8') as f:
+            html = f.read()
+        sdk = '<script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>'
+        if sdk not in html:
+            abort(500)
+        html = html.replace(sdk, '<script src="/cast/socket.io.min.js"></script>\n'
+                                 '  <script src="/cast/caf_local.js?v=1"></script>')
+        html = html.replace('</head>', '  <link rel="stylesheet" href="/cast/tv.css?v=1">\n</head>', 1)
+        response = Response(html, mimetype='text/html')
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        return response
 
     @app.route('/cast/<path:filename>')
     def serve_cast_file(filename):
@@ -126,6 +167,24 @@ def create_app():
             start_pipeline_reconciler(app)
         except Exception as e:
             print(f"⚠️ Could not start pipeline reconciler: {e}")
+
+        # Fill updates/ from GitHub releases (UPDATE_SOURCE=github, the
+        # default) so the in-app updater actually has something to offer.
+        try:
+            from app.update_fetcher import start_update_fetcher
+
+            start_update_fetcher()
+        except Exception as e:
+            print(f"⚠️ Could not start update fetcher: {e}")
+
+        # Original release years from MusicBrainz (reissues read as the
+        # original year on the TV).
+        try:
+            from app.original_year import start_original_year_filler
+
+            start_original_year_filler()
+        except Exception as e:
+            print(f"⚠️ Could not start original-year filler: {e}")
 
         # Keep an SMB session to the library warm so cold-stat stalls / skip
         # cascades can't happen after an idle stretch. Only for a library on a

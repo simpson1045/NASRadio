@@ -10,6 +10,7 @@ import '../widgets/m3u8_import_dialog.dart';
 import '../widgets/mouse_back_button_wrapper.dart';
 import 'missing_albums_screen.dart';
 import 'now_playing_screen.dart';
+import 'offline_downloads_screen.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
 
@@ -746,6 +747,14 @@ class _PlaylistsScreenState extends State<PlaylistsScreen>
           title: const Text('Playlists'),
           backgroundColor: const Color(0xFF0d1b2a),
           actions: [
+            if (Platform.isAndroid)
+              IconButton(
+                icon: const Icon(Icons.download_done),
+                tooltip: 'Downloads on this phone',
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const OfflineDownloadsScreen()),
+                ),
+              ),
             PopupMenuButton<String>(
               icon: const Icon(Icons.sort),
               tooltip: 'Sort by',

@@ -3,14 +3,28 @@
     android:id="@+id/widget_background"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:padding="8dp"
-    android:background="#CC1E1E2E">
+    android:background="@drawable/widget_bg_rounded"
+    android:clipToOutline="true">
+
+    <!-- Blurred, darkened album art filling the widget edge to edge (made
+         once per song in NowPlayingWidgetProvider). The root has no padding
+         (a negative margin to bleed past it is ignored in widgets, which left
+         a dark frame, Nov 9); the children carry the spacing instead. -->
+    <ImageView
+        android:id="@+id/widget_bg_art"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"
+        android:importantForAccessibility="no" />
 
     <!-- Album Art -->
     <ImageView
         android:id="@+id/widget_album_art"
         android:layout_width="120dp"
         android:layout_height="120dp"
+        android:layout_marginStart="8dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginBottom="8dp"
         android:layout_alignParentStart="true"
         android:layout_centerVertical="true"
         android:scaleType="centerCrop"
@@ -24,7 +38,7 @@
         android:layout_toEndOf="@id/widget_album_art"
         android:layout_centerVertical="true"
         android:layout_marginStart="12dp"
-        android:layout_marginEnd="4dp"
+        android:layout_marginEnd="12dp"
         android:orientation="vertical"
         android:gravity="center_horizontal">
 
@@ -167,6 +181,17 @@
             android:progress="0"
             android:progressTint="#00D4FF"
             android:progressBackgroundTint="#40FFFFFF" />
+
+        <!-- The song's waveform as the progress bar (played part in the art's
+             accent colour); replaces the bar above when there's a waveform. -->
+        <ImageView
+            android:id="@+id/widget_waveform"
+            android:layout_width="match_parent"
+            android:layout_height="26dp"
+            android:layout_marginTop="2dp"
+            android:scaleType="fitXY"
+            android:visibility="gone"
+            android:importantForAccessibility="no" />
 
         <!-- Time stamps -->
         <RelativeLayout

@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import '../utils/player_watch.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/song.dart';
@@ -102,9 +104,23 @@ class _StationsScreenState extends State<StationsScreen> {
   static const _searchHistoryMax = 8;
   List<String> _recentSearches = [];
 
+  /// The live-station state the page shows; see PlayerWatch.
+  late final PlayerWatch _playerShown;
+
   @override
   void initState() {
     super.initState();
+    _playerShown = PlayerWatch(widget.audioPlayerService, () {
+      final s = widget.audioPlayerService;
+      return (
+        s.currentSong?.id,
+        s.isPlaying,
+        s.isBuffering,
+        s.isLoading,
+        s.stationTrackTitle,
+        s.stationTrackArtist,
+      );
+    });
     _load();
     _loadSearchHistory();
   }
@@ -150,6 +166,7 @@ class _StationsScreenState extends State<StationsScreen> {
     _searchDebounce?.cancel();
     _heroTimer?.cancel();
     _heroController.dispose();
+    _playerShown.dispose();
     super.dispose();
   }
 
@@ -341,7 +358,7 @@ class _StationsScreenState extends State<StationsScreen> {
     }
     if (_error != null) return _errorView();
     return ListenableBuilder(
-      listenable: widget.audioPlayerService,
+      listenable: _playerShown,
       builder: (context, _) {
         return RefreshIndicator(
           color: kAccent,
@@ -1095,17 +1112,37 @@ class _Equalizer extends StatefulWidget {
 class _EqualizerState extends State<_Equalizer>
     with SingleTickerProviderStateMixin {
   late final AnimationController _c;
+  // Desktop: stepped by a 12.5 fps timer instead of every vsync. On Windows
+  // each frame redraws the whole window, so per-vsync bars meant 60
+  // full-window frames a second whenever a station played (Nov 9 audit).
+  Timer? _timer;
+  bool get _isDesktop => !(Platform.isAndroid || Platform.isIOS);
 
   @override
   void initState() {
     super.initState();
     _c = AnimationController(
-        vsync: this, duration: const Duration(milliseconds: 950))
-      ..repeat();
+        vsync: this, duration: const Duration(milliseconds: 950));
+    if (!_isDesktop) _c.repeat();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_isDesktop) return;
+    if (TickerMode.of(context)) {
+      _timer ??= Timer.periodic(const Duration(milliseconds: 80), (_) {
+        _c.value = (_c.value + 80 / 950) % 1.0;
+      });
+    } else {
+      _timer?.cancel();
+      _timer = null;
+    }
   }
 
   @override
   void dispose() {
+    _timer?.cancel();
     _c.dispose();
     super.dispose();
   }

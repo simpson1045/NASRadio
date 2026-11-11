@@ -525,10 +525,9 @@ class _DevicePickerSheetState extends State<_DevicePickerSheet> {
                   width: double.infinity,
                   child: OutlinedButton.icon(
                     onPressed: () {
-                      // resumeLocal: phone-side disconnect hands playback
-                      // back to the phone, playing, from the TV's position.
-                      widget.audioPlayerService.stopCasting(resumeLocal: true);
-                      widget.castService.disconnect();
+                      // Back to the phone, PAUSED (pre-join queue if we
+                      // only joined this cast).
+                      widget.audioPlayerService.disconnectCast();
                       Navigator.pop(context);
                     },
                     icon: const Icon(Icons.close, color: Colors.red, size: 18),

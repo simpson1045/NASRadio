@@ -13,6 +13,7 @@ blueprint import, to avoid a circular dependency.
 """
 
 import functools
+import re
 
 from flask import g, jsonify, request
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -23,6 +24,12 @@ from app.models import Database
 
 _TOKEN_SALT = "nasradio-auth-v1"
 TOKEN_MAX_AGE = 30 * 24 * 60 * 60  # 30 days, in seconds
+# Session tokens slide: the app trades its token for a fresh one
+# (/api/auth/refresh) on every start/resume and daily while running, so only a
+# device unused for 30 days has to sign in again. Media tokens ride in
+# stream/artwork URLs (visible in proxy logs, cast state), so they live 7 days;
+# the app re-fetches them on the same schedule.
+MEDIA_TOKEN_MAX_AGE = 7 * 24 * 60 * 60
 _DEFAULT_SECRET = "dev-secret-key-change-in-production"
 
 # Endpoints (by Flask endpoint name) reachable WITHOUT a token.
@@ -37,14 +44,24 @@ MEDIA_PATH_PREFIXES = (
     "/api/artwork/",
     "/api/artist-image/",
     "/api/rss/stream/",
+    # Read-only song facts (album year) for the cast receiver's screen.
+    "/api/cast/song-info/",
     # HTTPS relay for plain-http station streams — the Chromecast fetches
     # this URL itself with the media token in the query string.
     "/api/station-proxy",
 )
 
 
+# Album-folder images for the artwork picker's "Local Images" previews
+# (/api/album/<id>/local-image/<file>): plain image fetches, so they carry
+# the media token in the query like /api/artwork/ does.
+_LOCAL_IMAGE_RE = re.compile(r"^/api/album/\d+/local-image/")
+
+
 def is_media_request(path, method):
-    return method in ("GET", "HEAD") and any(path.startswith(p) for p in MEDIA_PATH_PREFIXES)
+    return method in ("GET", "HEAD") and (
+        any(path.startswith(p) for p in MEDIA_PATH_PREFIXES)
+        or bool(_LOCAL_IMAGE_RE.match(path)))
 
 _db = None
 
@@ -115,7 +132,11 @@ def resolve_party_token(token):
 
 def _decode_token(token):
     try:
-        return _serializer().loads(token, max_age=TOKEN_MAX_AGE)
+        payload = _serializer().loads(token, max_age=TOKEN_MAX_AGE)
+        if isinstance(payload, dict) and payload.get("scope") == "media":
+            # Same signature, tighter age limit for URL-embedded tokens.
+            _serializer().loads(token, max_age=MEDIA_TOKEN_MAX_AGE)
+        return payload
     except (BadSignature, SignatureExpired, Exception):
         return None
 

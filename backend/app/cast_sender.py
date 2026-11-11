@@ -17,12 +17,13 @@ Endpoints (full-token gate, mirrors party host endpoints):
   POST /api/cast/play   {query, type?, device?, wake?}  → resolve + cast
   POST /api/cast/party  {wake?}                          → party + shuffle
   POST /api/cast/queue  {query, next?, by?, type?}  → add to live queue
+  POST /api/cast/queue/remove {query | position | song_id, all?} → drop upcoming track(s)
+  POST /api/cast/repeat {mode: off|one|all}   → repeat this song / the whole queue
   POST /api/cast/pause | /resume | /next | /previous
   POST /api/cast/seek   {position}
   POST /api/cast/volume {level 0-85 | action up/down/mute/unmute} → Denon
   POST /api/cast/lyrics {show?}          → push synced lyrics + toggle view
   POST /api/cast/sleep  {minutes | seconds}   (0 cancels)
-  POST /api/cast/crossfade {seconds 0-12}     (segue ramp; 0 = off)
   POST /api/cast/black  {active?}
   POST /api/cast/stop
   GET  /api/cast/status
@@ -39,6 +40,7 @@ Ambiguity rule (per simpson1045): albums win over songs — "5150" is the album.
 import json
 import os
 import random
+import re
 import socket
 import ssl
 import struct
@@ -77,7 +79,23 @@ def _resolve_host(requested=None):
     if not host:
         raise CastNotConfigured("No cast device configured — set the default "
                                 "cast device in Settings → Cast, or pass \"device\"")
-    return host
+    # Non-Chromecast players (the NASRadio TV app on ELKO) go by name; their
+    # sessions run over Socket.IO (cast_relay).
+    return _relay_host(host) or host
+
+
+def _relay_host(host):
+    """Canonical name when `host` is a cast_relay player, else None."""
+    from app.cast_relay import relay_name
+    return relay_name(host)
+
+
+def _new_session(host):
+    """Google Cast for the TV; the Socket.IO relay for named players."""
+    if _relay_host(host):
+        from app.cast_relay import RelayCastSession
+        return RelayCastSession(host)
+    return HeadlessCastSession(host)
 
 
 def _receiver_app_id():
@@ -225,6 +243,9 @@ class HeadlessCastSession:
         # can answer "is this shuffled?" and hand back the source's order.
         self.source = None           # {"type": "album"|"playlist"|"party", "id", "name"}
         self.shuffled = False
+        # Repeat: "off" | "one" (this song again and again) | "all" (wrap the
+        # queue). Applied through what we feed the TV's UP_NEXT list.
+        self.repeat = "off"
         # Wedge detection (see _wedged / _heal): when the receiver went IDLE
         # and why, plus the recent self-heal attempts.
         self.idle_since = None
@@ -261,12 +282,8 @@ class HeadlessCastSession:
         launch: if nothing is running, LAUNCH our own. launch=False is the
                 "only join, never take over" probe used by the guest routes.
         """
-        ctx = ssl._create_unverified_context()
-        raw = socket.create_connection((self.host, self.port), timeout=8)
-        self.sock = ctx.wrap_socket(raw)
-        self.alive = True
-        self._send(NS_CONNECTION, {"type": "CONNECT"}, dest="receiver-0")
-        eventlet.spawn_n(self._pump)
+        if not self._open_transport():
+            return False
         eventlet.spawn_n(self._heartbeat)
         if join:
             self._send(NS_RECEIVER,
@@ -304,6 +321,17 @@ class HeadlessCastSession:
             self._send(NS_MEDIA, {"type": "GET_STATUS",
                                   "requestId": self._next_req()})
             print(f"📺 [cast-sender] joined a running cast on {self.host} as a guest")
+        return True
+
+    def _open_transport(self):
+        """TLS socket to the Cast device plus its reader. RelayCastSession
+        (cast_relay) swaps in its Socket.IO link."""
+        ctx = ssl._create_unverified_context()
+        raw = socket.create_connection((self.host, self.port), timeout=8)
+        self.sock = ctx.wrap_socket(raw)
+        self.alive = True
+        self._send(NS_CONNECTION, {"type": "CONNECT"}, dest="receiver-0")
+        eventlet.spawn_n(self._pump)
         return True
 
     def request_custom(self, payload, timeout=6):
@@ -420,6 +448,7 @@ class HeadlessCastSession:
                 self.idle_since = None
                 if self.player_state not in ("UNKNOWN", None):
                     self.last_active_state = self.player_state
+            prev_position = self.position
             if statuses:
                 st = statuses[0]
                 if isinstance(st.get("currentTime"), (int, float)):
@@ -443,6 +472,7 @@ class HeadlessCastSession:
                     # self-advance — lyrics ride along on every track.
                     if self.current_song_id != prev and self.current_song_id > 0:
                         eventlet.spawn_n(self._push_lyrics, self.current_song_id)
+                        eventlet.spawn_n(self._prefetch_next_lyrics)
                         # The TV self-advances by shifting items off the
                         # UP_NEXT list we gave it. Without a refill it runs
                         # dry after UP_NEXT_COUNT tracks and sits in IDLE
@@ -453,12 +483,33 @@ class HeadlessCastSession:
                         # self.position (a resume LOADs mid-song — don't
                         # zero it).
                         _save_state(self)
+                    elif (self.repeat == "one" and self.current_song_id == prev
+                          and prev_position > 15 and self.position < 5):
+                        # Repeat-one replay: same song started over, so the
+                        # copy we put in UP_NEXT was used. Arm the next one.
+                        eventlet.spawn_n(self._refill_up_next)
         elif ns == NASRADIO_NS and t in ("QUEUE_INSERT_RESULT", "SKIP_RESULT", "STATE"):
             slot = self._pending.get(payload.get("requestId"))
             if slot is not None:
                 slot[1] = payload
                 if not slot[0].ready():
                     slot[0].send(True)
+        elif ns == NASRADIO_NS and t == "DIAG_ERROR":
+            # A receiver UI exception (receiver.js _reportUiError): the TV
+            # screen froze or glitched while audio kept going; this names it.
+            print(f"📺 [receiver] UI error on {self.host} in {payload.get('where')}: "
+                  f"{payload.get('message')} (song {payload.get('songId')}, "
+                  f"{payload.get('playerState')} @ {payload.get('currentTime')}s) "
+                  f"{payload.get('stack') or ''}")
+        elif ns == NASRADIO_NS and t == "DIAG_FPS":
+            # receiver.js measures its requestAnimationFrame rate once per
+            # launch: is 120 Hz available to the Cast app at all?
+            print(f"📺 [receiver] frame rate on {self.host} [{payload.get('variant') or 'startup'}]: "
+                  f"{payload.get('fps')} fps (screen {payload.get('screen')}, dpr {payload.get('dpr')})")
+        elif ns == NASRADIO_NS and t == "CAPABILITIES":
+            # What the TV's Cast runtime says it can play (Dolby Atmos /
+            # DD+ passthrough), sent by the receiver on every connect.
+            print(f"📺 [receiver] capabilities from {self.host}: {json.dumps(payload)}")
         elif ns == NASRADIO_NS and t == "WAVEFORM_REQUEST":
             # The receiver's waveform canvas IS its scrubber; no answer,
             # no scrubber (the EVH skin needs the floats too).
@@ -474,17 +525,15 @@ class HeadlessCastSession:
             return  # stations have no queue
         try:
             ids = [s["id"] for s in self.queue]
-            try:
-                idx = ids.index(self.current_song_id)
-            except ValueError:
+            if self.current_song_id not in ids:
                 return  # TV is on something we didn't queue
-            tail = self.queue[idx + 1:idx + 1 + UP_NEXT_COUNT]
+            tail = _up_next_tail(self)
             if not tail:
                 return  # genuinely the last track
             token = _media_token()
             self.send_custom({
                 "type": "UP_NEXT",
-                "items": [_song_media_message(s, token) for s in tail],
+                "items": [_song_media_message(s, token, self) for s in tail],
             })
         except Exception as e:
             print(f"📺 [cast-sender] UP_NEXT refill failed: {e}")
@@ -551,17 +600,59 @@ class HeadlessCastSession:
         finally:
             self._wf_pending.discard(song_id)
 
-    def _push_lyrics(self, song_id):
+    def _push_lyrics(self, song_id, attempt=0):
         """Send cached synced lyrics (or a clear) for a track. The
-        receiver stores them hidden until TOGGLE_LYRICS."""
+        receiver stores them hidden until TOGGLE_LYRICS.
+
+        An LRCLIB error is retried (LYRICS_RETRY_S) while the song is still
+        playing instead of being sent as "no lyrics" and marked done
+        (Oct 30: "Hitch A Ride" lost its lyrics to a 503 burst; the same
+        lookup worked two minutes later)."""
         if song_id == self._lyrics_sent_for:
             return
+        if attempt and self.current_song_id != song_id:
+            return  # the song moved on before the retry
         try:
             synced = _synced_lyrics_for(song_id)
+        except LyricsLookupFailed as e:
+            if attempt < len(LYRICS_RETRY_S):
+                delay = LYRICS_RETRY_S[attempt]
+                print(f"📺 [cast-sender] lyrics for song {song_id}: {e}, retrying in {delay}s")
+                eventlet.spawn_after(delay, self._push_lyrics, song_id, attempt + 1)
+            else:
+                print(f"📺 [cast-sender] lyrics for song {song_id}: {e}, giving up (backfill later)")
+                note_lyrics_failure(song_id)
+            return
+        except Exception as e:
+            print(f"📺 [cast-sender] lyrics lookup for song {song_id} failed: {e}")
+            return
+        try:
             self._lyrics_sent_for = song_id
             self.send_custom({"type": "LYRICS", "synced": synced})
         except Exception as e:
+            self._lyrics_sent_for = None  # not delivered: let the next push retry
             print(f"📺 [cast-sender] lyrics push for song {song_id} failed: {e}")
+
+    def _prefetch_next_lyrics(self, attempt=0):
+        """Warm the lyrics cache for the next track while this one plays, so
+        the song change reads the DB instead of racing a live LRCLIB lookup."""
+        try:
+            tail = _up_next_tail(self)
+        except Exception:
+            return
+        if not tail or tail[0]["id"] == self.current_song_id:
+            return  # nothing next, or repeat-one
+        nxt = tail[0]["id"]
+        try:
+            _synced_lyrics_for(nxt)
+        except LyricsLookupFailed as e:
+            if attempt < 2:
+                print(f"📺 [cast-sender] lyrics prefetch for song {nxt}: {e}, retrying")
+                eventlet.spawn_after(30 * (attempt + 1), self._prefetch_next_lyrics, attempt + 1)
+            else:
+                note_lyrics_failure(nxt)
+        except Exception as e:
+            print(f"📺 [cast-sender] lyrics prefetch for song {nxt} failed: {e}")
 
     def stop_media(self):
         if self.media_session_id is not None:
@@ -619,20 +710,69 @@ def _save_state(s, stopped=False):
                      "position": round(max(0.0, s.position_now()), 1)}
         state.update({"host": s.host, "label": s.label,
                       "source": s.source, "shuffled": bool(s.shuffled),
+                      "repeat": s.repeat,
                       "player_state": s.player_state,
                       "stopped": bool(stopped), "updated_at": time.time()})
-        tmp = CAST_STATE_PATH + ".tmp"
-        os.makedirs(os.path.dirname(CAST_STATE_PATH), exist_ok=True)
-        with open(tmp, "w") as f:
-            json.dump(state, f)
-        os.replace(tmp, CAST_STATE_PATH)
+        if stopped:
+            _write_state(state)  # explicit stop: resume must see it at once
+        else:
+            _queue_state_write(state)
     except Exception as e:
         print(f"📺 [cast-sender] state save failed: {e}")
 
 
-def _load_state():
+# Background state writes. A plain write here blocked the whole eventlet hub
+# when the pool was stalled (Oct 30: the SMR drive at 90% busy), the 5 s
+# heartbeat to the TV missed, and the TV dropped the cast at a song change.
+# Now the newest state is handed to one writer greenlet that does the disk
+# I/O in a real thread (tpool); rapid saves coalesce into one write.
+_state_pending = {}   # state file -> latest state waiting to be written
+_state_writer_busy = False
+
+
+def _state_path(host=None):
+    """The TV keeps the original file; a relay player (ELKO) gets its own,
+    so one can't overwrite the other's place in a queue."""
+    name = _relay_host(host) if host else None
+    if name:
+        return os.path.join(os.path.dirname(CAST_STATE_PATH), f"cast_state_{name.lower()}.json")
+    return CAST_STATE_PATH
+
+
+def _write_state(state):
+    path = _state_path(state.get("host"))
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def _queue_state_write(state):
+    global _state_writer_busy
+    _state_pending[_state_path(state.get("host"))] = state
+    if not _state_writer_busy:
+        _state_writer_busy = True
+        eventlet.spawn_n(_state_writer)
+
+
+def _state_writer():
+    global _state_writer_busy
+    import eventlet.tpool
     try:
-        with open(CAST_STATE_PATH) as f:
+        while _state_pending:
+            _, state = _state_pending.popitem()
+            try:
+                eventlet.tpool.execute(_write_state, state)
+            except Exception as e:
+                print(f"📺 [cast-sender] state save failed: {e}")
+    finally:
+        _state_writer_busy = False
+
+
+def _load_state(host=None):
+    try:
+        with open(_state_path(host)) as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
@@ -661,7 +801,7 @@ def _restore_cast(host, wake=True):
     """Bring back the last cast we owned: same queue, same track, same
     second. Returns a summary dict; raises RuntimeError when there is
     nothing to restore or the TV can't be reached."""
-    st = _load_state()
+    st = _load_state(_resolve_host(host) if host else None)
     if not st:
         raise RuntimeError("nothing to resume — no saved cast")
     host = _resolve_host(host or st.get("host"))
@@ -690,6 +830,7 @@ def _restore_cast(host, wake=True):
     session.queue = songs
     session.kind, session.label = st.get("kind"), st.get("label")
     session.source, session.shuffled = st.get("source"), bool(st.get("shuffled"))
+    session.repeat = st.get("repeat") or "off"
     session._station_poll_gen += 1
     song = _load_queue_index(session, idx, current_time=pos)
     session.position, session.position_at = pos, time.time()
@@ -755,9 +896,12 @@ def _get_session(host, wake=True):
         except Exception:
             pass
         _sessions.pop(host, None)
-    if wake:
+    if wake and not _relay_host(host):
         _wake_the_room(host)
-    s = HeadlessCastSession(host)
+    elif wake:  # ELKO: music mode via ADMS, desktop app paused (cast_relay)
+        from app.cast_relay import prepare_room
+        prepare_room(_relay_host(host))
+    s = _new_session(host)
     if not s.connect_and_launch(join=False):
         raise RuntimeError(
             f"could not reach/launch receiver on {host} "
@@ -775,7 +919,7 @@ def _guest_session(host):
         return s
     if s is not None:
         _sessions.pop(host, None)
-    s = HeadlessCastSession(host)
+    s = _new_session(host)
     try:
         ok = s.connect_and_launch(join=True, launch=False)
     except OSError as e:
@@ -802,7 +946,7 @@ def _reclaim_if_ours(s):
     deadline = time.time() + 2.5
     while time.time() < deadline and s.current_song_id is None and s.alive:
         eventlet.sleep(0.1)
-    st = _load_state()
+    st = _load_state(s.host)
     if (not st or st.get("kind") == "station" or not s.remote_headless
             or s.current_song_id not in (st.get("queue") or [])):
         return False
@@ -812,11 +956,18 @@ def _reclaim_if_ours(s):
     s.queue = songs
     s.kind, s.label = st.get("kind"), st.get("label")
     s.source, s.shuffled = st.get("source"), bool(st.get("shuffled"))
+    s.repeat = st.get("repeat") or "off"
     s.joined = False
     s._our_session_id = s.session_id
     print(f"📺 [cast-sender] reclaimed our cast on {s.host}: "
           f"{s.label or 'queue'}, {len(songs)} tracks, on song {s.current_song_id}")
     eventlet.spawn_n(s._refill_up_next)
+    # The song may have changed while we were detached (Oct 30: the TV
+    # dropped the socket at a song change and was left with no lyrics):
+    # push the current track's lyrics again.
+    if s.current_song_id and s.current_song_id > 0:
+        s._lyrics_sent_for = None
+        eventlet.spawn_n(s._push_lyrics, s.current_song_id)
     _save_state(s)
     return True
 
@@ -870,7 +1021,7 @@ def _legitimately_idle(s):
     ids = [q["id"] for q in s.queue]
     if s.idle_reason == "FINISHED" and ids and s.current_song_id == ids[-1]:
         return True
-    st = _load_state()
+    st = _load_state(s.host)
     return bool(st and st.get("stopped"))
 
 
@@ -1070,9 +1221,130 @@ def _waveform_for(song_id):
     return None
 
 
+class LyricsLookupFailed(Exception):
+    """LRCLIB couldn't answer (5xx/429/timeout), as opposed to "this song has
+    no lyrics". The caller retries instead of telling the TV there are none."""
+
+
+# Seconds between retries of a failed lyrics lookup for the playing song.
+LYRICS_RETRY_S = (5, 15, 40)
+
+# Songs whose lyrics lookup hit an LRCLIB outage (phone or TV), retried in
+# the background until it's back (Nov 3: its API 502'd for hours, and
+# "Hammer To Fall" stayed lyric-less until someone tapped Try Again).
+_lyrics_retry = {}             # song_id -> first failure time
+_lyrics_backfill_running = False
+LYRICS_BACKFILL_EVERY = 300    # seconds between passes
+LYRICS_BACKFILL_MAX_AGE = 86400
+
+
+def note_lyrics_failure(song_id):
+    global _lyrics_backfill_running
+    _lyrics_retry.setdefault(int(song_id), time.time())
+    if not _lyrics_backfill_running:
+        _lyrics_backfill_running = True
+        eventlet.spawn_n(_lyrics_backfill_loop)
+
+
+def _lyrics_backfill_loop():
+    global _lyrics_backfill_running
+    try:
+        while _lyrics_retry:
+            eventlet.sleep(LYRICS_BACKFILL_EVERY)
+            now = time.time()
+            for sid, since in list(_lyrics_retry.items()):
+                if now - since > LYRICS_BACKFILL_MAX_AGE:
+                    _lyrics_retry.pop(sid, None)
+                    continue
+                try:
+                    synced = _synced_lyrics_for(sid)
+                except LyricsLookupFailed:
+                    break  # still down: next pass
+                except Exception as e:
+                    print(f"🎤 [lyrics] backfill for song {sid} failed: {e}")
+                    _lyrics_retry.pop(sid, None)
+                    continue
+                _lyrics_retry.pop(sid, None)
+                print(f"🎤 [lyrics] backfilled song {sid}: {'synced' if synced else 'no synced lyrics'}")
+                if synced:  # a cast on that song gets them right away
+                    for s in list(_sessions.values()):
+                        if s.alive and s.current_song_id == sid:
+                            s._lyrics_sent_for = None
+                            eventlet.spawn_n(s._push_lyrics, sid)
+                eventlet.sleep(2)
+    finally:
+        _lyrics_backfill_running = False
+        if _lyrics_retry:  # one slipped in as we finished
+            _lyrics_backfill_running = True
+            eventlet.spawn_n(_lyrics_backfill_loop)
+
+
+def lrclib_lookup(artist, title, duration):
+    """LRCLIB's best entry for a song: the exact match, else the closest-length
+    synced search hit (the plain exact match as fallback). Returns that entry,
+    None when LRCLIB answered and has nothing, and raises LyricsLookupFailed
+    when it couldn't answer (5xx/429/timeout). Shared by the TV
+    (_synced_lyrics_for) and the phone's GET /api/lyrics (Oct 31: the phone's
+    own copy called a 502 "No lyrics found" and never tried search)."""
+    import requests
+    ua = {"User-Agent": "NASRadio/1.0 (https://github.com/simpson1045/nasradio)"}
+    data = None
+    trouble = None   # set when LRCLIB errored rather than answered
+    try:
+        # Exact lookup first (one retry: LRCLIB answers 503 "ServerOverloaded"
+        # in bursts), then the fuzzier search, which kept working on Oct 30
+        # while /get 503'd: closest length within 8 s, synced lyrics preferred.
+        for attempt in (1, 2):
+            r = requests.get("https://lrclib.net/api/get", headers=ua, timeout=10,
+                             params={"artist_name": artist,
+                                     "track_name": title,
+                                     "duration": duration})
+            if r.status_code == 200:
+                data = r.json()
+                break
+            if r.status_code != 503:
+                break
+            eventlet.sleep(1.5)
+        if r.status_code not in (200, 404):
+            trouble = f"/get HTTP {r.status_code}"
+        if not (data and data.get("syncedLyrics")):
+            # No exact match, or one without timing: search for a synced
+            # entry of the same song; the plain exact match is the fallback.
+            plain_fallback = data
+            for attempt in (1, 2):
+                r = requests.get("https://lrclib.net/api/search", headers=ua, timeout=10,
+                                 params={"artist_name": artist,
+                                         "track_name": title})
+                if r.status_code != 503:
+                    break
+                eventlet.sleep(1.5)
+            # The broader search answering is the final word on "none".
+            trouble = None if r.status_code == 200 else f"/search HTTP {r.status_code}"
+            hits = r.json() if r.status_code == 200 else []
+            if isinstance(hits, list):
+                dur = duration or 0
+                hits = [h for h in hits if h.get("syncedLyrics") or h.get("plainLyrics")]
+                if dur:
+                    hits = [h for h in hits if abs((h.get("duration") or 0) - dur) <= 8]
+                hits.sort(key=lambda h: (not h.get("syncedLyrics"),
+                                         abs((h.get("duration") or 0) - dur)))
+                data = hits[0] if hits else plain_fallback
+            else:
+                data = plain_fallback
+    except (requests.exceptions.RequestException, ValueError) as e:
+        raise LyricsLookupFailed(f"LRCLIB {type(e).__name__}: {e}")
+    if not data:
+        if trouble:
+            raise LyricsLookupFailed(f"LRCLIB {trouble}")
+        return None
+    return data
+
+
 def _synced_lyrics_for(song_id):
-    """DB-cached synced lyrics only — the LRCLIB fetch-on-miss lives in
-    GET /api/lyrics; anything ever viewed on the phone is cached here."""
+    """Synced lyrics for a cast track: the DB cache, else fetched from LRCLIB
+    and cached (same lookup as the phone's GET /api/lyrics). It used to read
+    the cache only, so a song never opened on the phone showed no lyrics on
+    the TV (Oct 30: Dokken "The Hunter")."""
     db = _get_db()
     conn = db.get_connection()
     try:
@@ -1080,15 +1352,50 @@ def _synced_lyrics_for(song_id):
         cur.execute("SELECT synced_lyrics FROM lyrics WHERE song_id = %s",
                     (song_id,))
         row = cur.fetchone()
-        return row["synced_lyrics"] if row else None
+        if row and row["synced_lyrics"]:
+            return row["synced_lyrics"]
+        # No row, or a plain-only row (the TV shows synced lyrics only):
+        # look up a synced version and fill it in. Oct 30: Dokken "The
+        # Hunter" (song 1956) cached LRCLIB's plain-only exact match while
+        # other entries of the same recording had full synced lyrics.
+        had_plain_row = bool(row)
+        cur.execute("""SELECT songs.title, artists.name AS artist_name, songs.duration
+                       FROM songs JOIN artists ON songs.artist_id = artists.id
+                       WHERE songs.id = %s""", (song_id,))
+        song = cur.fetchone()
     finally:
         conn.close()
+    if not song:
+        return None
+
+    data = lrclib_lookup(song["artist_name"], song["title"], song["duration"])
+    if not data:
+        return None
+    synced, plain = data.get("syncedLyrics"), data.get("plainLyrics")
+    if had_plain_row and not synced:
+        return None  # still plain-only: keep the existing row as is
+    if not (synced or plain):
+        return None
+    conn = db.get_connection()
+    try:
+        cur = db.get_cursor(conn)
+        if had_plain_row:
+            cur.execute("UPDATE lyrics SET synced_lyrics = %s WHERE song_id = %s",
+                        (synced, song_id))
+        else:
+            cur.execute("""INSERT INTO lyrics (song_id, synced_lyrics, plain_lyrics, source)
+                           VALUES (%s, %s, %s, 'lrclib') ON CONFLICT DO NOTHING""",
+                        (song_id, synced, plain))
+        conn.commit()
+    finally:
+        conn.close()
+    return synced
 
 
 _MIME = {"FLAC": "audio/flac", "MP3": "audio/mpeg", "M4A": "audio/mp4",
          "AAC": "audio/mp4", "WAV": "audio/wav", "WAVE": "audio/wav",
          "OGG": "audio/ogg", "OPUS": "audio/opus",
-         "AIFF": "audio/aiff", "AIF": "audio/aiff"}
+         "AIFF": "audio/aiff", "AIF": "audio/aiff", "MKA": "audio/x-matroska"}
 
 
 def _mime_for(file_path):
@@ -1121,15 +1428,20 @@ def _special_waveform(artist, album, title):
     return None
 
 
-def _song_media_message(song, token):
+def _song_media_message(song, token, session=None):
     tok = f"&token={token}"
     # Dolby bitstreams (eac3/ac3, incl. Atmos) stream as-is — the C2's eARC
     # passes them through to the Denon untouched. Multichannel PCM instead
     # requests quality=cast, which serves the E-AC-3 sidecar if one exists
     # (raw >2ch PCM gets folded to stereo by the TV). Stereo stays lossless.
+    # A relay player (the NASRadio TV app on ELKO) always gets the original:
+    # its Chromium audio can't decode the E-AC-3 sidecar but plays
+    # multichannel FLAC (Oct 31: 5.1 "Time" sat IDLE on ELKO).
     _codec = (song.get("audio_codec") or "").lower()
     _multich = (song.get("audio_channels") or 2) > 2
-    _quality = "cast" if (_multich and _codec not in ("eac3", "ac3")) else "lossless"
+    _relay = session is not None and bool(_relay_host(session.host))
+    _quality = ("cast" if (_multich and not _relay and _codec not in ("eac3", "ac3"))
+                else "lossless")
     stream = (f"{_public_base()}/api/stream/{song['id']}?quality={_quality}{tok}")
     artwork = f"{_public_base()}/api/artwork/{song['album_id']}?token={token}"
     artist_img = f"{_public_base()}/api/artist-image/{song['artist_id']}?token={token}"
@@ -1149,6 +1461,7 @@ def _song_media_message(song, token):
         },
         "customData": {
             "artistImageUrl": artist_img,
+            "gain": _cast_gain(song),
             "specialWaveform": _special_waveform(
                 song["artist_name"], song["album_title"], song["title"]),
             # Describe what the TV actually receives: sidecar/eac3 casts play
@@ -1156,7 +1469,9 @@ def _song_media_message(song, token):
             "fileFormat": ("DD+" if (_quality == "cast" or _codec in ("eac3", "ac3"))
                            else (song.get("file_path") or "").rsplit(".", 1)[-1].upper()),
             "isHdcd": bool(song.get("is_hdcd")),
-            "isAtmos": bool(song.get("is_atmos")),
+            # The cast sidecar is plain DD+ 5.1 (no free encoder writes the
+            # Atmos layer), so a TrueHD Atmos track isn't Atmos on the TV.
+            "isAtmos": bool(song.get("is_atmos")) and _quality != "cast",
             "audioChannels": song.get("audio_channels") or 2,
             "isExplicit": bool(song.get("is_explicit")),
             "songId": song["id"],
@@ -1170,7 +1485,23 @@ def _song_media_message(song, token):
 _SONG_COLS = ("s.id, s.title, s.track_number, s.disc_number, s.file_path, "
               "s.is_explicit, s.is_hdcd, s.audio_codec, s.audio_channels, "
               "s.is_atmos, s.artist_id, s.album_id, "
-              "ar.name AS artist_name, al.title AS album_title")
+              "ar.name AS artist_name, al.title AS album_title, "
+              "(SELECT sa.integrated_loudness_lufs FROM song_analysis sa "
+              " WHERE sa.song_id = s.id LIMIT 1) AS rg_lufs")
+
+# ReplayGain for casts. The receiver sets an <audio> element's volume, which
+# tops out at 1, so a cast can only turn loud tracks DOWN: bring them toward
+# -14 LUFS (≈3 dB under the library's typical -11) and never boost. Same math
+# as the app's CastService._castGain.
+CAST_RG_TARGET_LUFS = -14.0
+
+
+def _cast_gain(song):
+    lufs = song.get("rg_lufs")
+    if lufs is None or not (-60 < lufs < 0):
+        return 1.0  # not analysed yet, or digital silence
+    gain_db = max(-12.0, min(0.0, CAST_RG_TARGET_LUFS - lufs))
+    return round(10 ** (gain_db / 20), 4)
 
 
 def resolve_query(q, kind="auto"):
@@ -1196,9 +1527,10 @@ def resolve_query(q, kind="auto"):
                     f"""SELECT {_SONG_COLS} FROM songs s
                         JOIN artists ar ON ar.id = s.artist_id
                         JOIN albums al ON al.id = s.album_id
-                        WHERE s.album_id = %s AND s.source_type = 'local'
-                        ORDER BY s.disc_number NULLS FIRST, s.track_number, s.id""",
-                    (album["id"],))
+                        {_ALBUM_REFS_JOIN}
+                        WHERE {_ALBUM_REFS_WHERE} AND s.source_type = 'local'
+                        ORDER BY {_ALBUM_REFS_ORDER}""",
+                    (album["id"], album["id"]))
                 songs = [dict(r) for r in cur.fetchall()]
                 if songs:
                     return {"kind": "album",
@@ -1263,6 +1595,43 @@ def resolve_query(q, kind="auto"):
                                    "start_song_id": hit["id"]},
                         "songs": album_songs[start:]}
 
+        if kind == "artist":
+            # Everything credited to the artist (primary or featured), minus
+            # albums flagged exclude_from_shuffle. Explicit only: "Van Halen"
+            # on auto still means the 1978 album. Name match ignores
+            # punctuation/spacing, so a stray "Van Halen  -" credit folds in.
+            cur.execute(
+                """SELECT id, name FROM artists
+                   WHERE regexp_replace(lower(name), '[^a-z0-9]', '', 'g')
+                       = regexp_replace(lower(%s), '[^a-z0-9]', '', 'g')""", (q,))
+            artists = cur.fetchall()
+            if not artists:
+                cur.execute(
+                    """SELECT id, name FROM artists
+                       WHERE similarity(lower(name), lower(%s)) > 0.5
+                       ORDER BY similarity(lower(name), lower(%s)) DESC LIMIT 1""", (q, q))
+                artists = cur.fetchall()
+            if artists:
+                ids = [a["id"] for a in artists]
+                cur.execute(
+                    f"""SELECT {_SONG_COLS} FROM songs s
+                        JOIN artists ar ON ar.id = s.artist_id
+                        JOIN albums al ON al.id = s.album_id
+                        WHERE s.source_type = 'local'
+                          AND NOT COALESCE(al.exclude_from_shuffle, FALSE)
+                          AND (s.artist_id = ANY(%s) OR EXISTS (
+                                SELECT 1 FROM song_artists sa
+                                WHERE sa.song_id = s.id AND sa.artist_id = ANY(%s)))
+                        ORDER BY al.year NULLS LAST, al.id, s.disc_number NULLS FIRST,
+                                 s.track_number, s.id""", (ids, ids))
+                songs = [dict(r) for r in cur.fetchall()]
+                if songs:
+                    name = min(artists, key=lambda a: len(a["name"]))["name"]
+                    return {"kind": "artist",
+                            "label": f"{name} — all songs ({len(songs)})",
+                            "source": {"type": "artist", "id": ids[0], "name": name},
+                            "songs": songs}
+
         if kind in ("auto", "station"):
             cur.execute(
                 """SELECT id, name, url, favicon, genre FROM stations
@@ -1281,6 +1650,39 @@ def resolve_query(q, kind="auto"):
         conn.close()
 
 
+def _without_held(songs, user_id=None):
+    """Drop songs the user is holding back (👎 'Not now' / 'Never play
+    this', table song_holds) from a list the server is about to queue. A
+    single direct pick isn't touched, and if everything is held the list is
+    left alone rather than queueing nothing."""
+    if not songs or len(songs) < 2:
+        return songs
+    try:
+        db = _get_db()
+        conn = db.get_connection()
+        try:
+            cur = db.get_cursor(conn)
+            cur.execute(
+                """SELECT song_id FROM song_holds
+                   WHERE user_id = %s AND (until IS NULL OR until > CURRENT_TIMESTAMP)""",
+                (user_id or 1,))
+            held = {r["song_id"] for r in cur.fetchall()}
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[cast] holds lookup failed ({e}); queueing as is")
+        return songs
+    kept = [s for s in songs if s.get("id") not in held]
+    return kept or songs
+
+
+def _request_user_id():
+    try:
+        return (g.user or {}).get("id")
+    except Exception:
+        return None
+
+
 def _party_shuffle_songs(limit=25):
     db = _get_db()
     conn = db.get_connection()
@@ -1293,7 +1695,7 @@ def _party_shuffle_songs(limit=25):
                 JOIN albums al ON al.id = s.album_id
                 WHERE s.source_type = 'local'
                 ORDER BY random() LIMIT %s""", (limit * 3,))
-        pool = [dict(r) for r in cur.fetchall()]
+        pool = _without_held([dict(r) for r in cur.fetchall()])
         random.shuffle(pool)
         return pool[:limit]
     finally:
@@ -1302,13 +1704,13 @@ def _party_shuffle_songs(limit=25):
 
 # ── Cast operations ────────────────────────────────────────────────────
 
-def _cast_songs(session, songs, label=None, kind=None, source=None, shuffled=False):
+def _cast_songs(session, songs, label=None, kind=None, source=None, shuffled=False, start=0):
     session.queue = list(songs)
     session.label, session.kind, session.station_query = label, kind, None
     session.source, session.shuffled = source, bool(shuffled)
     session._heal_times, session._heal_gave_up = [], False
     session._station_poll_gen += 1  # songs playing → any station poll dies
-    song = _load_queue_index(session, 0)
+    song = _load_queue_index(session, start)
     _save_state(session)
     return song
 
@@ -1317,11 +1719,11 @@ def _load_queue_index(session, idx, current_time=0):
     """LOAD queue[idx] + hand the receiver the UP_NEXT tail from there."""
     token = _media_token()
     song = session.queue[idx]
-    session.load(_song_media_message(song, token), current_time=current_time)
+    session.load(_song_media_message(song, token, session), current_time=current_time)
     # Give the receiver a beat to process LOAD before custom messages —
     # same deferred-send lesson the phone sender learned the hard way.
     eventlet.sleep(2)
-    up_next = [_song_media_message(s, token)
+    up_next = [_song_media_message(s, token, session)
                for s in session.queue[idx + 1:idx + 1 + UP_NEXT_COUNT]]
     session.send_custom({"type": "UP_NEXT", "items": up_next})
     return song
@@ -1403,7 +1805,11 @@ def _cast_gate():
     if not token:
         return jsonify({"error": "Authentication required"}), 401
     user, scope = auth.resolve_token(token)
-    if not user or scope != "full":
+    # The TV receiver only holds the read-only media token its artwork URLs
+    # carry. Let it through for media paths (just /api/cast/song-info here,
+    # see auth.MEDIA_PATH_PREFIXES); everything else needs a full login.
+    media_ok = scope == "media" and auth.is_media_request(request.path, request.method)
+    if not user or (scope != "full" and not media_ok):
         return jsonify({"error": "Full authentication required"}), 401
     g.user = user
     return None
@@ -1425,8 +1831,22 @@ def cast_play():
 
     # shuffle:true randomizes the resolved track list (albums/playlists;
     # meaningless for stations, harmless for single-song resolves).
+    if resolved.get("songs") and resolved.get("kind") != "song":
+        resolved["songs"] = _without_held(resolved["songs"], _request_user_id())
     if data.get("shuffle") and resolved.get("songs"):
         random.shuffle(resolved["songs"])
+
+    # start_at: begin at this song (title, exact else contains) with the
+    # whole list queued around it, like tapping a track in a playlist.
+    start = 0
+    start_at = (data.get("start_at") or "").strip().lower()
+    if start_at and resolved.get("songs"):
+        titles = [(s.get("title") or "").lower() for s in resolved["songs"]]
+        start = next((i for i, t in enumerate(titles) if t == start_at), None)
+        if start is None:
+            start = next((i for i, t in enumerate(titles) if start_at in t), None)
+        if start is None:
+            return jsonify({"error": f"'{data['start_at']}' isn't in {resolved['label']}"}), 404
 
     try:
         session = _get_session(host, wake=wake)
@@ -1446,7 +1866,7 @@ def cast_play():
     first = _cast_songs(session, resolved["songs"],
                         label=resolved["label"], kind=resolved["kind"],
                         source=resolved.get("source"),
-                        shuffled=bool(data.get("shuffle")))
+                        shuffled=bool(data.get("shuffle")), start=start)
     print(f"📺 [cast-sender] Casting {resolved['label']} "
           f"({len(resolved['songs'])} tracks) → {host}")
     return jsonify({
@@ -1511,6 +1931,29 @@ def _live_session_or_error(data):
         return None, (jsonify({"error": f"no cast running on {host} "
                                "(nothing to join, and no headless session)"}), 409)
     return s, None
+
+
+def _up_next_tail(s):
+    """The songs to hand the TV as UP_NEXT from where it is now, honouring
+    repeat: "one" = this song again; "all" = wrap to the start of the queue
+    when the end is near; "off" = just what follows."""
+    ids = [t["id"] for t in s.queue]
+    try:
+        idx = ids.index(s.current_song_id)
+    except ValueError:
+        idx = len(ids) - 1
+    if s.repeat == "one" and 0 <= idx < len(s.queue):
+        return [s.queue[idx]]
+    tail = s.queue[idx + 1:idx + 1 + UP_NEXT_COUNT]
+    if s.repeat == "all" and len(tail) < UP_NEXT_COUNT and s.queue:
+        tail += s.queue[:UP_NEXT_COUNT - len(tail)]
+    return tail
+
+
+def _send_up_next(s):
+    token = _media_token()
+    s.send_custom({"type": "UP_NEXT",
+                   "items": [_song_media_message(t, token, s) for t in _up_next_tail(s)]})
 
 
 def _clear_upcoming(s):
@@ -1585,6 +2028,8 @@ def cast_queue():
     songs = list(resolved["songs"])
     if resolved["kind"] == "song":
         songs = songs[:1]  # just the matched track, not its album tail
+    else:
+        songs = _without_held(songs, _request_user_id())
     shuffle = bool(data.get("shuffle"))
     replace = bool(data.get("replace"))
     if shuffle:
@@ -1613,9 +2058,7 @@ def cast_queue():
     s.queue[pos:pos] = songs
 
     token = _media_token()
-    up_next = [_song_media_message(t, token)
-               for t in s.queue[idx + 1:idx + 1 + UP_NEXT_COUNT]]
-    s.send_custom({"type": "UP_NEXT", "items": up_next})
+    _send_up_next(s)
     _save_state(s)
 
     title = (songs[0]["album_title"] if resolved["kind"] == "album"
@@ -1651,7 +2094,7 @@ def _guest_queue(s, songs, kind, play_next, by):
     splices them into its own self-advance list. Either way it answers
     QUEUE_INSERT_RESULT and shows the "by Claude" toast."""
     token = _media_token()
-    items = [_song_media_message(t, token) for t in songs]
+    items = [_song_media_message(t, token, s) for t in songs]
     for it in items:
         # The phone owns this queue and LOADs its own tracks; don't tell
         # the receiver to race it with the fast headless self-advance.
@@ -1685,6 +2128,131 @@ def _guest_queue(s, songs, kind, play_next, by):
                     "mode": "guest", "handled_by": reply.get("handledBy")})
 
 
+@cast_api.route("/api/cast/queue/remove", methods=["POST"])
+def cast_queue_remove():
+    """Take upcoming track(s) out of the live cast queue (Claude queued the
+    wrong "Hunter", Oct 30). Pick by "query" (title / artist words),
+    "position" (1 = the next song, as in status up_next) or "song_id".
+    Removes the first upcoming match unless "all": true. Never touches the
+    song that is playing (skip it with /api/cast/next)."""
+    data = request.get_json(silent=True) or {}
+    s, err = _live_session_or_error(data)
+    if err:
+        return err
+    if s.joined:
+        return jsonify({"error": "this cast's queue belongs to the phone that started it; "
+                        "remove it from the phone", "mode": "guest"}), 409
+    if not s.queue:
+        return jsonify({"error": "no song queue on this cast (station or idle?)"}), 409
+    ids = [t["id"] for t in s.queue]
+    cur = ids.index(s.current_song_id) if s.current_song_id in ids else -1
+    upcoming = list(range(cur + 1, len(s.queue)))
+
+    picks = []
+    if data.get("position") is not None:
+        try:
+            n = int(data["position"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "position must be a number (1 = next song)"}), 400
+        if not 1 <= n <= len(upcoming):
+            return jsonify({"error": f"position {n} is outside the upcoming queue "
+                            f"(1-{len(upcoming)})"}), 400
+        picks = [upcoming[n - 1]]
+    elif data.get("song_id") is not None:
+        try:
+            sid = int(data["song_id"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "song_id must be a number"}), 400
+        picks = [i for i in upcoming if s.queue[i]["id"] == sid]
+    else:
+        q = (data.get("query") or "").strip().lower()
+        if not q:
+            return jsonify({"error": "query, position or song_id required"}), 400
+        words = [w for w in re.findall(r"[a-z0-9']+", q)]
+        def hay(t):
+            return f"{t.get('title') or ''} {t.get('artist_name') or ''}".lower()
+        picks = [i for i in upcoming if all(w in hay(s.queue[i]) for w in words)]
+    if not picks:
+        return jsonify({"error": "no upcoming track matches that", "removed": []}), 404
+    if not data.get("all"):
+        picks = picks[:1]
+
+    removed = [{"song_id": s.queue[i]["id"], "title": s.queue[i].get("title"),
+                "artist": s.queue[i].get("artist_name")} for i in picks]
+    for i in sorted(picks, reverse=True):
+        del s.queue[i]
+    _send_up_next(s)
+    _save_state(s)
+    by = ((data.get("by") or "").strip() or (g.user or {}).get("username") or "someone")
+    print(f"📺 [cast-sender] {by} removed {', '.join(r['title'] or '?' for r in removed)} "
+          f"from the queue on {s.host}")
+    return jsonify({"ok": True, "removed": removed, "queue_length": len(s.queue)})
+
+
+@cast_api.route("/api/cast/fps-probe", methods=["POST"])
+def cast_fps_probe():
+    """Diagnostic: ask the receiver to measure its frame rate for ~2.5 s with
+    one expensive layer off (normal | noblur | nobg | nowave | minimal). The
+    result lands in the log as "📺 [receiver] frame rate ... [variant]"."""
+    data = request.get_json(silent=True) or {}
+    s, err = _live_session_or_error(data)
+    if err:
+        return err
+    variant = (data.get("variant") or "normal").strip().lower()
+    if variant not in ("normal", "noblur", "nobg", "nowave", "minimal", "sweep"):
+        return jsonify({"error": "variant must be normal, noblur, nobg, nowave, minimal or sweep"}), 400
+    msg = {"type": "FPS_PROBE", "variant": variant}
+    if variant == "sweep":  # scrubber fill sweeps the bar every 2 s for N s
+        try:
+            msg["seconds"] = max(4, min(60, int(data.get("seconds") or 15)))
+        except (TypeError, ValueError):
+            msg["seconds"] = 15
+    s.send_custom(msg)
+    return jsonify({"ok": True, **msg})
+
+
+@cast_api.route("/api/cast/scroll-mode", methods=["POST"])
+def cast_scroll_mode():
+    """Switch the TV's lyrics scroll: 'drift' (the default: slides at a
+    constant speed with the song clock, never parks), 'tween' (700 ms ease
+    per line change) or 'css' (the same glide as a CSS transition), to
+    compare smoothness by eye."""
+    data = request.get_json(silent=True) or {}
+    s, err = _live_session_or_error(data)
+    if err:
+        return err
+    mode = (data.get("mode") or "").strip().lower()
+    if mode not in ("drift", "tween", "css"):
+        return jsonify({"error": "mode must be drift, tween or css"}), 400
+    s.send_custom({"type": "SCROLL_MODE", "mode": mode})
+    return jsonify({"ok": True, "mode": mode})
+
+
+@cast_api.route("/api/cast/repeat", methods=["POST"])
+def cast_repeat():
+    """Repeat mode for the live cast: "one" plays the current song again and
+    again, "all" wraps back to the start of the queue, "off" stops repeating."""
+    data = request.get_json(silent=True) or {}
+    s, err = _live_session_or_error(data)
+    if err:
+        return err
+    mode = (data.get("mode") or "").strip().lower()
+    mode = {"song": "one", "track": "one", "this": "one", "queue": "all",
+            "on": "all", "none": "off", "false": "off"}.get(mode, mode)
+    if mode not in ("off", "one", "all"):
+        return jsonify({"error": "mode must be off, one or all"}), 400
+    if s.joined:
+        return jsonify({"error": "this cast's queue belongs to the phone that started it; "
+                        "set repeat on the phone", "mode": "guest"}), 409
+    if not s.queue:
+        return jsonify({"error": "no song queue on this cast (station or idle?)"}), 409
+    s.repeat = mode
+    _send_up_next(s)
+    _save_state(s)
+    print(f"📺 [cast-sender] repeat -> {mode} on {s.host}")
+    return jsonify({"ok": True, "repeat": mode})
+
+
 @cast_api.route("/api/cast/pause", methods=["POST"])
 def cast_pause():
     s, err = _live_session_or_error(request.get_json(silent=True) or {})
@@ -1692,6 +2260,37 @@ def cast_pause():
         return err
     s.media_command("PAUSE")
     return jsonify({"ok": True})
+
+
+@cast_api.route("/api/cast/song-info/<int:song_id>", methods=["GET"])
+def cast_song_info(song_id):
+    """Read-only facts the TV receiver shows about a song: the album's release
+    year for now (the album line reads "Rumours · 1977"). Reachable with a
+    media token (auth.MEDIA_PATH_PREFIXES) because the receiver only has the
+    one its artwork URLs carry. Room to grow into an X-Ray panel."""
+    db = _get_db()
+    conn = db.get_connection()
+    try:
+        cur = db.get_cursor(conn)
+        cur.execute(
+            """SELECT al.year, al.original_year FROM songs s
+               JOIN albums al ON al.id = s.album_id
+               WHERE s.id = %s""", (song_id,))
+        row = cur.fetchone()
+    finally:
+        conn.close()
+
+    def ok(y):
+        return y if y and 1000 < y < 3000 else None
+
+    tagged = ok(row["year"]) if row else None
+    original = ok(row["original_year"]) if row else None
+    # album_year is what the TV shows: the original release year when
+    # MusicBrainz knows it (Reckless (Deluxe) -> 1984, not 2014).
+    return jsonify({"song_id": song_id,
+                    "album_year": original or tagged,
+                    "original_year": original,
+                    "release_year": tagged})
 
 
 @cast_api.route("/api/cast/resume", methods=["POST"])
@@ -1826,22 +2425,6 @@ def cast_sleep():
     return jsonify({"ok": True, "remaining_sec": max(0, remaining)})
 
 
-@cast_api.route("/api/cast/crossfade", methods=["POST"])
-def cast_crossfade():
-    """Segue crossfade duration on the TV (volume ramp, Stage 1).
-    {seconds: 0-12}; 0 disables. Receiver persists it across launches."""
-    data = request.get_json(silent=True) or {}
-    s, err = _live_session_or_error(data)
-    if err:
-        return err
-    try:
-        seconds = max(0.0, min(float(data.get("seconds", 4)), 12.0))
-    except (TypeError, ValueError):
-        return jsonify({"error": "seconds must be a number 0-12"}), 400
-    s.send_custom({"type": "CROSSFADE", "seconds": seconds})
-    return jsonify({"ok": True, "crossfade_sec": seconds})
-
-
 @cast_api.route("/api/cast/black", methods=["POST"])
 def cast_black():
     data = request.get_json(silent=True) or {}
@@ -1865,6 +2448,10 @@ def cast_stop():
     if not s or not s.alive:
         return jsonify({"ok": True, "note": "no cast running"})
     _save_state(s, stopped=True)   # "resume" can bring this back later
+    # Warn every connected phone first (the receiver relays CAST_ENDED),
+    # or a joined phone reads the close as a crash and relaunches the cast.
+    s.send_custom({"type": "SESSION_ENDING", "reason": "stopped"})
+    eventlet.sleep(1.0)
     s.stop_media()
     eventlet.sleep(0.5)
     s.stop_receiver()
@@ -1930,6 +2517,7 @@ def cast_status():
             "label": s.label,
             "kind": s.kind,
             "shuffled": bool(s.shuffled),
+            "repeat": s.repeat,
             "source": s.source,
             "idle_for_sec": int(time.time() - s.idle_since) if s.idle_since else None,
             "self_heals_recent": len([x for x in s._heal_times
@@ -1938,6 +2526,15 @@ def cast_status():
             "last_error": s.last_error,
         }
     return jsonify(out)
+
+
+# An album's songs INCLUDING album references (album_track_refs: tracks that
+# live on another album but are also listed on this one), in this album's
+# own order. Both need the album id twice: (album_id, album_id).
+_ALBUM_REFS_JOIN = "LEFT JOIN album_track_refs r ON r.song_id = s.id AND r.album_id = %s"
+_ALBUM_REFS_WHERE = "(s.album_id = %s OR r.id IS NOT NULL)"
+_ALBUM_REFS_ORDER = ("COALESCE(r.disc_number, s.disc_number) NULLS FIRST, "
+                     "COALESCE(r.track_number, s.track_number), s.id")
 
 
 def _source_tracks(source):
@@ -1950,11 +2547,12 @@ def _source_tracks(source):
         cur = db.get_cursor(conn)
         if source["type"] == "album":
             cur.execute(
-                """SELECT s.id, s.title, ar.name AS artist_name FROM songs s
+                f"""SELECT s.id, s.title, ar.name AS artist_name FROM songs s
                    JOIN artists ar ON ar.id = s.artist_id
-                   WHERE s.album_id = %s AND s.source_type = 'local'
-                   ORDER BY s.disc_number NULLS FIRST, s.track_number, s.id""",
-                (source["id"],))
+                   {_ALBUM_REFS_JOIN}
+                   WHERE {_ALBUM_REFS_WHERE} AND s.source_type = 'local'
+                   ORDER BY {_ALBUM_REFS_ORDER}""",
+                (source["id"], source["id"]))
         else:
             cur.execute(
                 """SELECT s.id, s.title, ar.name AS artist_name FROM playlist_songs ps

@@ -11,6 +11,14 @@ _UPDATES_DIR = os.path.join(_BASE_DIR, "updates")
 _CHANGELOG_PATH = os.path.join(os.path.dirname(_BASE_DIR), "CHANGELOG.md")
 
 
+def _changelog_file():
+    """Release notes to serve. The GitHub update fetcher saves the release's
+    CHANGELOG.md into updates/ (a stock container has no repo CHANGELOG);
+    otherwise use the one mounted next to the backend."""
+    fetched = os.path.join(_UPDATES_DIR, "CHANGELOG.md")
+    return fetched if os.path.exists(fetched) else _CHANGELOG_PATH
+
+
 def _read_version_json():
     """Read and return parsed version.json.
 
@@ -31,9 +39,10 @@ def _parse_latest_changelog():
     regex from matching '## ' at position 0 and we'd return the wrong
     section (next one down).
     """
-    if not os.path.exists(_CHANGELOG_PATH):
+    path = _changelog_file()
+    if not os.path.exists(path):
         return ""
-    with open(_CHANGELOG_PATH, "r", encoding="utf-8-sig") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         content = f.read()
 
     # Split on ## headers, take the first section
@@ -55,9 +64,10 @@ def _parse_changelog_since(since_build):
     without a parseable build number (rare, near the top) are included. Falls
     back to the latest section if the user is already current.
     """
-    if not os.path.exists(_CHANGELOG_PATH):
+    path = _changelog_file()
+    if not os.path.exists(path):
         return ""
-    with open(_CHANGELOG_PATH, "r", encoding="utf-8-sig") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         content = f.read()
     sections = [s.strip() for s in re.split(r"(?=^## )", content, flags=re.MULTILINE)
                 if s.strip().startswith("## ")]
@@ -97,22 +107,28 @@ def check_update():
         # the frontend can treat "no Linux artifact this release" as the
         # same as "no update for me" rather than erroring.
         "linux_size": version_data.get("linux_size", 0),
+        # macos_size: 0 when this release has no Mac build, which the app
+        # treats as "no update for me" (same as Linux).
+        "macos_size": version_data.get("macos_size", 0),
         "released_at": version_data.get("released_at", ""),
+        # "beta" on a server publishing beta-channel builds (scripts/beta.ps1).
+        "channel": version_data.get("channel", "stable"),
     })
 
 
 @update_api.route("/api/update/download/<platform>", methods=["GET"])
 def download_update(platform):
-    """Stream the update file for the given platform (android, windows, or linux)."""
+    """Stream the update file for the given platform (android, windows, linux, or macos)."""
     platform_files = {
         "android": "nasradio-android.apk",
         "windows": "nasradio-windows.zip",
         "linux": "nasradio-linux.tar.xz",
+        "macos": "nasradio-macos.zip",
     }
     if platform not in platform_files:
         return (
             jsonify({
-                "error": "Invalid platform. Use 'android', 'windows', or 'linux'."
+                "error": "Invalid platform. Use 'android', 'windows', 'linux', or 'macos'."
             }),
             400,
         )

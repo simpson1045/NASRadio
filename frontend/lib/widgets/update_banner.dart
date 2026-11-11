@@ -107,8 +107,8 @@ class _UpdateBannerState extends State<UpdateBanner> {
                   // Build number too: a same-version rebuild (1.4.16 build
                   // 149 -> 150) otherwise reads as the version you already have.
                   _state == _UpdateState.ready
-                      ? 'Update ready: v${widget.info.version} (build ${widget.info.buildNumber})'
-                      : 'Update available: v${widget.info.version} (build ${widget.info.buildNumber})',
+                      ? '${widget.info.isBeta ? 'Beta' : 'Update'} ready: v${widget.info.version} (build ${widget.info.buildNumber})'
+                      : '${widget.info.isBeta ? 'Beta' : 'Update'} available: v${widget.info.version} (build ${widget.info.buildNumber})',
                   style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
                 ),
               ),

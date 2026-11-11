@@ -29,6 +29,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+    <!-- Wake-up alarms: exact alarm-clock scheduling (13+ grants USE_EXACT_ALARM
+         to alarm apps; 12 needs the user-grantable SCHEDULE_EXACT_ALARM), the
+         full-screen ringing screen over the lock screen, re-arming after a
+         reboot or app update, and vibration. -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM"/>
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32"/>
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.VIBRATE"/>
     
     <application
         android:label="NASRadio"
@@ -55,6 +65,13 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <!-- "Hey Google, play ___ on NASRadio" on the phone / Google TV.
+                 MainActivity hands it to the Dart audio handler's
+                 playFromSearch (Android Auto talks to the media session). -->
+            <intent-filter>
+                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH"/>
+                <category android:name="android.intent.category.DEFAULT"/>
             </intent-filter>
         </activity>
         
@@ -90,6 +107,30 @@
                 android:name="android.appwidget.provider"
                 android:resource="@xml/widget_now_playing_info" />
         </receiver>
+
+        <!-- Wake-up alarms. directBootAware: an alarm still rings after an
+             overnight restart, before the phone has been unlocked. -->
+        <receiver
+            android:name=".AlarmReceiver"
+            android:exported="false"
+            android:directBootAware="true" />
+        <receiver
+            android:name=".AlarmBootReceiver"
+            android:exported="true"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+            </intent-filter>
+        </receiver>
+        <service
+            android:name=".AlarmRingService"
+            android:exported="false"
+            android:directBootAware="true"
+            android:foregroundServiceType="mediaPlayback" />
         
         <!-- FileProvider for APK update installation -->
         <provider

@@ -5,6 +5,7 @@ import '../services/api_service.dart';
 import 'artwork_picker_dialog.dart';
 import 'artist_image_picker_dialog.dart';
 import '../services/audio_player_service.dart';
+import '../main.dart' show globalAudioPlayerService;
 import '../models/song.dart';
 import '../models/playlist.dart';
 import '../screens/album_detail_screen.dart';
@@ -833,6 +834,26 @@ class _MusicContextMenuState extends State<MusicContextMenu> {
         }
       }
     });
+  }
+
+  /// 👎 from a song's menu: 'Not now' (30 days) or 'Never play this'.
+  Future<void> _holdSong(BuildContext context, {int? days = 30}) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await globalAudioPlayerService.holdSongById(widget.itemId,
+          title: widget.itemName, days: days);
+    } catch (_) {
+      // Kept on this phone; the server hears next time.
+    }
+    messenger.showSnackBar(SnackBar(
+      content: Text(days == null
+          ? "Won't play \"${widget.itemName}\" again"
+          : 'Not playing "${widget.itemName}" for $days days'),
+      action: SnackBarAction(
+        label: 'Undo',
+        onPressed: () => globalAudioPlayerService.unholdSong(widget.itemId),
+      ),
+    ));
   }
 
   Future<void> _goToAlbum(BuildContext context) async {
@@ -1816,6 +1837,10 @@ class _MusicContextMenuState extends State<MusicContextMenu> {
             await _showScrobbleDialog(context);
           } else if (value == 'change_song_artist') {
             await _showChangeSongArtistDialog(context);
+          } else if (value == 'not_now' || value == 'never_play') {
+            await _holdSong(context, days: value == 'not_now' ? 30 : null);
+          } else if (value == 'play_again') {
+            await globalAudioPlayerService.unholdSong(widget.itemId);
           }
         },
         itemBuilder: (BuildContext context) {
@@ -1881,6 +1906,43 @@ class _MusicContextMenuState extends State<MusicContextMenu> {
                   ],
                 ),
               ),
+            // 👎 holds (songs): keep it out of queues for 30 days / for good,
+            // or lift a hold.
+            if (widget.itemType == 'song' &&
+                globalAudioPlayerService.isHeld(widget.itemId))
+              const PopupMenuItem<String>(
+                value: 'play_again',
+                child: Row(
+                  children: [
+                    Icon(Icons.thumb_up_alt_outlined, size: 20, color: Colors.grey),
+                    SizedBox(width: 12),
+                    Text('Play again (lift hold)'),
+                  ],
+                ),
+              ),
+            if (widget.itemType == 'song' &&
+                !globalAudioPlayerService.isHeld(widget.itemId)) ...[
+              const PopupMenuItem<String>(
+                value: 'not_now',
+                child: Row(
+                  children: [
+                    Icon(Icons.thumb_down_alt_outlined, size: 20, color: Colors.grey),
+                    SizedBox(width: 12),
+                    Text('Not now (30 days)'),
+                  ],
+                ),
+              ),
+              const PopupMenuItem<String>(
+                value: 'never_play',
+                child: Row(
+                  children: [
+                    Icon(Icons.block, size: 20, color: Colors.grey),
+                    SizedBox(width: 12),
+                    Text('Never play this'),
+                  ],
+                ),
+              ),
+            ],
             // Add to Playlist option (for songs and albums)
             if (widget.itemType == 'song' || widget.itemType == 'album')
               PopupMenuItem<String>(

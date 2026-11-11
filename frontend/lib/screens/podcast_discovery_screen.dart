@@ -508,6 +508,7 @@ class _PodcastDiscoveryScreenState extends State<PodcastDiscoveryScreen> {
                 ? CachedNetworkImage(
                     imageUrl: artwork,
                     width: 56,
+                    memCacheWidth: 112,
                     height: 56,
                     fit: BoxFit.cover,
                     errorWidget: (_, __, ___) => _podcastPlaceholder(56),

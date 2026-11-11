@@ -17,6 +17,11 @@ import '../widgets/hdcd_badge.dart';
 import '../widgets/surround_badge.dart';
 import '../widgets/music_context_menu.dart';
 import '../widgets/design_system.dart';
+import '../widgets/image_zoom.dart';
+import '../widgets/device_upload.dart';
+import 'youtube_download_screen.dart';
+import 'import_queue_screen.dart' show openImportDetail;
+import '../widgets/download_button.dart';
 
 class PlaylistDetailScreen extends StatefulWidget {
   final int playlistId;
@@ -449,14 +454,53 @@ class _PlaylistDetailScreenState extends State<PlaylistDetailScreen> {
           top: 24,
           left: 0,
           right: 0,
-          child: Center(child: artworkBlock),
+          child: Center(
+            child: albumIds.isEmpty
+                ? artworkBlock
+                : GestureDetector(
+                    onTap: () => _showMosaicZoom(albumIds),
+                    child: artworkBlock,
+                  ),
+          ),
         ),
       ],
     );
   }
 
+  /// Full-screen zoom of the header art: the single cover, or the 2x2
+  /// mosaic rebuilt at full size so each cover stays sharp when zoomed.
+  void _showMosaicZoom(List<int> albumIds) {
+    if (albumIds.length < 4) {
+      showImageZoom(context, imageUrl: _apiService.getArtworkUrl(albumIds.first));
+      return;
+    }
+    Widget cover(int id) => Expanded(
+          child: CachedNetworkImage(
+            imageUrl: _apiService.getArtworkUrl(id),
+            fit: BoxFit.cover,
+            memCacheWidth: 1200,
+            placeholder: (context, url) =>
+                Container(color: const Color(0xFF1a2332)),
+            errorWidget: (context, url, error) =>
+                Container(color: const Color(0xFF1a2332)),
+          ),
+        );
+    showImageZoom(
+      context,
+      child: AspectRatio(
+        aspectRatio: 1,
+        child: Column(
+          children: [
+            Expanded(child: Row(children: [cover(albumIds[0]), cover(albumIds[1])])),
+            Expanded(child: Row(children: [cover(albumIds[2]), cover(albumIds[3])])),
+          ],
+        ),
+      ),
+    );
+  }
+
   void _playSong(Song song, int index) {
-    _apiService.markPlaylistPlayed(widget.playlistId);
+    // (setQueue marks the playlist played now, for every way of starting it)
     widget.audioPlayerService.setQueue(
       _songs,
       index,
@@ -510,6 +554,7 @@ class _PlaylistDetailScreenState extends State<PlaylistDetailScreen> {
               child: CachedNetworkImage(
                 imageUrl: _apiService.getArtworkUrl(song.albumId),
                 width: 50,
+                memCacheWidth: 100,
                 height: 50,
                 fit: BoxFit.cover,
                 placeholder: (context, url) => Container(
@@ -1476,6 +1521,10 @@ class _PlaylistDetailScreenState extends State<PlaylistDetailScreen> {
                                   ),
                                 ],
                               ),
+                              DownloadButton(
+                                kind: 'playlist',
+                                id: widget.playlistId,
+                              ),
                               const SizedBox(height: 8),
                               Row(
                                 children: [
@@ -2262,6 +2311,10 @@ class _UnavailableTrackTileState extends State<_UnavailableTrackTile>
   late AnimationController _fadeController;
   String? _previewUrl;
   String? _artworkUrl;
+  // A preview paused the main player: resume it when the last preview ends.
+  // Static (shared by every tile) because starting a second preview cuts
+  // the first one off; whichever finishes last brings the music back.
+  static bool _pausedMain = false;
 
   @override
   void initState() {
@@ -2327,9 +2380,10 @@ class _UnavailableTrackTileState extends State<_UnavailableTrackTile>
     // Notify parent that this preview is starting
     widget.onPreviewStarted(_stopPreviewImmediate);
 
-    // Pause main player if playing
+    // Pause main player if playing (resumed when the preview ends)
     if (widget.mainAudioPlayer.isPlaying) {
       widget.mainAudioPlayer.togglePlayPause();
+      _pausedMain = true;
     }
 
     setState(() {
@@ -2430,6 +2484,10 @@ class _UnavailableTrackTileState extends State<_UnavailableTrackTile>
       _fadeController.reset();
       widget.onPreviewStopped();
     }
+    if (_pausedMain) {
+      _pausedMain = false;
+      widget.mainAudioPlayer.playExplicit();
+    }
 
     _isStopping = false;
   }
@@ -2442,6 +2500,8 @@ class _UnavailableTrackTileState extends State<_UnavailableTrackTile>
     _previewPlayer?.stop();
     _previewPlayer?.dispose();
     _previewPlayer = null;
+    // Music started on its own (you pressed play): nothing to resume later.
+    if (widget.mainAudioPlayer.isPlaying) _pausedMain = false;
 
     if (mounted) {
       setState(() {
@@ -2505,22 +2565,178 @@ class _UnavailableTrackTileState extends State<_UnavailableTrackTile>
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),
-      trailing: Row(
+      // One button for every way to get it (three small icons crowded the
+      // row and cut the title off on a phone).
+      trailing: IconButton(
+        icon: const Icon(Icons.add_circle_outline, color: Colors.orange),
+        tooltip: 'Get this song',
+        onPressed: _getThisSong,
+      ),
+    );
+  }
+
+  void _getThisSong() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1a2332),
+      builder: (ctx) {
+        Widget option(IconData icon, Color color, String title, String sub,
+                VoidCallback action) =>
+            ListTile(
+              leading: Icon(icon, color: color),
+              title: Text(title, style: const TextStyle(color: Colors.white)),
+              subtitle: Text(sub, style: const TextStyle(color: Colors.white38)),
+              onTap: () {
+                Navigator.pop(ctx);
+                action();
+              },
+            );
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+                child: Text(
+                  '"${widget.trackName}" · ${widget.artistName}',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.grey),
+                ),
+              ),
+              option(Icons.album, Colors.orange, 'Download the album',
+                  'Pick the release, then search Prowlarr', _showAlbumPicker),
+              option(Icons.smart_display, Colors.redAccent, 'Find on YouTube',
+                  'Grab just this song', _findOnYouTube),
+              option(Icons.upload_file, Colors.lightGreenAccent,
+                  'Add from this device', 'A file on your phone or PC',
+                  _addFromDevice),
+              option(Icons.link, const Color(0xFF00d4ff),
+                  "It's already in my library",
+                  'Link this slot to a library song', _showLinkDialog),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  /// YouTube, pre-searched for this track. Importing it there re-links this
+  /// slot on the server (_relink_after_import); refresh when back.
+  Future<void> _findOnYouTube() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => YouTubeDownloadScreen(
+          audioPlayerService: widget.mainAudioPlayer,
+          initialSearch:
+              '${_primaryArtist()} ${_cleanForSearch(widget.trackName)}',
+        ),
+      ),
+    );
+    if (mounted) widget.onSongLinked();
+  }
+
+  bool _resultsHaveThisTrack(List<Song> results) {
+    String norm(String s) =>
+        s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), ' ').trim();
+    final want = norm(_cleanForSearch(widget.trackName));
+    if (want.isEmpty) return true;
+    return results.any((s) {
+      final got = norm(s.title);
+      return got.isNotEmpty && (got.contains(want) || want.contains(got));
+    });
+  }
+
+  /// Shown in the link box when nothing in the library has this title, with
+  /// the ways to get it instead of just the nearest wrong matches.
+  Widget _notInLibraryBanner(BuildContext dialogContext) {
+    void then(VoidCallback action) {
+      Navigator.pop(dialogContext);
+      action();
+    }
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+      decoration: BoxDecoration(
+        color: Colors.orange.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          IconButton(
-            icon: const Icon(Icons.search, color: Colors.orange),
-            tooltip: 'Find album to download',
-            onPressed: _showAlbumPicker,
+          Text(
+            "\"${widget.trackName}\" doesn't seem to be in your library yet",
+            style: TextStyle(color: Colors.orange.shade200, fontSize: 13),
           ),
-          IconButton(
-            icon: const Icon(Icons.link, color: Color(0xFF00d4ff)),
-            tooltip: 'Link to library song',
-            onPressed: _showLinkDialog,
+          Wrap(
+            spacing: 4,
+            children: [
+              TextButton.icon(
+                icon: const Icon(Icons.album, size: 16),
+                label: const Text('Download'),
+                onPressed: () => then(_showAlbumPicker),
+              ),
+              TextButton.icon(
+                icon: const Icon(Icons.smart_display, size: 16),
+                label: const Text('YouTube'),
+                onPressed: () => then(_findOnYouTube),
+              ),
+              TextButton.icon(
+                icon: const Icon(Icons.upload_file, size: 16),
+                label: const Text('From device'),
+                onPressed: () => then(_addFromDevice),
+              ),
+            ],
           ),
         ],
       ),
     );
+  }
+
+  /// The missing track is on this device (phone, or a PC / network share):
+  /// upload it, import it, then link this playlist slot to it (by itself
+  /// when exactly one library song has that title, else the link box).
+  Future<void> _addFromDevice() async {
+    final album =
+        widget.albumName.isNotEmpty ? widget.albumName : widget.trackName;
+    final item = await pickAndUploadForImport(
+      context,
+      folderName: '${_primaryArtist()} - $album',
+      what: '"${widget.trackName}"',
+    );
+    if (item == null || !mounted) return;
+    var imported = false;
+    await openImportDetail(
+      context,
+      item: item,
+      artist: _primaryArtist(),
+      album: album,
+      audioPlayerService: widget.mainAudioPlayer,
+      onImportComplete: () => imported = true,
+    );
+    if (!imported || !mounted) return;
+    try {
+      final r = await _apiService.searchLibrarySong(
+        '${widget.trackName} ${widget.artistName}',
+        artist: widget.artistName,
+      );
+      final songs = ((r['songs'] as List?) ?? [])
+          .map((j) => Song.fromJson(j))
+          .toList();
+      String norm(String s) =>
+          s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), ' ').trim();
+      final exact =
+          songs.where((s) => norm(s.title) == norm(widget.trackName)).toList();
+      if (exact.length == 1) {
+        await _linkSong(exact.first);
+        return;
+      }
+    } catch (_) {}
+    if (mounted) await _showLinkDialog();
   }
 
   /// Primary artist only — drops "& João Gilberto", "feat. X" etc. that
@@ -2551,7 +2767,10 @@ class _UnavailableTrackTileState extends State<_UnavailableTrackTile>
           initialQuery: query,
         ),
       ),
-    );
+    ).then((_) {
+      // An import re-links missing slots on the server; show it.
+      if (mounted) widget.onSongLinked();
+    });
   }
 
   /// Open a picker listing the albums this track appears on (with type tags),
@@ -2635,12 +2854,19 @@ class _UnavailableTrackTileState extends State<_UnavailableTrackTile>
               ),
               content: SizedBox(
                 width: 500,
-                height: 400,
+                // Fit what's left of the screen: a fixed 400 got crushed to a
+                // sliver when the keyboard came up (Nov 9).
+                height: (MediaQuery.of(context).size.height -
+                        MediaQuery.of(context).viewInsets.bottom -
+                        260)
+                    .clamp(180.0, 400.0),
                 child: Column(
                   children: [
                     TextField(
                       controller: searchController,
-                      autofocus: true,
+                      // Prefilled from the missing track and already searched:
+                      // no keyboard until you tap the field.
+                      autofocus: false,
                       decoration: InputDecoration(
                         hintText: 'Search your library...',
                         prefixIcon: const Icon(
@@ -2708,6 +2934,10 @@ class _UnavailableTrackTileState extends State<_UnavailableTrackTile>
                       },
                     ),
                     const SizedBox(height: 16),
+                    if (!isSearching &&
+                        searchQuery.length >= 2 &&
+                        !_resultsHaveThisTrack(searchResults))
+                      _notInLibraryBanner(context),
                     Expanded(
                       child: isSearching
                           ? const Center(child: CircularProgressIndicator())

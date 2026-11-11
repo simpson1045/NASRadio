@@ -16,6 +16,7 @@ class SongRecognitionResult {
   final String? genre;
   final String? coverUrl;
   final String? year; // release year from Shazam, e.g. "1977"
+  final bool shazamWasDown; // AcoustID answered because Shazam didn't
 
   SongRecognitionResult({
     required this.title,
@@ -25,10 +26,28 @@ class SongRecognitionResult {
     this.genre,
     this.coverUrl,
     this.year,
+    this.shazamWasDown = false,
   });
 
   String get prowlarrQuery => '$artist $album';
 }
+
+/// Why a recognition try failed, so the sheet can tell "Shazam heard it but
+/// doesn't know it" apart from "Shazam is broken" and "server unreachable".
+enum RecognitionFailure { noMatch, shazamDown, serverUnreachable, other }
+
+class RecognitionException implements Exception {
+  final RecognitionFailure kind;
+  final String message;
+  final String? detail; // e.g. "Shazam didn't answer within 12 s"
+  RecognitionException(this.kind, this.message, {this.detail});
+
+  @override
+  String toString() => message;
+}
+
+/// Live state of one identify try, for the status line under the timer.
+enum AttemptState { checking, noMatch, shazamDown, serverUnreachable }
 
 class SongRecognitionService {
   static const int _sampleRate = 16000;
@@ -183,19 +202,41 @@ class SongRecognitionService {
 
     // Route through appHttpClient so the auth bearer token is attached —
     // MultipartRequest.send() uses its own tokenless client and gets 401'd
-    // by the API auth gate.
-    final streamedResponse = await appHttpClient
-        .send(request)
-        .timeout(const Duration(seconds: 30));
-    final response = await http.Response.fromStream(streamedResponse);
+    // by the API auth gate. The backend gives Shazam 12 s, then AcoustID, so
+    // 20 s without an answer means the server itself is the problem.
+    final http.Response response;
+    try {
+      final streamedResponse = await appHttpClient
+          .send(request)
+          .timeout(const Duration(seconds: 20));
+      response = await http.Response.fromStream(streamedResponse);
+    } on TimeoutException {
+      throw RecognitionException(RecognitionFailure.serverUnreachable,
+          "Your NASRadio server didn't answer in time.");
+    } on SocketException {
+      throw RecognitionException(RecognitionFailure.serverUnreachable,
+          "Can't reach your NASRadio server.");
+    } on http.ClientException {
+      throw RecognitionException(RecognitionFailure.serverUnreachable,
+          "Can't reach your NASRadio server.");
+    }
 
     if (response.statusCode == 404) {
-      final data = json.decode(response.body);
-      throw Exception(data['error'] ?? 'No match found');
+      Map<String, dynamic> data = const {};
+      try {
+        data = json.decode(response.body) as Map<String, dynamic>;
+      } catch (_) {}
+      final down = data['shazam'] == 'down';
+      final detail = data['shazam_detail'] as String?;
+      throw RecognitionException(
+        down ? RecognitionFailure.shazamDown : RecognitionFailure.noMatch,
+        data['error'] as String? ?? 'No match found',
+        detail: detail != null && detail.isNotEmpty ? detail : null,
+      );
     }
 
     if (response.statusCode != 200) {
-      throw Exception('Server error: ${response.statusCode}');
+      throw RecognitionException(RecognitionFailure.other, 'Server error: ${response.statusCode}');
     }
 
     final data = json.decode(response.body);
@@ -208,6 +249,7 @@ class SongRecognitionService {
       genre: data['genre'],
       coverUrl: data['cover_url'],
       year: (data['year'] as String?)?.trim().isNotEmpty == true ? data['year'] as String : null,
+      shazamWasDown: data['shazam'] == 'down',
     );
   }
 
@@ -217,13 +259,20 @@ class SongRecognitionService {
   /// going meanwhile, so an early miss costs nothing: a loud chorus matches
   /// in a few seconds, a noisy passage just takes longer. Every 2 s stays
   /// polite to Shazam's unofficial API.
+  ///
+  /// [onAttempt] reports each try as it happens (checking, no match yet,
+  /// Shazam down, server unreachable). Two "Shazam down" or two "server
+  /// unreachable" answers in a row end the listen early with that error:
+  /// another 15 s of listening can't fix either.
   Future<SongRecognitionResult> recordAndIdentify({
     void Function(int secondsElapsed, int maxSeconds)? onProgress,
     void Function(String status)? onStatus,
+    void Function(int attempt, AttemptState state, String? detail)? onAttempt,
   }) async {
     const firstTry = 3;
     const gap = 2;
     const maxSeconds = 20;
+    const giveUpAfter = 2;
 
     await _startListening();
     final clock = Stopwatch()..start();
@@ -236,6 +285,9 @@ class SongRecognitionService {
     onStatus?.call('Listening...');
 
     Object? lastError;
+    var attempt = 0;
+    var downInARow = 0;
+    var unreachableInARow = 0;
     try {
       var nextTry = firstTry;
       while (true) {
@@ -244,10 +296,31 @@ class SongRecognitionService {
           if (!_isRecording) throw Exception('Cancelled');
         }
         final startedAt = secs();
+        attempt++;
+        onAttempt?.call(attempt, AttemptState.checking, null);
         try {
           return await _identifyBytes(_wav(_pcm.toBytes()));
+        } on RecognitionException catch (e) {
+          lastError = e;
+          switch (e.kind) {
+            case RecognitionFailure.shazamDown:
+              downInARow++;
+              unreachableInARow = 0;
+              onAttempt?.call(attempt, AttemptState.shazamDown, e.detail);
+            case RecognitionFailure.serverUnreachable:
+              unreachableInARow++;
+              downInARow = 0;
+              onAttempt?.call(attempt, AttemptState.serverUnreachable, e.message);
+            case RecognitionFailure.noMatch:
+            case RecognitionFailure.other:
+              downInARow = 0;
+              unreachableInARow = 0;
+              onAttempt?.call(attempt, AttemptState.noMatch, null);
+          }
+          if (downInARow >= giveUpAfter || unreachableInARow >= giveUpAfter) break;
         } catch (e) {
           lastError = e;
+          onAttempt?.call(attempt, AttemptState.noMatch, null);
         }
         if (!_isRecording) throw Exception('Cancelled');
         if (startedAt >= maxSeconds) break;

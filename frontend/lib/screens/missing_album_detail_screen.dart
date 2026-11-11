@@ -1,3 +1,4 @@
+import '../widgets/editions_row.dart';
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:math' as math;
@@ -5,6 +6,7 @@ import 'package:audioplayers/audioplayers.dart';
 import '../services/api_service.dart';
 import '../services/audio_player_service.dart';
 import '../widgets/mouse_back_button_wrapper.dart';
+import '../widgets/image_zoom.dart';
 
 class MissingAlbumDetailScreen extends StatefulWidget {
   final String artist;
@@ -46,12 +48,9 @@ class _MissingAlbumDetailScreenState extends State<MissingAlbumDetailScreen> {
   }
 
   void _onMainPlayerChanged() {
-    // If main player starts playing, stop any preview
-    print(
-      'DEBUG: _onMainPlayerChanged - isPlaying=${widget.audioPlayerService.isPlaying}, _currentlyPlayingIndex=$_currentlyPlayingIndex',
-    );
+    // If main player starts playing, stop any preview. (No print here: it
+    // ran on every 250 ms player tick while this page was open.)
     if (widget.audioPlayerService.isPlaying && _currentlyPlayingIndex != null) {
-      print('DEBUG: Stopping all previews');
       _stopAllPreviews();
     }
   }
@@ -672,17 +671,26 @@ class _MissingAlbumDetailScreenState extends State<MissingAlbumDetailScreen> {
                       color: Color(0xFF1DB954),
                     ),
                   ),
-                // Gradient overlay
-                Container(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                      colors: [
-                        Colors.transparent,
-                        const Color(0xFF0d1b2a).withOpacity(0.8),
-                        const Color(0xFF0d1b2a),
-                      ],
+                // Gradient overlay (on top of the cover, so it takes the
+                // tap that opens the full-screen zoom)
+                GestureDetector(
+                  onTap: _albumData?['artwork_url'] != null
+                      ? () => showImageZoom(
+                            context,
+                            imageUrl: _albumData!['artwork_url'] as String,
+                          )
+                      : null,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [
+                          Colors.transparent,
+                          const Color(0xFF0d1b2a).withOpacity(0.8),
+                          const Color(0xFF0d1b2a),
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -744,6 +752,19 @@ class _MissingAlbumDetailScreenState extends State<MissingAlbumDetailScreen> {
                   ),
                 ),
               ],
+            ),
+          ),
+        ),
+
+        // Every edition on MusicBrainz (Atmos, 5.1, SACD...), so you can pick
+        // which one to go after.
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+            child: EditionsRow(
+              artist: widget.artist,
+              album: widget.albumName,
+              audioPlayerService: widget.audioPlayerService,
             ),
           ),
         ),

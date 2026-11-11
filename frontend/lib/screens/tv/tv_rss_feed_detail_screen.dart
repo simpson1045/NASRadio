@@ -385,6 +385,7 @@ class _TvEpisodeRow extends StatelessWidget {
                 child: CachedNetworkImage(
                   imageUrl: artUrl,
                   width: 56,
+                  memCacheWidth: 112,
                   height: 56,
                   fit: BoxFit.cover,
                   placeholder: (_, __) => Container(

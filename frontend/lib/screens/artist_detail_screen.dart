@@ -15,8 +15,10 @@ import 'album_detail_screen.dart';
 import 'now_playing_screen.dart';
 import '../widgets/favorite_button.dart';
 import '../widgets/music_context_menu.dart';
+import '../widgets/image_zoom.dart';
 import '../widgets/mouse_back_button_wrapper.dart';
 import '../widgets/breadcrumb_bar.dart';
+import '../widgets/edition_badge.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:palette_generator/palette_generator.dart';
 import 'prowlarr_search_screen.dart';
@@ -398,6 +400,7 @@ class _ArtistDetailScreenState extends State<ArtistDetailScreen> {
           child: CachedNetworkImage(
             imageUrl: entry['cover_url'] ?? '',
             width: 50,
+            memCacheWidth: 100,
             height: 50,
             fit: BoxFit.cover,
             placeholder: (context, url) => Container(
@@ -773,6 +776,7 @@ class _ArtistDetailScreenState extends State<ArtistDetailScreen> {
                                 child: CachedNetworkImage(
                                   imageUrl: _apiService.getArtworkUrl(album.id),
                                   width: 50,
+                                  memCacheWidth: 100,
                                   height: 50,
                                   fit: BoxFit.cover,
                                   placeholder: (context, url) => Container(
@@ -798,8 +802,13 @@ class _ArtistDetailScreenState extends State<ArtistDetailScreen> {
                     title: Text(album.title),
                     selected: isSelected,
                     selectedTileColor: const Color(0xFF00d4ff).withOpacity(0.1),
-                    subtitle: Text(
-                      '${album.year ?? "Unknown"} • ${album.songCount} songs',
+                    subtitle: EditionBadge.after(
+                      album: album,
+                      text: Text(
+                        '${album.year ?? "Unknown"} • ${album.songCount} songs',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
                     ),
                     trailing: !_isMobile
                         ? PopupMenuButton<String>(
@@ -1041,71 +1050,7 @@ class _ArtistDetailScreenState extends State<ArtistDetailScreen> {
   }
 
   void _showFullScreenImage(String imageUrl) {
-    showDialog(
-      context: context,
-      builder: (context) => Dialog(
-        backgroundColor: Colors.transparent,
-        insetPadding: EdgeInsets.zero,
-        // Tap-to-dismiss + d-pad-center-to-dismiss for Fire TV. Without
-        // FocusableActionDetector(autofocus: true), the remote has no way
-        // to close this fullscreen overlay since there's no other
-        // focusable widget inside it.
-        child: FocusableActionDetector(
-          autofocus: true,
-          actions: <Type, Action<Intent>>{
-            ActivateIntent: CallbackAction<ActivateIntent>(
-              onInvoke: (_) {
-                Navigator.of(context).pop();
-                return null;
-              },
-            ),
-          },
-          child: GestureDetector(
-            onTap: () => Navigator.of(context).pop(),
-            child: Container(
-              color: Colors.black.withOpacity(0.9),
-              width: double.infinity,
-              height: double.infinity,
-              child: Stack(
-                children: [
-                  Center(
-                    child: InteractiveViewer(
-                      minScale: 0.5,
-                      maxScale: 4.0,
-                      child: CachedNetworkImage(
-                        imageUrl: imageUrl,
-                        fit: BoxFit.contain,
-                        placeholder: (context, url) =>
-                            const CircularProgressIndicator(
-                          color: Color(0xFF00d4ff),
-                        ),
-                        errorWidget: (context, url, error) => const Icon(
-                          Icons.broken_image,
-                          color: Colors.grey,
-                          size: 64,
-                        ),
-                      ),
-                    ),
-                  ),
-                  Positioned(
-                    top: 40,
-                    right: 16,
-                    child: IconButton(
-                      icon: const Icon(
-                        Icons.close,
-                        color: Colors.white,
-                        size: 30,
-                      ),
-                      onPressed: () => Navigator.of(context).pop(),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
+    showImageZoom(context, imageUrl: imageUrl);
   }
 
   Widget _buildContent() {
@@ -1592,9 +1537,26 @@ class _ArtistDetailScreenState extends State<ArtistDetailScreen> {
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
-                        subtitle: Text(
-                          '${track['play_count']} plays',
-                          style: const TextStyle(color: Colors.grey),
+                        // Same shape as the Global tab: album, then the count.
+                        subtitle: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if ((track['album_title'] ?? '').isNotEmpty)
+                              Text(
+                                track['album_title'],
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(color: Colors.grey),
+                              ),
+                            Text(
+                              '${track['play_count']} plays',
+                              style: const TextStyle(
+                                color: Colors.grey,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
                         ),
                         trailing: _isMobile
                             ? MusicContextMenu(
@@ -1992,6 +1954,7 @@ class _ArtistDetailScreenState extends State<ArtistDetailScreen> {
                   child: CachedNetworkImage(
                     imageUrl: _apiService.getArtworkUrl(song.albumId),
                     width: 50,
+                    memCacheWidth: 100,
                     height: 50,
                     fit: BoxFit.cover,
                     placeholder: (context, url) => Container(
@@ -2084,7 +2047,7 @@ class _PopularityBar extends StatelessWidget {
         ? _formatCount(playcount!)
         : score.toStringAsFixed(1);
 
-    return Row(
+    final bar = Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         // 10 bar segments
@@ -2126,12 +2089,25 @@ class _PopularityBar extends StatelessWidget {
             fontWeight: FontWeight.w600,
           ),
         ),
-        if (suffix != null) ...[
-          Text(
-            ' • $suffix',
-            style: const TextStyle(color: Colors.grey, fontSize: 12),
-          ),
-        ],
+      ],
+    );
+
+    // The suffix (album name, or "Not in library") gets its own line under
+    // the track title. It used to trail the bar, where a long album name ran
+    // under the tile's ⋮ button and off the screen edge.
+    if (suffix == null || suffix!.isEmpty) return bar;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          suffix!,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(color: Colors.grey, fontSize: 13),
+        ),
+        const SizedBox(height: 4),
+        bar,
       ],
     );
   }

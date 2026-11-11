@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
+import 'dart:async';
 import 'dart:io';
 import '../models/album.dart';
 import '../models/song.dart';
 import '../services/api_service.dart';
 import '../services/audio_player_service.dart';
 import 'now_playing_screen.dart';
+import 'album_images_screen.dart';
 import 'artist_detail_screen.dart';
 import '../widgets/music_context_menu.dart';
 import '../widgets/favorite_button.dart';
@@ -15,6 +17,10 @@ import '../widgets/explicit_badge.dart';
 import '../widgets/hdcd_badge.dart';
 import '../widgets/surround_badge.dart';
 import '../widgets/design_system.dart';
+import '../widgets/image_zoom.dart';
+import '../layout_context.dart';
+import '../widgets/download_button.dart';
+import '../widgets/editions_row.dart';
 
 class AlbumDetailScreen extends StatefulWidget {
   final int albumId;
@@ -43,6 +49,18 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
   List<Song> _songs = [];
   // Sibling editions of this album's group (empty = ungrouped).
   List<Map<String, dynamic>> _editions = [];
+  // The edition on screen. Starts as widget.albumId; edition chips swap it
+  // IN PLACE (no new route), so every per-album call reads this instead.
+  late int _albumId;
+  // Edition group (null = ungrouped): its title and original year head the
+  // page whichever edition is showing.
+  int? _groupId;
+  String? _groupTitle;
+  int? _groupYear;
+  // True while a chip-picked edition loads; dims the tracklist.
+  bool _swappingEdition = false;
+  // Images/booklets in the album folder (scans, back cover, photos).
+  List<Map<String, dynamic>> _albumImages = [];
   Map<int, String> _discNames = {};
   bool _isLoading = true;
   String? _error;
@@ -62,10 +80,18 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
   @override
   void initState() {
     super.initState();
+    _albumId = widget.albumId;
     _loadAlbum();
 
-    // Listen for player state changes to update highlighting
+    // Listen for player state changes to update highlighting: only when the
+    // song or play state changes. This page stays mounted under other pages
+    // and below Now Playing, and used to rebuild whole on every 250 ms tick.
+    Object? shownState;
     _playerListener = () {
+      final s = widget.audioPlayerService;
+      final shown = (s.currentSong?.id, s.isPlaying, s.isLoading);
+      if (shown == shownState) return;
+      shownState = shown;
       if (mounted) setState(() {});
     };
     widget.audioPlayerService.addListener(_playerListener!);
@@ -142,9 +168,11 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
   }
 
   /// Edition picker chip (ALBUM_EDITIONS_SPEC.md §4) — one chip per
-  /// sibling edition in this album's group; tapping swaps the page.
+  /// sibling edition in this album's group. The label is the edition
+  /// ("2025 Remaster"), the icon its format (stereo vs surround/Atmos).
+  /// Tapping swaps the edition in place.
   Widget _editionChip(Map<String, dynamic> e) {
-    final isCurrent = e['id'] == widget.albumId;
+    final isCurrent = e['id'] == _albumId;
     final label =
         (e['edition_label'] as String?) ??
         ((e['has_atmos'] == 1)
@@ -153,19 +181,7 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
     final spatial = e['has_atmos'] == 1 || (e['max_channels'] ?? 2) > 2;
     return InkWell(
       borderRadius: BorderRadius.circular(16),
-      onTap: isCurrent
-          ? null
-          : () {
-              Navigator.of(context).pushReplacement(
-                MaterialPageRoute(
-                  builder: (context) => AlbumDetailScreen(
-                    albumId: e['id'] as int,
-                    audioPlayerService: widget.audioPlayerService,
-                    parentLabel: widget.parentLabel,
-                  ),
-                ),
-              );
-            },
+      onTap: isCurrent ? null : () => _switchEdition(e['id'] as int),
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
         decoration: BoxDecoration(
@@ -202,30 +218,131 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
     );
   }
 
-  Future<void> _loadAlbum() async {
-    // Clear image cache to force reload of artwork
-    imageCache.clear();
-    imageCache.clearLiveImages();
-    _artworkCacheKey = DateTime.now().millisecondsSinceEpoch;
+  /// Chip tap: swap this page to another edition IN PLACE (no new route,
+  /// so Back still returns to wherever the user came from) and remember the
+  /// pick so the group's card opens to it next time.
+  void _switchEdition(int albumId) {
+    if (albumId == _albumId) return;
+    setState(() {
+      _albumId = albumId;
+      _swappingEdition = true;
+      _isSelectMode = false;
+      _selectedSongIds.clear();
+    });
+    _loadAlbum(editionSwap: true);
+    final groupId = _groupId;
+    if (groupId != null) {
+      _apiService.setPreferredEdition(groupId, albumId).catchError((_) {});
+    }
+  }
+
+  // The album's name: the group title for an edition group (the edition
+  // itself is named by the selected chip), else the album's own title.
+  String get _displayTitle => (_groupTitle ?? _album?.title ?? '').trim();
+
+  // "1985", or "1985 · 2025 edition" when the edition on screen came out
+  // later than the album itself.
+  String get _yearLabel {
+    final editionYear = (_album?.year ?? 0) > 0 ? _album!.year : null;
+    final albumYear = _groupYear ?? editionYear;
+    if (albumYear == null) return 'Unknown year';
+    if (editionYear != null && editionYear != albumYear) {
+      return '$albumYear · $editionYear edition';
+    }
+    return '$albumYear';
+  }
+
+  // Long titles step down a size and wrap (up to 3 lines) instead of
+  // being cut off after 2.
+  TextStyle get _titleStyle {
+    final n = _displayTitle.length;
+    return TextStyle(
+      fontSize: n <= 22 ? 34 : (n <= 40 ? 28 : 24),
+      fontWeight: FontWeight.w800,
+      color: Colors.white,
+      letterSpacing: -0.5,
+      height: 1.05,
+    );
+  }
+
+  // Height of the hero's bottom info band (category label, title row,
+  // artist, meta strip, edition chips), measured rather than guessed so the
+  // hero always has room for it below the cover. A fixed allowance let a
+  // two-line title + chips ride up over the bottom of the cover.
+  double _heroInfoHeight(double bandWidth) {
+    final scaler = MediaQuery.textScalerOf(context);
+    final title = TextPainter(
+      text: TextSpan(text: _displayTitle, style: _titleStyle),
+      maxLines: 3,
+      textDirection: TextDirection.ltr,
+      textScaler: scaler,
+    )..layout(maxWidth: (bandWidth - 96).clamp(120.0, double.infinity));
+    // The title row is at least as tall as the favorite / menu buttons.
+    final titleRow = title.height < 48 ? 48.0 : title.height;
+    var h = scaler.scale(16) + 6 + titleRow + 10 + scaler.scale(24) + 8 +
+        scaler.scale(24) + 16;
+    if (_editions.length > 1) h += 10 + 30;
+    return h + 8;
+  }
+
+  Future<void> _loadAlbum({bool editionSwap = false}) async {
+    // A full (re)load clears the image cache to force fresh artwork. An
+    // edition swap keeps it and precaches the new cover below instead, so
+    // the hero never flashes blank mid-swap.
+    if (!editionSwap) {
+      imageCache.clear();
+      imageCache.clearLiveImages();
+      _artworkCacheKey = DateTime.now().millisecondsSinceEpoch;
+    }
+    final requestedId = _albumId;
 
     try {
-      final data = await _apiService.getAlbum(widget.albumId);
+      final data = await _apiService.getAlbum(requestedId);
+      final art = data['artwork_path'] as String?;
+      if (editionSwap && mounted && art != null && art.isNotEmpty) {
+        try {
+          await precacheImage(
+            CachedNetworkImageProvider(
+              _apiService.getArtworkUrl(
+                requestedId,
+                cacheBuster: _artworkCacheKey,
+              ),
+            ),
+            context,
+          );
+        } catch (_) {}
+      }
 
       // setState-after-dispose guard: see favorite_button.dart for the
       // pattern. Caught a 2026-05-23 crash. The await above can outlive
-      // the widget if the user navigates away mid-fetch.
-      if (!mounted) return;
+      // the widget if the user navigates away mid-fetch. A newer chip tap
+      // also supersedes this load.
+      if (!mounted || requestedId != _albumId) return;
       setState(() {
         _album = Album.fromJson(data);
         _editions = List<Map<String, dynamic>>.from(
           data['editions'] ?? const [],
         );
+        _groupId = data['group_id'] as int?;
+        _groupTitle = data['group_title'] as String?;
+        _groupYear = data['group_year'] as int?;
+        _swappingEdition = false;
 
         // Manually add artist_name and album_title to each song
         final songsData = data['songs'] as List;
         _songs = songsData.map((json) {
-          json['artist_name'] = data['artist_name'];
-          json['album_title'] = data['title'];
+          if (json['linked'] == true) {
+            // Album reference: the song lives on another album. Keep its
+            // home album + real artist (that's the file that plays).
+            final artists = json['artists'] as List?;
+            json['artist_name'] = (artists != null && artists.isNotEmpty)
+                ? artists.first['name']
+                : data['artist_name'];
+            json['album_title'] = json['home_album_title'] ?? data['title'];
+          } else {
+            json['artist_name'] = data['artist_name'];
+            json['album_title'] = data['title'];
+          }
           return Song.fromJson(json);
         }).toList();
 
@@ -241,6 +358,9 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
 
         _isLoading = false;
       });
+      _apiService.getAlbumImages(_albumId).then((imgs) {
+        if (mounted) setState(() => _albumImages = imgs);
+      }).catchError((_) {});
       // Kick off dominant color extraction in the background — drives
       // the GradientBackdrop on the hero. Not awaited; the UI renders
       // immediately with a neutral fallback and re-paints when the
@@ -248,6 +368,17 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
       _extractAlbumDominantColor();
     } catch (e) {
       if (!mounted) return;
+      if (editionSwap && _album != null) {
+        // Keep showing the edition we had; just say the swap failed.
+        setState(() {
+          _albumId = _album!.id;
+          _swappingEdition = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Couldn't load that edition")),
+        );
+        return;
+      }
       setState(() {
         _error = e.toString();
         _isLoading = false;
@@ -274,7 +405,7 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
       _songs,
       randomIndex,
       sourceType: 'album',
-      sourceId: widget.albumId,
+      sourceId: _albumId,
       sourceName: _album?.title,
     );
     if (!widget.audioPlayerService.isShuffled) {
@@ -299,7 +430,7 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
       _songs,
       0,
       sourceType: 'album',
-      sourceId: widget.albumId,
+      sourceId: _albumId,
       sourceName: _album?.title,
     );
 
@@ -340,7 +471,7 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
     if (confirmed != true) return;
 
     try {
-      await _apiService.splitBoxSet(widget.albumId);
+      await _apiService.splitBoxSet(_albumId);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -367,7 +498,7 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
       _songs,
       index,
       sourceType: 'album',
-      sourceId: widget.albumId,
+      sourceId: _albumId,
       sourceName: _album?.title,
     );
     NowPlayingScreen.open(
@@ -682,7 +813,7 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
 
     try {
       await _apiService.renumberDiscTracks(
-        widget.albumId,
+        _albumId,
         discNumber,
         startNumber,
       );
@@ -704,6 +835,229 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
           SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
         );
       }
+    }
+  }
+
+  // ── Album references ────────────────────────────────────────────────
+  void _openHomeAlbum(Song song) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => AlbumDetailScreen(
+          albumId: song.albumId,
+          audioPlayerService: widget.audioPlayerService,
+          parentLabel: _album?.title,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showLinkedSongMenu(Song song) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: const Color(0xFF1b2838),
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.album, color: Color(0xFF00d4ff)),
+              title: const Text('Go to home album',
+                  style: TextStyle(color: Colors.white)),
+              subtitle: Text(song.homeAlbumTitle ?? '',
+                  style: const TextStyle(color: Colors.grey)),
+              onTap: () => Navigator.pop(context, 'home'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.link_off, color: Colors.redAccent),
+              title: const Text('Unlink from this album',
+                  style: TextStyle(color: Colors.white)),
+              subtitle: const Text(
+                  'The song stays on its home album',
+                  style: TextStyle(color: Colors.grey)),
+              onTap: () => Navigator.pop(context, 'unlink'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || action == null) return;
+    if (action == 'home') {
+      _openHomeAlbum(song);
+      return;
+    }
+    try {
+      await _apiService.unlinkAlbumTrack(_albumId, song.id);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Unlinked "${song.title}"')),
+      );
+      _loadAlbum();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Unlink failed: $e')),
+      );
+    }
+  }
+
+  /// First empty track slot on a disc (1, 2, … or one past the end).
+  int _firstFreeTrack(int discNumber) {
+    final used = _songs
+        .where((s) => s.discNumber == discNumber)
+        .map((s) => s.trackNumber)
+        .toSet();
+    var n = 1;
+    while (used.contains(n)) {
+      n++;
+    }
+    return n;
+  }
+
+  Future<void> _showLinkTrackDialog(int discNumber) async {
+    final searchCtrl = TextEditingController();
+    final trackCtrl =
+        TextEditingController(text: '${_firstFreeTrack(discNumber)}');
+    List<Map<String, dynamic>> results = [];
+    Map<String, dynamic>? picked;
+    bool searching = false;
+    Timer? debounce;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialog) {
+          Future<void> runSearch(String q) async {
+            if (q.trim().length < 2) {
+              setDialog(() => results = []);
+              return;
+            }
+            setDialog(() => searching = true);
+            try {
+              final data = await _apiService.search(q.trim());
+              final songs = (data['songs'] as List? ?? const [])
+                  .cast<Map<String, dynamic>>()
+                  .where((m) => m['album_id'] != _albumId)
+                  .take(25)
+                  .toList();
+              setDialog(() => results = songs);
+            } catch (_) {
+              setDialog(() => results = []);
+            } finally {
+              setDialog(() => searching = false);
+            }
+          }
+
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1b2838),
+            title: Text('Link a track to Disc $discNumber',
+                style: const TextStyle(color: Colors.white)),
+            content: SizedBox(
+              width: 420,
+              height: 380,
+              child: Column(
+                children: [
+                  TextField(
+                    controller: searchCtrl,
+                    autofocus: true,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: const InputDecoration(
+                      hintText: 'Search your library…',
+                      hintStyle: TextStyle(color: Colors.grey),
+                      prefixIcon: Icon(Icons.search, color: Colors.grey),
+                    ),
+                    onChanged: (q) {
+                      debounce?.cancel();
+                      debounce = Timer(const Duration(milliseconds: 350),
+                          () => runSearch(q));
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: searching
+                        ? const Center(child: CircularProgressIndicator())
+                        : ListView.builder(
+                            itemCount: results.length,
+                            itemBuilder: (context, i) {
+                              final m = results[i];
+                              final sel = picked?['id'] == m['id'];
+                              return ListTile(
+                                dense: true,
+                                selected: sel,
+                                selectedTileColor: const Color(0xFF00d4ff)
+                                    .withOpacity(0.15),
+                                title: Text(m['title']?.toString() ?? '',
+                                    style: const TextStyle(color: Colors.white),
+                                    overflow: TextOverflow.ellipsis),
+                                subtitle: Text(
+                                  '${m['artist_name'] ?? ''} · ${m['album_title'] ?? m['album'] ?? ''}',
+                                  style: const TextStyle(color: Colors.grey),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                onTap: () => setDialog(() => picked = m),
+                              );
+                            },
+                          ),
+                  ),
+                  Row(
+                    children: [
+                      const Text('Track #',
+                          style: TextStyle(color: Colors.grey)),
+                      const SizedBox(width: 12),
+                      SizedBox(
+                        width: 64,
+                        child: TextField(
+                          controller: trackCtrl,
+                          keyboardType: TextInputType.number,
+                          style: const TextStyle(color: Colors.white),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: picked == null
+                    ? null
+                    : () => Navigator.pop(context, true),
+                child: const Text('Link'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    debounce?.cancel();
+    final track = int.tryParse(trackCtrl.text.trim());
+    if (ok != true || picked == null || !mounted) return;
+    if (track == null || track < 1) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Track number must be 1 or more')),
+      );
+      return;
+    }
+    try {
+      await _apiService.linkAlbumTrack(
+        _albumId,
+        picked!['id'] as int,
+        trackNumber: track,
+        discNumber: discNumber,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Linked "${picked!['title']}" as track $track')),
+      );
+      _loadAlbum();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Link failed: $e')),
+      );
     }
   }
 
@@ -769,11 +1123,22 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
     if (result == null) return;
 
     try {
-      await _apiService.editSong(
-        song.id,
-        trackNumber: result['track'],
-        discNumber: result['disc'],
-      );
+      if (song.linked) {
+        // Linked song: move its slot on THIS album. editSong would rewrite
+        // its real track number on its home album.
+        await _apiService.linkAlbumTrack(
+          _albumId,
+          song.id,
+          trackNumber: result['track']!,
+          discNumber: result['disc'] ?? 1,
+        );
+      } else {
+        await _apiService.editSong(
+          song.id,
+          trackNumber: result['track'],
+          discNumber: result['disc'],
+        );
+      }
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1039,8 +1404,9 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
     return FloatingActionButton.small(
       onPressed: () {
         // Calculate approximate scroll position
-        // Header is ~350px, action buttons ~150px, each song row ~56px
-        final headerHeight = 350.0 + 150.0;
+        // Header is ~350px, action buttons ~150px, each song row ~56px.
+        // Desktop's tracklist scrolls on its own, with nothing above it.
+        final headerHeight = _desktopLayout ? 0.0 : 350.0 + 150.0;
         final songHeight = 56.0;
         final targetOffset =
             headerHeight + (currentSongIndex * songHeight) - 100;
@@ -1056,7 +1422,781 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
     );
   }
 
+  // Album cover with its glow: the cover casts its own dominant color,
+  // plus a plain drop shadow so it lifts off the gradient.
+  Widget _buildCover(double coverSize) {
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(14),
+        boxShadow: [
+          BoxShadow(
+            color: (_dominantColor ?? const Color(0xFF00d4ff))
+                .withOpacity(0.55),
+            blurRadius: 48,
+            spreadRadius: 2,
+            offset: const Offset(0, 18),
+          ),
+          BoxShadow(
+            color: Colors.black.withOpacity(0.5),
+            blurRadius: 24,
+            offset: const Offset(0, 10),
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(14),
+        child: SizedBox(
+          width: coverSize,
+          height: coverSize,
+          child:
+              _album!.artworkPath != null &&
+                  _album!.artworkPath!.isNotEmpty
+              ? GestureDetector(
+                  onTap: () => showImageZoom(
+                    context,
+                    imageUrl: _apiService.getArtworkUrl(
+                      _album!.id,
+                      cacheBuster: _artworkCacheKey,
+                    ),
+                  ),
+                  child: CachedNetworkImage(
+                    imageUrl: _apiService.getArtworkUrl(
+                      _album!.id,
+                      cacheBuster: _artworkCacheKey,
+                    ),
+                    fit: BoxFit.cover,
+                    placeholder: (context, url) =>
+                        Container(color: const Color(0xFF1a2332)),
+                    errorWidget: (context, url, error) =>
+                        Container(
+                          color: const Color(0xFF1a2332),
+                          child: const Icon(
+                            Icons.album,
+                            size: 80,
+                            color: Color(0xFF00d4ff),
+                          ),
+                        ),
+                  ),
+                )
+              : Container(
+                  color: const Color(0xFF1a2332),
+                  child: const Icon(
+                    Icons.album,
+                    size: 80,
+                    color: Color(0xFF00d4ff),
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
+
+  // Category label, title row (favorite + menu), artist, meta strip and
+  // edition chips. Bottom band of the phone hero; left column on desktop.
+  Widget _buildInfoColumn() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Small "ALBUM" label up top for Spotify-style hierarchy
+        Text(
+          _album!.category.toUpperCase(),
+          style: const TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w700,
+            color: Colors.white70,
+            letterSpacing: 1.5,
+          ),
+        ),
+        const SizedBox(height: 6),
+        // Album title with favorite + menu inline at the right
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Expanded(
+              child: Text(
+                _displayTitle,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: _titleStyle,
+              ),
+            ),
+            FavoriteButton(
+              itemType: 'album',
+              itemId: _album!.id,
+              size: 28,
+            ),
+            MusicContextMenu(
+              itemType: 'album',
+              itemId: _album!.id,
+              itemName: _album!.title,
+              onFavoriteChanged: _loadAlbum,
+              onArtworkChanged: _loadAlbum,
+              audioPlayerService: widget.audioPlayerService,
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        // Artist name (tappable, cyan accent)
+        GestureDetector(
+          onTap: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (context) => ArtistDetailScreen(
+                  artistId: _album!.artistId,
+                  audioPlayerService: widget.audioPlayerService,
+                  parentLabel: widget.parentLabel,
+                ),
+              ),
+            );
+          },
+          child: Text(
+            _album!.artistName,
+            style: const TextStyle(
+              fontSize: 17,
+              color: Color(0xFF00d4ff),
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        // Metadata strip: year · song count · total duration
+        Wrap(
+          spacing: 12,
+          runSpacing: 4,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            _MetaChip(
+              icon: Icons.calendar_today,
+              label: _yearLabel,
+            ),
+            _MetaChip(
+              icon: Icons.queue_music,
+              label: '${_songs.length} songs',
+            ),
+            if (_totalDurationSeconds > 0)
+              _MetaChip(
+                icon: Icons.schedule,
+                label: _formatTotalDuration(
+                  _totalDurationSeconds,
+                ),
+              ),
+          ],
+        ),
+        // Album editions (ALBUM_EDITIONS_SPEC.md §4):
+        // this album belongs to a group — offer its
+        // sibling editions as a picker. One row that
+        // scrolls sideways, so 5+ editions never push the
+        // hero taller.
+        if (_editions.length > 1) ...[
+          const SizedBox(height: 10),
+          SizedBox(
+            height: 30,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: _editions.length,
+              separatorBuilder: (_, __) =>
+                  const SizedBox(width: 6),
+              itemBuilder: (_, i) =>
+                  Center(child: _editionChip(_editions[i])),
+            ),
+          ),
+        ],
+        // Every edition on MusicBrainz (Atmos, 5.1, SACD...), yours marked.
+        const SizedBox(height: 8),
+        EditionsRow(
+          key: ValueKey('editions_${_album!.id}'),
+          albumId: _album!.id,
+          artist: _album!.artistName,
+          album: _album!.title,
+          audioPlayerService: widget.audioPlayerService,
+        ),
+      ],
+    );
+  }
+
+  // Play / Shuffle, Images, Select-mode and the album tools.
+  Widget _buildActions({
+    EdgeInsetsGeometry padding = const EdgeInsets.all(16),
+  }) {
+    return Padding(
+      padding: padding,
+      child: Column(
+        children: [
+          // Play and Shuffle buttons
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _playAlbum,
+                  icon: const Icon(Icons.play_arrow, size: 20),
+                  label: const Text('Play'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF00d4ff),
+                    foregroundColor: Colors.black,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _shufflePlayAlbum,
+                  icon: const Icon(Icons.shuffle, size: 20),
+                  label: const Text('Shuffle'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1a2332),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          DownloadButton(kind: 'album', id: _albumId),
+          if (_albumImages.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => AlbumImagesScreen(
+                      albumId: _albumId,
+                      albumTitle: _album?.title ?? 'Album',
+                      images: _albumImages,
+                    ),
+                  ),
+                ),
+                icon: const Icon(Icons.photo_library_outlined, size: 18),
+                label: Text('Images (${_albumImages.length})'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white,
+                  side: const BorderSide(color: Color(0xFF2a3a4d)),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+              ),
+            ),
+          ],
+          const SizedBox(height: 8),
+          // Select mode buttons
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  icon: Icon(
+                    _isSelectMode ? Icons.close : Icons.checklist,
+                    size: 18,
+                  ),
+                  label: Text(_isSelectMode ? 'Cancel' : 'Select'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _isSelectMode
+                        ? Colors.grey
+                        : const Color(0xFF1a2332),
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: () {
+                    setState(() {
+                      _isSelectMode = !_isSelectMode;
+                      _selectedSongIds.clear();
+                    });
+                  },
+                ),
+              ),
+              if (_isSelectMode) ...[
+                const SizedBox(width: 8),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    icon: Icon(
+                      _selectedSongIds.length == _songs.length
+                          ? Icons.deselect
+                          : Icons.select_all,
+                      size: 18,
+                    ),
+                    label: Text(
+                      _selectedSongIds.length == _songs.length
+                          ? 'Deselect'
+                          : 'Select All',
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF1a2332),
+                      foregroundColor: Colors.white,
+                    ),
+                    onPressed: () {
+                      setState(() {
+                        if (_selectedSongIds.length == _songs.length) {
+                          _selectedSongIds.clear();
+                        } else {
+                          _selectedSongIds.clear();
+                          _selectedSongIds.addAll(
+                            _songs.map((s) => s.id),
+                          );
+                        }
+                      });
+                    },
+                  ),
+                ),
+              ],
+            ],
+          ),
+          // Action buttons row (separate row to prevent overflow on mobile)
+          if (_isSelectMode && _selectedSongIds.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      icon: const Icon(Icons.person_outline, size: 18),
+                      label: Text('Artist (${_selectedSongIds.length})'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF00d4ff),
+                        foregroundColor: Colors.black,
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                      ),
+                      onPressed: _changeSelectedArtist,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      icon: const Icon(Icons.open_with, size: 18),
+                      label: Text('Move (${_selectedSongIds.length})'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF00d4ff),
+                        foregroundColor: Colors.black,
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                      ),
+                      onPressed: _moveSelectedToPosition,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      icon: const Icon(Icons.delete_outline, size: 18),
+                      label: Text('Delete (${_selectedSongIds.length})'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.red,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                      ),
+                      onPressed: _deleteSelectedSongs,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          // Strip Album Version button (only show if any songs have it)
+          if (_songs.any((song) => song.title.contains('Album Version')))
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  icon: const Icon(Icons.auto_fix_high, size: 18),
+                  label: Text(
+                    'Strip (Album Version) from ${_songs.where((s) => s.title.contains('Album Version')).length} songs',
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.orange,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: _stripAlbumVersion,
+                ),
+              ),
+            ),
+          // Split Box Set button (only for box sets)
+          if (_discNames.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  icon: const Icon(Icons.call_split, size: 18),
+                  label: Text(
+                    'Split Box Set (${_discNames.length} discs)',
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.deepPurple,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: _splitBoxSet,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  // The tracklist (disc headers + rows); dims while a chip-picked edition
+  // loads.
+  Widget _buildTrackListSliver(List<Map<String, dynamic>> discList) {
+    return SliverAnimatedOpacity(
+      opacity: _swappingEdition ? 0.35 : 1.0,
+      duration: const Duration(milliseconds: 180),
+      sliver: SliverList(
+        delegate: SliverChildBuilderDelegate((context, index) {
+          final item = discList[index];
+
+          // Disc header
+          if (item['type'] == 'header') {
+            final discNumber = item['discNumber'] as int;
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Row(
+                children: [
+                  Text(
+                    item['title'],
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF00d4ff),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    icon: const Icon(
+                      Icons.format_list_numbered,
+                      size: 18,
+                      color: Colors.grey,
+                    ),
+                    onPressed: () => _showRenumberDialog(discNumber),
+                    tooltip: 'Renumber tracks',
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                  ),
+                  const SizedBox(width: 12),
+                  IconButton(
+                    icon: const Icon(
+                      Icons.add_link,
+                      size: 18,
+                      color: Colors.grey,
+                    ),
+                    onPressed: () => _showLinkTrackDialog(discNumber),
+                    tooltip: 'Link a track from another album',
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                  ),
+                ],
+              ),
+            );
+          }
+
+          // Song item
+          final song = item['song'] as Song;
+          final songIndex = item['songIndex'] as int;
+          final isSelected = _selectedSongIds.contains(song.id);
+
+          // Check if this song is currently playing
+          final currentSong = widget.audioPlayerService.currentSong;
+          final isCurrentlyPlaying = currentSong?.id == song.id;
+          final isPlaying =
+              isCurrentlyPlaying && widget.audioPlayerService.isPlaying;
+
+          return Container(
+            margin: const EdgeInsets.only(
+              left: 4,
+              right: 0,
+              top: 2,
+              bottom: 2,
+            ),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              color: isCurrentlyPlaying
+                  ? const Color(0xFF00d4ff).withOpacity(0.15)
+                  : Colors.transparent,
+              border: isCurrentlyPlaying
+                  ? Border.all(
+                      color: const Color(0xFF00d4ff).withOpacity(0.3),
+                      width: 1,
+                    )
+                  : null,
+            ),
+            child: InkWell(
+              onTap: () {
+                if (_isSelectMode) {
+                  setState(() {
+                    if (_selectedSongIds.contains(song.id)) {
+                      _selectedSongIds.remove(song.id);
+                    } else {
+                      _selectedSongIds.add(song.id);
+                    }
+                  });
+                } else {
+                  _playSong(song, songIndex);
+                }
+              },
+              onLongPress: song.linked && !_isSelectMode
+                  ? () => _showLinkedSongMenu(song)
+                  : null,
+              child: Padding(
+                padding: const EdgeInsets.only(
+                  left: 0,
+                  right: 0,
+                  top: 12,
+                  bottom: 12,
+                ),
+                child: Row(
+                  children: [
+                    // Leading: checkbox or track number
+                    _isSelectMode
+                        ? SizedBox(
+                            width: 32,
+                            child: Checkbox(
+                              value: isSelected,
+                              onChanged: (bool? value) {
+                                setState(() {
+                                  if (value == true) {
+                                    _selectedSongIds.add(song.id);
+                                  } else {
+                                    _selectedSongIds.remove(song.id);
+                                  }
+                                });
+                              },
+                              activeColor: const Color(0xFF00d4ff),
+                            ),
+                          )
+                        : SizedBox(
+                            width: 32,
+                            child: isCurrentlyPlaying
+                                ? Icon(
+                                    isPlaying ? Icons.volume_up : Icons.pause,
+                                    color: const Color(0xFF00d4ff),
+                                    size: 20,
+                                  )
+                                : Text(
+                                    '${song.trackNumber}',
+                                    style: const TextStyle(
+                                      fontSize: 16,
+                                      color: Colors.grey,
+                                    ),
+                                    textAlign: TextAlign.center,
+                                  ),
+                          ),
+                    const SizedBox(width: 8),
+                    // Title and subtitle
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            song.title,
+                            style: TextStyle(
+                              color: isCurrentlyPlaying
+                                  ? const Color(0xFF00d4ff)
+                                  : Colors.white,
+                              fontWeight: isCurrentlyPlaying
+                                  ? FontWeight.w600
+                                  : FontWeight.normal,
+                              fontSize: 16,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          if (song.linked)
+                            GestureDetector(
+                              onTap: () => _openHomeAlbum(song),
+                              child: Row(
+                                children: [
+                                  const Icon(Icons.link,
+                                      size: 13, color: Color(0xFF00d4ff)),
+                                  const SizedBox(width: 4),
+                                  Flexible(
+                                    child: Text(
+                                      _album!.artistName == 'Various Artists'
+                                          ? '${song.artistsFormatted} · from ${song.homeAlbumTitle ?? 'another album'}'
+                                          : 'from ${song.homeAlbumTitle ?? 'another album'}',
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: const Color(0xFF00d4ff)
+                                            .withOpacity(0.75),
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            )
+                          else if (_album!.artistName == 'Various Artists')
+                            Text(
+                              song.artistsFormatted,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: isCurrentlyPlaying
+                                    ? const Color(0xFF00d4ff).withOpacity(0.7)
+                                    : Colors.grey,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            )
+                          else if (song.artists.length > 1)
+                            Text(
+                              'feat. ${song.artists.skip(1).map((a) => a.name).join(', ')}',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: isCurrentlyPlaying
+                                    ? const Color(0xFF00d4ff).withOpacity(0.7)
+                                    : Colors.grey,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                        ],
+                      ),
+                    ),
+                    // Trailing: format badge, explicit badge, duration, menu
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: song.formatColor.withOpacity(0.2),
+                        border: Border.all(color: song.formatColor, width: 1),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        song.fileFormat,
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          color: song.formatColor,
+                        ),
+                      ),
+                    ),
+                    if (song.isExplicit) ...[
+                      const SizedBox(width: 4),
+                      const ExplicitBadge(fontSize: 10),
+                    ],
+                    if (song.isAtmos || song.isSurround) ...[
+                      const SizedBox(width: 4),
+                      SpatialBadge(song: song, fontSize: 10),
+                    ],
+                    if (song.isHdcd) ...[
+                      const SizedBox(width: 4),
+                      const HdcdBadge(fontSize: 10),
+                    ],
+                    Padding(
+                      padding: const EdgeInsets.only(left: 8, right: 4),
+                      child: Text(
+                        song.durationFormatted,
+                        style: TextStyle(
+                          color: isCurrentlyPlaying
+                              ? const Color(0xFF00d4ff).withOpacity(0.8)
+                              : Colors.grey,
+                        ),
+                      ),
+                    ),
+                    MusicContextMenu(
+                      itemType: 'song',
+                      itemId: song.id,
+                      itemName: song.title,
+                      audioPlayerService: widget.audioPlayerService,
+                      onFavoriteChanged: _loadAlbum,
+                      onMoveToPosition: () => _showMoveToPositionDialog(song),
+                    ),
+                    // Extra padding on desktop to avoid scrollbar overlap
+                    if (Platform.isWindows ||
+                        Platform.isLinux ||
+                        Platform.isMacOS)
+                      const SizedBox(width: 12),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }, childCount: discList.length),
+      ),
+    );
+  }
+
+  bool get _desktopLayout => LayoutScope.maybeOf(context)?.isDesktop ?? false;
+
+  Widget _buildBreadcrumb() {
+    return BreadcrumbBar(
+      items: [
+        BreadcrumbItem(
+          label: widget.parentLabel ?? 'Library',
+          // Root of the current section, however deep we are.
+          onTap: () => Navigator.popUntil(context, (route) => route.isFirst),
+        ),
+        if (widget.artistName != null)
+          BreadcrumbItem(label: widget.artistName!, onTap: _goToArtistCrumb),
+        BreadcrumbItem(label: _displayTitle),
+      ],
+    );
+  }
+
+  /// Desktop album page (DESKTOP_UX_SPEC.md §5 #6): two columns. Cover,
+  /// info, edition chips and actions on the left; the tracklist scrolls on
+  /// its own on the right, so picking an edition swaps just that column.
+  Widget _buildDesktopContent() {
+    final discList = _buildDiscList();
+    return Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          stops: const [0.0, 0.6],
+          colors: [
+            Color.lerp(
+                  _dominantColor ?? const Color(0xFF1a2332),
+                  const Color(0xFF0d1b2a),
+                  0.35,
+                ) ??
+                const Color(0xFF1a2332),
+            const Color(0xFF0d1b2a),
+          ],
+        ),
+      ),
+      child: Column(
+        children: [
+          AppBar(
+            backgroundColor: Colors.transparent,
+            elevation: 0,
+            title: _buildBreadcrumb(),
+          ),
+          Expanded(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SizedBox(
+                  width: 420,
+                  child: SingleChildScrollView(
+                    // Let the cover's glow spill past the column edge.
+                    clipBehavior: Clip.none,
+                    padding: const EdgeInsets.fromLTRB(32, 8, 24, 24),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Center(child: _buildCover(340)),
+                        const SizedBox(height: 32),
+                        _buildInfoColumn(),
+                        _buildActions(padding: const EdgeInsets.only(top: 20)),
+                      ],
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: CustomScrollView(
+                    controller: _scrollController,
+                    slivers: [
+                      const SliverToBoxAdapter(child: SizedBox(height: 8)),
+                      _buildTrackListSliver(discList),
+                      const SliverToBoxAdapter(child: SizedBox(height: 20)),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildContent() {
+    if (_desktopLayout) return _buildDesktopContent();
     final discList = _buildDiscList();
 
     // Cover is much larger on desktop (the 200px version looked tiny
@@ -1077,7 +2217,15 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
     final double coverSize = isMobile
         ? (screenWidth * 0.72).clamp(200.0, 340.0)
         : 260;
-    final double heroHeight = isMobile ? topInset + coverSize + 196 : 580;
+    final double bandWidth =
+        screenWidth -
+        24 -
+        (Platform.isWindows || Platform.isLinux || Platform.isMacOS ? 32 : 16);
+    final double heroBody =
+        topInset + coverSize + 30 + _heroInfoHeight(bandWidth);
+    final double heroHeight = isMobile
+        ? heroBody
+        : (heroBody > 580 ? heroBody : 580);
 
     return CustomScrollView(
       controller: _scrollController,
@@ -1087,24 +2235,7 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
           expandedHeight: heroHeight,
           pinned: true,
           backgroundColor: const Color(0xFF0d1b2a),
-          title: _album != null
-              ? BreadcrumbBar(
-                  items: [
-                    BreadcrumbItem(
-                      label: widget.parentLabel ?? 'Library',
-                      // Root of the current section, however deep we are.
-                      onTap: () =>
-                          Navigator.popUntil(context, (route) => route.isFirst),
-                    ),
-                    if (widget.artistName != null)
-                      BreadcrumbItem(
-                        label: widget.artistName!,
-                        onTap: _goToArtistCrumb,
-                      ),
-                    BreadcrumbItem(label: _album!.title),
-                  ],
-                )
-              : null,
+          title: _album != null ? _buildBreadcrumb() : null,
           flexibleSpace: FlexibleSpaceBar(
             background: Stack(
               fit: StackFit.expand,
@@ -1176,63 +2307,7 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
                   left: 0,
                   right: 0,
                   child: Center(
-                    // Glow: the cover casts its own dominant color, plus a
-                    // plain drop shadow so it lifts off the gradient.
-                    child: Container(
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(14),
-                        boxShadow: [
-                          BoxShadow(
-                            color: (_dominantColor ?? const Color(0xFF00d4ff))
-                                .withOpacity(0.55),
-                            blurRadius: 48,
-                            spreadRadius: 2,
-                            offset: const Offset(0, 18),
-                          ),
-                          BoxShadow(
-                            color: Colors.black.withOpacity(0.5),
-                            blurRadius: 24,
-                            offset: const Offset(0, 10),
-                          ),
-                        ],
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(14),
-                        child: SizedBox(
-                          width: coverSize,
-                          height: coverSize,
-                          child:
-                              _album!.artworkPath != null &&
-                                  _album!.artworkPath!.isNotEmpty
-                              ? CachedNetworkImage(
-                                  imageUrl: _apiService.getArtworkUrl(
-                                    _album!.id,
-                                    cacheBuster: _artworkCacheKey,
-                                  ),
-                                  fit: BoxFit.cover,
-                                  placeholder: (context, url) =>
-                                      Container(color: const Color(0xFF1a2332)),
-                                  errorWidget: (context, url, error) =>
-                                      Container(
-                                        color: const Color(0xFF1a2332),
-                                        child: const Icon(
-                                          Icons.album,
-                                          size: 80,
-                                          color: Color(0xFF00d4ff),
-                                        ),
-                                      ),
-                                )
-                              : Container(
-                                  color: const Color(0xFF1a2332),
-                                  child: const Icon(
-                                    Icons.album,
-                                    size: 80,
-                                    color: Color(0xFF00d4ff),
-                                  ),
-                                ),
-                        ),
-                      ),
-                    ),
+                    child: _buildCover(coverSize),
                   ),
                 ),
                 // Album info positioned to the right of the cover
@@ -1246,117 +2321,7 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
                       ? 32
                       : 16,
                   bottom: 16,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      // Small "ALBUM" label up top for Spotify-style hierarchy
-                      Text(
-                        _album!.category.toUpperCase(),
-                        style: const TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
-                          color: Colors.white70,
-                          letterSpacing: 1.5,
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-                      // Album title with favorite + menu inline at the right
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.center,
-                        children: [
-                          Expanded(
-                            child: Text(
-                              _album!.title,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 34,
-                                fontWeight: FontWeight.w800,
-                                color: Colors.white,
-                                letterSpacing: -0.5,
-                                height: 1.05,
-                              ),
-                            ),
-                          ),
-                          FavoriteButton(
-                            itemType: 'album',
-                            itemId: _album!.id,
-                            size: 28,
-                          ),
-                          MusicContextMenu(
-                            itemType: 'album',
-                            itemId: _album!.id,
-                            itemName: _album!.title,
-                            onFavoriteChanged: _loadAlbum,
-                            onArtworkChanged: _loadAlbum,
-                            audioPlayerService: widget.audioPlayerService,
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 10),
-                      // Artist name (tappable, cyan accent)
-                      GestureDetector(
-                        onTap: () {
-                          Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (context) => ArtistDetailScreen(
-                                artistId: _album!.artistId,
-                                audioPlayerService: widget.audioPlayerService,
-                                parentLabel: widget.parentLabel,
-                              ),
-                            ),
-                          );
-                        },
-                        child: Text(
-                          _album!.artistName,
-                          style: const TextStyle(
-                            fontSize: 17,
-                            color: Color(0xFF00d4ff),
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      // Metadata strip: year · song count · total duration
-                      Wrap(
-                        spacing: 12,
-                        runSpacing: 4,
-                        crossAxisAlignment: WrapCrossAlignment.center,
-                        children: [
-                          _MetaChip(
-                            icon: Icons.calendar_today,
-                            label: '${_album!.year ?? "Unknown year"}',
-                          ),
-                          _MetaChip(
-                            icon: Icons.queue_music,
-                            label: '${_songs.length} songs',
-                          ),
-                          if (_totalDurationSeconds > 0)
-                            _MetaChip(
-                              icon: Icons.schedule,
-                              label: _formatTotalDuration(
-                                _totalDurationSeconds,
-                              ),
-                            ),
-                        ],
-                      ),
-                      // Album editions (ALBUM_EDITIONS_SPEC.md §4):
-                      // this album belongs to a group — offer its
-                      // sibling editions as a picker.
-                      if (_editions.length > 1) ...[
-                        const SizedBox(height: 10),
-                        Wrap(
-                          spacing: 6,
-                          runSpacing: 6,
-                          children: [
-                            for (final e in _editions) _editionChip(e),
-                          ],
-                        ),
-                      ],
-                    ],
-                  ),
+                  child: _buildInfoColumn(),
                 ),
               ],
             ),
@@ -1365,424 +2330,10 @@ class _AlbumDetailScreenState extends State<AlbumDetailScreen> {
 
         // Action buttons
         SliverToBoxAdapter(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              children: [
-                // Play and Shuffle buttons
-                Row(
-                  children: [
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        onPressed: _playAlbum,
-                        icon: const Icon(Icons.play_arrow, size: 20),
-                        label: const Text('Play'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF00d4ff),
-                          foregroundColor: Colors.black,
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        onPressed: _shufflePlayAlbum,
-                        icon: const Icon(Icons.shuffle, size: 20),
-                        label: const Text('Shuffle'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF1a2332),
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                // Select mode buttons
-                Row(
-                  children: [
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        icon: Icon(
-                          _isSelectMode ? Icons.close : Icons.checklist,
-                          size: 18,
-                        ),
-                        label: Text(_isSelectMode ? 'Cancel' : 'Select'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: _isSelectMode
-                              ? Colors.grey
-                              : const Color(0xFF1a2332),
-                          foregroundColor: Colors.white,
-                        ),
-                        onPressed: () {
-                          setState(() {
-                            _isSelectMode = !_isSelectMode;
-                            _selectedSongIds.clear();
-                          });
-                        },
-                      ),
-                    ),
-                    if (_isSelectMode) ...[
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          icon: Icon(
-                            _selectedSongIds.length == _songs.length
-                                ? Icons.deselect
-                                : Icons.select_all,
-                            size: 18,
-                          ),
-                          label: Text(
-                            _selectedSongIds.length == _songs.length
-                                ? 'Deselect'
-                                : 'Select All',
-                          ),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF1a2332),
-                            foregroundColor: Colors.white,
-                          ),
-                          onPressed: () {
-                            setState(() {
-                              if (_selectedSongIds.length == _songs.length) {
-                                _selectedSongIds.clear();
-                              } else {
-                                _selectedSongIds.clear();
-                                _selectedSongIds.addAll(
-                                  _songs.map((s) => s.id),
-                                );
-                              }
-                            });
-                          },
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-                // Action buttons row (separate row to prevent overflow on mobile)
-                if (_isSelectMode && _selectedSongIds.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 8),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: ElevatedButton.icon(
-                            icon: const Icon(Icons.person_outline, size: 18),
-                            label: Text('Artist (${_selectedSongIds.length})'),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF00d4ff),
-                              foregroundColor: Colors.black,
-                              padding: const EdgeInsets.symmetric(vertical: 8),
-                            ),
-                            onPressed: _changeSelectedArtist,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: ElevatedButton.icon(
-                            icon: const Icon(Icons.open_with, size: 18),
-                            label: Text('Move (${_selectedSongIds.length})'),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF00d4ff),
-                              foregroundColor: Colors.black,
-                              padding: const EdgeInsets.symmetric(vertical: 8),
-                            ),
-                            onPressed: _moveSelectedToPosition,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: ElevatedButton.icon(
-                            icon: const Icon(Icons.delete_outline, size: 18),
-                            label: Text('Delete (${_selectedSongIds.length})'),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.red,
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(vertical: 8),
-                            ),
-                            onPressed: _deleteSelectedSongs,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                // Strip Album Version button (only show if any songs have it)
-                if (_songs.any((song) => song.title.contains('Album Version')))
-                  Padding(
-                    padding: const EdgeInsets.only(top: 8),
-                    child: SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton.icon(
-                        icon: const Icon(Icons.auto_fix_high, size: 18),
-                        label: Text(
-                          'Strip (Album Version) from ${_songs.where((s) => s.title.contains('Album Version')).length} songs',
-                        ),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.orange,
-                          foregroundColor: Colors.white,
-                        ),
-                        onPressed: _stripAlbumVersion,
-                      ),
-                    ),
-                  ),
-                // Split Box Set button (only for box sets)
-                if (_discNames.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 8),
-                    child: SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton.icon(
-                        icon: const Icon(Icons.call_split, size: 18),
-                        label: Text(
-                          'Split Box Set (${_discNames.length} discs)',
-                        ),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.deepPurple,
-                          foregroundColor: Colors.white,
-                        ),
-                        onPressed: _splitBoxSet,
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
+          child: _buildActions(),
         ),
 
-        // Track list
-        SliverList(
-          delegate: SliverChildBuilderDelegate((context, index) {
-            final item = discList[index];
-
-            // Disc header
-            if (item['type'] == 'header') {
-              final discNumber = item['discNumber'] as int;
-              return Padding(
-                padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-                child: Row(
-                  children: [
-                    Text(
-                      item['title'],
-                      style: const TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFF00d4ff),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton(
-                      icon: const Icon(
-                        Icons.format_list_numbered,
-                        size: 18,
-                        color: Colors.grey,
-                      ),
-                      onPressed: () => _showRenumberDialog(discNumber),
-                      tooltip: 'Renumber tracks',
-                      padding: EdgeInsets.zero,
-                      constraints: const BoxConstraints(),
-                    ),
-                  ],
-                ),
-              );
-            }
-
-            // Song item
-            final song = item['song'] as Song;
-            final songIndex = item['songIndex'] as int;
-            final isSelected = _selectedSongIds.contains(song.id);
-
-            // Check if this song is currently playing
-            final currentSong = widget.audioPlayerService.currentSong;
-            final isCurrentlyPlaying = currentSong?.id == song.id;
-            final isPlaying =
-                isCurrentlyPlaying && widget.audioPlayerService.isPlaying;
-
-            return Container(
-              margin: const EdgeInsets.only(
-                left: 4,
-                right: 0,
-                top: 2,
-                bottom: 2,
-              ),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(8),
-                color: isCurrentlyPlaying
-                    ? const Color(0xFF00d4ff).withOpacity(0.15)
-                    : Colors.transparent,
-                border: isCurrentlyPlaying
-                    ? Border.all(
-                        color: const Color(0xFF00d4ff).withOpacity(0.3),
-                        width: 1,
-                      )
-                    : null,
-              ),
-              child: InkWell(
-                onTap: () {
-                  if (_isSelectMode) {
-                    setState(() {
-                      if (_selectedSongIds.contains(song.id)) {
-                        _selectedSongIds.remove(song.id);
-                      } else {
-                        _selectedSongIds.add(song.id);
-                      }
-                    });
-                  } else {
-                    _playSong(song, songIndex);
-                  }
-                },
-                child: Padding(
-                  padding: const EdgeInsets.only(
-                    left: 0,
-                    right: 0,
-                    top: 12,
-                    bottom: 12,
-                  ),
-                  child: Row(
-                    children: [
-                      // Leading: checkbox or track number
-                      _isSelectMode
-                          ? SizedBox(
-                              width: 32,
-                              child: Checkbox(
-                                value: isSelected,
-                                onChanged: (bool? value) {
-                                  setState(() {
-                                    if (value == true) {
-                                      _selectedSongIds.add(song.id);
-                                    } else {
-                                      _selectedSongIds.remove(song.id);
-                                    }
-                                  });
-                                },
-                                activeColor: const Color(0xFF00d4ff),
-                              ),
-                            )
-                          : SizedBox(
-                              width: 32,
-                              child: isCurrentlyPlaying
-                                  ? Icon(
-                                      isPlaying ? Icons.volume_up : Icons.pause,
-                                      color: const Color(0xFF00d4ff),
-                                      size: 20,
-                                    )
-                                  : Text(
-                                      '${song.trackNumber}',
-                                      style: const TextStyle(
-                                        fontSize: 16,
-                                        color: Colors.grey,
-                                      ),
-                                      textAlign: TextAlign.center,
-                                    ),
-                            ),
-                      const SizedBox(width: 8),
-                      // Title and subtitle
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              song.title,
-                              style: TextStyle(
-                                color: isCurrentlyPlaying
-                                    ? const Color(0xFF00d4ff)
-                                    : Colors.white,
-                                fontWeight: isCurrentlyPlaying
-                                    ? FontWeight.w600
-                                    : FontWeight.normal,
-                                fontSize: 16,
-                              ),
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            if (_album!.artistName == 'Various Artists')
-                              Text(
-                                song.artistsFormatted,
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: isCurrentlyPlaying
-                                      ? const Color(0xFF00d4ff).withOpacity(0.7)
-                                      : Colors.grey,
-                                ),
-                                overflow: TextOverflow.ellipsis,
-                              )
-                            else if (song.artists.length > 1)
-                              Text(
-                                'feat. ${song.artists.skip(1).map((a) => a.name).join(', ')}',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: isCurrentlyPlaying
-                                      ? const Color(0xFF00d4ff).withOpacity(0.7)
-                                      : Colors.grey,
-                                ),
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                          ],
-                        ),
-                      ),
-                      // Trailing: format badge, explicit badge, duration, menu
-                      const SizedBox(width: 8),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: song.formatColor.withOpacity(0.2),
-                          border: Border.all(color: song.formatColor, width: 1),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: Text(
-                          song.fileFormat,
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                            color: song.formatColor,
-                          ),
-                        ),
-                      ),
-                      if (song.isExplicit) ...[
-                        const SizedBox(width: 4),
-                        const ExplicitBadge(fontSize: 10),
-                      ],
-                      if (song.isAtmos || song.isSurround) ...[
-                        const SizedBox(width: 4),
-                        SpatialBadge(song: song, fontSize: 10),
-                      ],
-                      if (song.isHdcd) ...[
-                        const SizedBox(width: 4),
-                        const HdcdBadge(fontSize: 10),
-                      ],
-                      Padding(
-                        padding: const EdgeInsets.only(left: 8, right: 4),
-                        child: Text(
-                          song.durationFormatted,
-                          style: TextStyle(
-                            color: isCurrentlyPlaying
-                                ? const Color(0xFF00d4ff).withOpacity(0.8)
-                                : Colors.grey,
-                          ),
-                        ),
-                      ),
-                      MusicContextMenu(
-                        itemType: 'song',
-                        itemId: song.id,
-                        itemName: song.title,
-                        audioPlayerService: widget.audioPlayerService,
-                        onFavoriteChanged: _loadAlbum,
-                        onMoveToPosition: () => _showMoveToPositionDialog(song),
-                      ),
-                      // Extra padding on desktop to avoid scrollbar overlap
-                      if (Platform.isWindows ||
-                          Platform.isLinux ||
-                          Platform.isMacOS)
-                        const SizedBox(width: 12),
-                    ],
-                  ),
-                ),
-              ),
-            );
-          }, childCount: discList.length),
-        ),
+        _buildTrackListSliver(discList),
 
         // Bottom padding
         const SliverToBoxAdapter(child: SizedBox(height: 20)),

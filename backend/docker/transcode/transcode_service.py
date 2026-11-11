@@ -58,6 +58,8 @@ QUALITY_PRESETS = {
     "high": {"codec": "aac", "bitrate": "320k", "ext": "m4a"},
     "medium": {"codec": "aac", "bitrate": "128k", "ext": "m4a"},
     "low": {"codec": "libmp3lame", "bitrate": "96k", "ext": "mp3"},
+    # Phone offline downloads: half the size of AAC 320, same sound in a car.
+    "opus160": {"codec": "libopus", "bitrate": "160k", "ext": "opus"},
 }
 
 # File extensions that DON'T need transcoding (already compressed, suitable for mobile)
@@ -130,7 +132,20 @@ def needs_transcode(file_path, bitrate):
     return True
 
 
-def transcode_file(input_path, output_path, quality="high"):
+def ffmpeg_timeout_for(duration_s):
+    """Seconds to allow FFmpeg for a track of this length. A flat 120 s killed
+    every long track (70 min Lars interview, 13 min Broadway Melody Ballet)
+    and they were retried every 30 min for weeks (2,094 failed runs). The
+    NAS encodes at only ~5x real time (measured on the 70 min interview), so
+    allow duration/2: about 2.5x the expected encode time."""
+    try:
+        d = int(duration_s or 0)
+    except (TypeError, ValueError):
+        d = 0
+    return max(120, d // 2 + 60)
+
+
+def transcode_file(input_path, output_path, quality="high", timeout=120):
     """Transcode a single file to the target quality."""
     preset = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["high"])
 
@@ -152,6 +167,10 @@ def transcode_file(input_path, output_path, quality="high"):
             cmd.extend(["-movflags", "+faststart", "-f", "ipod"])
         elif preset["ext"] == "mp3":
             cmd.extend(["-f", "mp3"])
+        elif preset["ext"] == "opus":
+            # Opus runs at 48 kHz; downloads are for phones/cars, so stereo
+            # (a 5.1 FLAC downmixes instead of becoming a multichannel Opus).
+            cmd.extend(["-ar", "48000", "-ac", "2", "-f", "ogg"])
 
         cmd.append(temp_path)
 
@@ -159,7 +178,7 @@ def transcode_file(input_path, output_path, quality="high"):
             cmd,
             capture_output=True,
             text=True,
-            timeout=120,  # 2 minute timeout per song
+            timeout=timeout,  # scaled to track length, see ffmpeg_timeout_for
         )
 
         if result.returncode != 0:
@@ -175,7 +194,7 @@ def transcode_file(input_path, output_path, quality="high"):
     except subprocess.TimeoutExpired:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-        return False, "FFmpeg timeout (>120s)"
+        return False, f"FFmpeg timeout (>{timeout}s)"
     except Exception as e:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -184,8 +203,10 @@ def transcode_file(input_path, output_path, quality="high"):
 
 # ─── Batch processing ────────────────────────────────────────────────────────
 
-def _batch_transcode_worker(quality="high"):
-    """Background worker that transcodes all untranscoded songs."""
+def _batch_transcode_worker(quality="high", song_ids=None):
+    """Background worker that transcodes untranscoded songs: just song_ids when
+    given (the backend reconciler passes exactly the ones missing a cache),
+    otherwise the whole library."""
     global _batch_running, _batch_cancel, _batch_progress
 
     _batch_running = True
@@ -205,8 +226,16 @@ def _batch_transcode_worker(quality="high"):
         conn = psycopg2.connect(DB_URL)
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        # Get all songs
-        cursor.execute("SELECT id, file_path, bitrate, title, artist_id FROM songs ORDER BY id")
+        # Library files only: podcast episodes / stations store a URL as their
+        # path ("...default.mp3?aid=...") which read as an unknown format, so
+        # every batch "failed" ~3,000 of them on a pointless stat.
+        sql = ("SELECT id, file_path, bitrate, title, artist_id, duration FROM songs "
+               "WHERE podcast_feed_id IS NULL AND file_path NOT ILIKE 'http%%'")
+        params = []
+        if song_ids:
+            sql += " AND id = ANY(%s)"
+            params.append(list(song_ids))
+        cursor.execute(sql + " ORDER BY id", params)
         songs = cursor.fetchall()
         conn.close()
 
@@ -259,9 +288,13 @@ def _batch_transcode_worker(quality="high"):
                 continue
 
             # Transcode
-            success, error = transcode_file(local_path, cache_path, quality)
+            success, error = transcode_file(
+                local_path, cache_path, quality,
+                timeout=ffmpeg_timeout_for(song.get("duration")))
             if success:
                 size_mb = os.path.getsize(cache_path) / (1024 * 1024)
+                if song_ids:
+                    print(f"✅ Transcoded: {title} (song {song_id}, {size_mb:.1f} MB)")
                 _batch_progress["transcoded"] += 1
                 if _batch_progress["transcoded"] % 100 == 0:
                     print(f"✅ Progress: {_batch_progress['transcoded']} transcoded, "
@@ -348,7 +381,8 @@ def transcode_single():
         return jsonify({"error": f"File not found: {local_path}"}), 404
 
     start = time.time()
-    success, error = transcode_file(local_path, cache_path, quality)
+    success, error = transcode_file(local_path, cache_path, quality,
+                                    timeout=ffmpeg_timeout_for(data.get("duration")))
     elapsed = time.time() - start
 
     if success:
@@ -380,9 +414,12 @@ def transcode_all():
             "progress": _batch_progress,
         })
 
-    quality = request.get_json().get("quality", "high") if request.get_json() else "high"
+    body = request.get_json(silent=True) or {}
+    quality = body.get("quality", "high")
+    song_ids = [int(i) for i in (body.get("song_ids") or []) if str(i).isdigit()] or None
 
-    thread = threading.Thread(target=_batch_transcode_worker, args=(quality,), daemon=True)
+    thread = threading.Thread(target=_batch_transcode_worker, args=(quality, song_ids),
+                              daemon=True)
     thread.start()
 
     return jsonify({"status": "started", "message": "Batch transcode started"})

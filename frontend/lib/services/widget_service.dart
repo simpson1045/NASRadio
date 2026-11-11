@@ -11,6 +11,24 @@ class WidgetService {
   int? _lastCachedAlbumId;
   String? _lastCachedArtworkUrl;
   bool _isUpdating = false;
+  // The widget updates every second while playing; a failed art fetch used
+  // to retry on every one of those ticks (Oct 26: 375 401'd art requests in
+  // a few minutes after the session expired). Wait a minute before retrying
+  // the same art.
+  String? _failedArtKey;
+  DateTime? _failedArtAt;
+  // The song whose waveform the widget has (sent once per song).
+  int? _waveSongId;
+
+  bool _artBackoff(String key) =>
+      key == _failedArtKey &&
+      _failedArtAt != null &&
+      DateTime.now().difference(_failedArtAt!) < const Duration(minutes: 1);
+
+  void _artFailed(String key) {
+    _failedArtKey = key;
+    _failedArtAt = DateTime.now();
+  }
 
   String _formatDuration(Duration d) {
     final hours = d.inHours;
@@ -32,6 +50,10 @@ class WidgetService {
     required Duration position,
     required Duration duration,
     String? artworkUrl,
+    int? songId,
+    List<double>? waveform,
+    bool shuffleOn = false,
+    int repeatMode = 0, // 0 off, 1 all, 2 one
   }) async {
     if (!Platform.isAndroid || _isUpdating) return;
     _isUpdating = true;
@@ -51,20 +73,41 @@ class WidgetService {
           ? (position.inMilliseconds * 1000 ~/ duration.inMilliseconds)
           : 0;
       await HomeWidget.saveWidgetData('progress', progress);
+      await HomeWidget.saveWidgetData('shuffle_on', shuffleOn);
+      await HomeWidget.saveWidgetData('repeat_mode', repeatMode);
+
+      // The song's waveform for the widget's progress bar, once per song
+      // (the widget draws it, played part in the art's colour).
+      if (songId != _waveSongId) {
+        _waveSongId = songId;
+        await HomeWidget.saveWidgetData('waveform', '');
+        if (songId != null && songId > 0) {
+          _sendWaveform(songId, waveform);
+        }
+      }
 
       // Cache artwork — from URL for podcasts, from API for music. Only mark
       // it cached when the download actually SUCCEEDS, otherwise a single
       // failed fetch would wedge the widget on the placeholder forever (it
       // would never retry that album).
       if (artworkUrl != null && artworkUrl != _lastCachedArtworkUrl) {
-        if (await _cacheArtworkFromUrl(artworkUrl)) {
-          _lastCachedArtworkUrl = artworkUrl;
-          _lastCachedAlbumId = null;
+        if (!_artBackoff(artworkUrl)) {
+          if (await _cacheArtworkFromUrl(artworkUrl)) {
+            _lastCachedArtworkUrl = artworkUrl;
+            _lastCachedAlbumId = null;
+          } else {
+            _artFailed(artworkUrl);
+          }
         }
       } else if (albumId != null && albumId > 0 && albumId != _lastCachedAlbumId) {
-        if (await _cacheArtwork(albumId)) {
-          _lastCachedAlbumId = albumId;
-          _lastCachedArtworkUrl = null;
+        final key = 'album:$albumId';
+        if (!_artBackoff(key)) {
+          if (await _cacheArtwork(albumId)) {
+            _lastCachedAlbumId = albumId;
+            _lastCachedArtworkUrl = null;
+          } else {
+            _artFailed(key);
+          }
         }
       }
 
@@ -74,6 +117,31 @@ class WidgetService {
       // Don't crash the player if widget update fails
     } finally {
       _isUpdating = false;
+    }
+  }
+
+  /// 64 bars, 0-100, comma-separated. Uses the player's copy when it has
+  /// one, else fetches it (a slow fetch just leaves the plain bar for now).
+  Future<void> _sendWaveform(int songId, List<double>? known) async {
+    try {
+      final w = known ?? await ApiService().getWaveform(songId);
+      if (w.isEmpty || songId != _waveSongId) return;
+      const bars = 64;
+      final peak = w.reduce((a, b) => a > b ? a : b);
+      final out = <int>[];
+      for (var i = 0; i < bars; i++) {
+        final from = i * w.length ~/ bars;
+        final to = ((i + 1) * w.length ~/ bars).clamp(from + 1, w.length);
+        var m = 0.0;
+        for (var k = from; k < to; k++) {
+          if (w[k] > m) m = w[k];
+        }
+        out.add(peak > 0 ? (m / peak * 100).round() : 0);
+      }
+      await HomeWidget.saveWidgetData('waveform', out.join(','));
+      await HomeWidget.updateWidget(androidName: _androidWidgetName);
+    } catch (_) {
+      // No waveform: the widget keeps the plain progress bar.
     }
   }
 

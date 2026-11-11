@@ -8,7 +8,7 @@
 // (or the Chromecast debugger). If you don't see this line at session
 // start, the receiver is running a cached older copy of this file and
 // the cache buster in receiver.html needs another bump.
-const NASRADIO_RECEIVER_VERSION = 'v38 — scrolling titles';
+const NASRADIO_RECEIVER_VERSION = 'v43 — straight playback (no crossfade)';
 
 // Live diagnostic counters rendered on the TV. Combined.log roundtrip
 // for DIAG_BOOT / DIAG_KEY / DIAG_MSG came back empty even though v13
@@ -212,6 +212,21 @@ function sendDiagToSender(payload) {
   }
 }
 
+// Messages EVERY connected sender must hear (session ending). Sent to each
+// sender ID explicitly — _activeSenderId is whoever connected last, which
+// on an ADMS-started cast is the backend, so a joined phone never heard
+// the shutdown and auto-relaunched the cast (waking the TV + Denon).
+function broadcastToSenders(payload) {
+  const ids = _senders.size ? [..._senders] : [undefined];
+  for (const id of ids) {
+    try {
+      context.sendCustomMessage(NASRADIO_NS, id, payload);
+    } catch (e) {
+      console.log('[NASRadio] broadcast to', id, 'threw:', e);
+    }
+  }
+}
+
 context.addEventListener(
   cast.framework.system.EventType.SENDER_CONNECTED,
   (event) => {
@@ -224,8 +239,125 @@ context.addEventListener(
       type: 'DIAG_BOOT',
       version: NASRADIO_RECEIVER_VERSION,
     });
+    _reportCapabilities();
   },
 );
+
+// What this Cast device says it can play: settles whether the TV passes
+// Dolby Digital Plus Atmos through to the receiver (Google's Cast media
+// docs: IS_DOLBY_ATMOS_SUPPORTED + the ec-3 spatialRendering type). The
+// backend logs the answer.
+function _reportCapabilities() {
+  const can = (type) => {
+    try { return context.canDisplayType(type); } catch (e) { return 'error'; }
+  };
+  let caps = null;
+  try { caps = context.getDeviceCapabilities(); } catch (e) { caps = 'error: ' + e; }
+  sendDiagToSender({
+    type: 'CAPABILITIES',
+    deviceCapabilities: caps,
+    ec3: can('audio/mp4; codecs="ec-3"'),
+    ec3Atmos: can('audio/mp4; codecs="ec-3"; spatialRendering=true'),
+    ac3: can('audio/mp4; codecs="ac-3"'),
+    mseEc3: !!(window.MediaSource && MediaSource.isTypeSupported &&
+               MediaSource.isTypeSupported('audio/mp4; codecs="ec-3"')),
+  });
+  _reportFormatMatrix();
+}
+
+// Which containers/codecs each layer of the TV accepts: the <video>
+// element (canPlayType: webOS's own media pipeline), MSE
+// (isTypeSupported) and Cast (canDisplayType). Looking for a door for
+// TrueHD and Dolby Vision that CAF's audio player doesn't offer.
+const _PROBE_TYPES = [
+  'audio/mp4; codecs="mlpa"',
+  'video/mp4; codecs="hvc1.2.4.L153.B0, mlpa"',
+  'video/mp4; codecs="dvh1.08.06, mlpa"',
+  'video/mp4; codecs="dvh1.08.06"',
+  'video/mp4; codecs="dvhe.07.06"',
+  'video/mp4; codecs="dvh1.05.06"',
+  'video/mp4; codecs="hvc1.2.4.L153.B0"',
+  'video/mp4; codecs="hvc1.2.4.L153.B0, ec-3"',
+  'video/x-matroska',
+  'video/x-matroska; codecs="hvc1, mlpa"',
+  'audio/x-matroska',
+  'video/mp2t',
+  'video/mp2t; codecs="hvc1.2.4.L153.B0, mlpa"',
+  'video/vnd.dlna.mpeg-tts',
+  'video/webm',
+];
+
+function _reportFormatMatrix() {
+  const v = document.createElement('video');
+  const mse = (t) => {
+    try {
+      return !!(window.MediaSource && MediaSource.isTypeSupported(t));
+    } catch (e) { return 'error'; }
+  };
+  const cast = (t) => {
+    try { return context.canDisplayType(t); } catch (e) { return 'error'; }
+  };
+  const rows = _PROBE_TYPES.map((t) => ({
+    type: t, video: v.canPlayType(t) || 'no', mse: mse(t), cast: cast(t),
+  }));
+  sendDiagToSender({ type: 'FORMAT_MATRIX', userAgent: navigator.userAgent, rows });
+}
+
+// ── Test-play mode ───────────────────────────────────────────────────
+// TEST_PLAY {url, mime}: play a URL in our OWN full-screen <video>,
+// bypassing CAF's player, and report what the TV's pipeline does with it.
+// TEST_STOP removes it. Diagnostics only; nothing in the app sends these.
+let _testVideo = null;
+
+function _testReport(event, extra) {
+  const v = _testVideo;
+  sendDiagToSender(Object.assign({
+    type: 'TEST_EVENT',
+    event,
+    t: v ? Math.round(v.currentTime * 10) / 10 : null,
+    w: v ? v.videoWidth : null,
+    h: v ? v.videoHeight : null,
+    ready: v ? v.readyState : null,
+  }, extra || {}));
+}
+
+function _testStop() {
+  if (!_testVideo) return;
+  try {
+    _testVideo.pause();
+    _testVideo.removeAttribute('src');
+    _testVideo.load();
+  } catch (e) { /* already gone */ }
+  _testVideo.remove();
+  _testVideo = null;
+}
+
+function _testPlay(url, mime) {
+  _testStop();
+  const v = document.createElement('video');
+  v.id = 'test-video';
+  v.autoplay = true;
+  _testVideo = v;
+  ['loadedmetadata', 'canplay', 'playing', 'waiting', 'stalled', 'ended']
+    .forEach((ev) => v.addEventListener(ev, () => _testReport(ev)));
+  v.addEventListener('error', () => {
+    const err = v.error || {};
+    _testReport('error', { code: err.code, message: err.message || '' });
+  });
+  let ticks = 0;
+  const timer = setInterval(() => {
+    if (_testVideo !== v || ++ticks > 6) { clearInterval(timer); return; }
+    _testReport('tick');
+  }, 2000);
+  const src = document.createElement('source');
+  src.src = url;
+  if (mime) src.type = mime;
+  v.appendChild(src);
+  document.body.appendChild(v);
+  _testReport('started', { url, mime: mime || '' });
+  const p = v.play();
+  if (p && p.catch) p.catch((e) => _testReport('play-rejected', { message: String(e) }));
+}
 
 context.addEventListener(
   cast.framework.system.EventType.SENDER_DISCONNECTED,
@@ -277,7 +409,7 @@ function _sendShutdownSignal(reason) {
   if (_shutdownSignalSent) return;
   _shutdownSignalSent = true;
   try {
-    sendDiagToSender({
+    broadcastToSenders({
       type: 'DIAG_RECEIVER_SHUTDOWN',
       reason: reason,
       version: NASRADIO_RECEIVER_VERSION,
@@ -447,31 +579,20 @@ const SELF_ADVANCE_GRACE_MS = 4000;
 const HEADLESS_ADVANCE_GRACE_MS = 250;
 let _isHeadlessCast = false;
 
-// ── Segue crossfade (Stage 1: volume ramp, no overlap) ──────────────
-// Fade the outgoing track's volume over its last `crossfadeSec`
-// seconds and ramp the incoming track up over the first half of that.
-// Position-derived every rAF tick, so seeks/pauses self-correct.
-// 0 disables. Set via CROSSFADE message; persisted across launches.
+// Straight playback: each track plays start to finish at full volume (times
+// its ReplayGain), then the next one loads. No crossfade: the LG's Cast
+// receiver only lets ONE media element make sound, so two tracks can never
+// overlap (a second <audio> deck silenced the current track; 2026-09-30).
 const castAudioEl = document.getElementById('castMediaElement');
-let crossfadeSec = (() => {
-  const v = parseFloat(localStorage.getItem('nasradio_crossfade'));
-  return isFinite(v) ? Math.max(0, Math.min(v, 12)) : 4;
-})();
+try { localStorage.removeItem('nasradio_crossfade'); } catch (e) {}
 
-function applySegueVolume(t, d) {
-  if (!crossfadeSec || liveMode || !isFinite(d) || d <= 0) {
-    if (castAudioEl.volume !== 1) castAudioEl.volume = 1;
-    return;
-  }
-  const fadeIn = crossfadeSec / 2;
-  let v = 1;
-  if (t < fadeIn) v = Math.min(1, t / fadeIn);
-  const remaining = d - t;
-  if (remaining < crossfadeSec) {
-    v = Math.min(v, Math.max(0, remaining / crossfadeSec));
-  }
-  // Equal-power curve — linear ramps sound like they duck too early
-  castAudioEl.volume = Math.sin(v * Math.PI / 2);
+// ReplayGain for casts: per-track volume (0..1) sent by the sender in
+// customData.gain, set in updateMediaInfo. An audio element can't go above
+// 1, so this only ever turns loud tracks down; 1 when there's no gain.
+let trackGain = 1;
+
+function applyTrackGain() {
+  if (castAudioEl.volume !== trackGain) castAudioEl.volume = trackGain;
 }
 
 function _cancelSelfAdvance() {
@@ -532,7 +653,35 @@ let _waveformRequestTimer = null;
 let _waveformRequestAttempts = 0;
 let lyricsLines = null;        // Array of {time: seconds, text: string}
 let currentLyricIndex = -1;
-let lyricsVisible = false;     // Toggled from phone — NOT auto-shown
+let lyricsVisible = false;     // Lyrics view on screen right now
+// What the user (phone / Claude) asked for. Sticky across songs: a song
+// change or a track with no lyrics no longer switches lyrics off for good
+// (Oct 30: lyrics vanished when "2 Minutes to Midnight" came on).
+let lyricsWanted = false;
+// Lyrics scroll: a transform glided by _tickLyricsScroll instead of native
+// smooth scroll. The C2's Cast app runs rAF at 30 fps (v44 FPS_PROBE: 30 in
+// every mode), so the old exponential ease lunged ~8 px per frame at the
+// start of each line change and read as judder (v45, Oct 30):
+//   'tween' = fixed 700 ms ease-in-out stepped from rAF (peak step about
+//             half the old one)
+//   'css'   = the same glide handed to a CSS transition, so the browser
+//             animates it (possibly faster than rAF's 30)
+//   'drift' = never parks: between one line's time and the next the text
+//             slides at a constant speed, so each line reaches centre as it
+//             starts. ~0.5 px per frame for a 4 s line, like the scrubber
+//             fill that looks smooth at 30 fps (v47, the default; Matt saw
+//             no difference between tween and css).
+// Switched live with SCROLL_MODE to compare by eye.
+let _lyricsScrollMode = 'drift';
+let _lyricsClock = -1;      // song time (s) for 'drift', set by updateProgress
+let _lineCenters = null;    // scroll position centring each line (measured lazily)
+const LYRICS_GLIDE_MS = 700;
+let _lyricsY = 0;
+let _lyricsTargetY = 0;
+let _glideFrom = 0;
+let _glideTo = 0;
+let _glideStart = 0;
+let _cssGlideTo = 0;
 let sleepTimerInterval = null;
 let sleepTimerRemaining = 0;
 let specialWaveform = null;   // 'evh', 'dna', 'lightsaber:blue', etc.
@@ -553,6 +702,54 @@ function formatTime(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+// No artwork for this track: show the placeholder instead of leaving the
+// previous album's cover (and blurred background) up. Before this, a failed
+// load only logged a warning and the old cover stayed on screen.
+function _showArtworkPlaceholder(customData) {
+  artwork.classList.remove('loaded');
+  artwork.removeAttribute('src');
+  lyricsArtworkSmall.removeAttribute('src');
+  if (!customData || !customData.artistImageUrl) {
+    bgImage.style.backgroundImage = 'none';
+  }
+}
+
+// Release year on the album line ("Rumours · 1977"). Asked once per song from
+// the server (read-only, with the media token the artwork URL already
+// carries), so it works whichever sender loaded the track. MEDIA_STATUS
+// re-runs updateMediaInfo many times per song, so answers are cached.
+const _albumYears = new Map(); // songId -> year (0 = unknown)
+let _albumYearPending = null;
+function _albumLine(album, songId, artUrl) {
+  const base = (album && album !== 'Unknown Album') ? album : '';
+  if (typeof songId !== 'number' || songId <= 0) return album;
+  if (_albumYears.has(songId)) {
+    const y = _albumYears.get(songId);
+    if (!y) return album;
+    return base ? `${base} · ${y}` : String(y);
+  }
+  if (_albumYearPending !== songId && artUrl) {
+    let u = null;
+    try { u = new URL(artUrl); } catch (e) { /* no year then */ }
+    const token = u && u.searchParams.get('token');
+    if (token) {
+      _albumYearPending = songId;
+      if (_albumYears.size > 500) _albumYears.clear();
+      fetch(`${u.origin}/api/cast/song-info/${songId}?token=${encodeURIComponent(token)}`)
+        .then(r => (r.ok ? r.json() : null))
+        .catch(() => null)
+        .then(info => {
+          _albumYears.set(songId, (info && info.album_year) || 0);
+          if (_albumYearPending === songId) _albumYearPending = null;
+          if (currentSongId === songId) {
+            setScrollingText(albumEl, _albumLine(album, songId, artUrl));
+          }
+        });
+    }
+  }
+  return album;
+}
+
 /**
  * Update the UI with current media metadata
  */
@@ -562,6 +759,10 @@ function updateMediaInfo(mediaInfo) {
 
   const metadata = mediaInfo.metadata || {};
   const customData = mediaInfo.customData || {};
+  // Per-track ReplayGain (see applyTrackGain). Live radio is never adjusted.
+  const g = Number(customData.gain);
+  trackGain = (mediaInfo.streamType === 'LIVE' || !isFinite(g) || g <= 0)
+    ? 1 : Math.min(1, g);
   // Live-track override — see _pendingStationTrack above.
   const stash =
     mediaInfo.streamType === 'LIVE' ? _pendingStationTrack : null;
@@ -576,7 +777,9 @@ function updateMediaInfo(mediaInfo) {
   titleEl.className = 'fade-in';
   setScrollingText(artistEl, artist);
   artistEl.className = 'fade-in';
-  setScrollingText(albumEl, album);
+  setScrollingText(albumEl, stash ? album : _albumLine(
+    album, customData.songId,
+    ((metadata.images || [])[0] || {}).url));
   albumEl.className = 'fade-in';
 
   // Lyrics view header
@@ -600,6 +803,8 @@ function updateMediaInfo(mediaInfo) {
       // (the canvas is waveform-only), so CORS mode buys nothing.
       const img = new Image();
       img.onload = function () {
+        // A slow cover from a previous track must not replace this one.
+        if (currentArtworkUrl !== artUrl) return;
         artwork.src = artUrl;
         artwork.classList.add('loaded');
         lyricsArtworkSmall.src = artUrl;
@@ -610,9 +815,14 @@ function updateMediaInfo(mediaInfo) {
       };
       img.onerror = function () {
         console.warn('[NASRadio] Failed to load artwork:', artUrl);
+        if (currentArtworkUrl !== artUrl) return;
+        _showArtworkPlaceholder(customData);
       };
       img.src = artUrl;
     }
+  } else if (currentArtworkUrl) {
+    currentArtworkUrl = '';
+    _showArtworkPlaceholder(customData);
   }
 
   // Special waveform mode
@@ -752,10 +962,15 @@ function updateBadges(data) {
 function setupWaveformCanvas() {
   const dpr = window.devicePixelRatio || 1;
   const container = waveformCanvas.parentElement;
-  // Account for the 60px padding on each side from the container, then
-  // add WAVE_PAD on each side for the glow (see WAVE_PAD).
-  const w = container.clientWidth - 120 + 2 * WAVE_PAD;
-  const h = 36;
+  // The bar spans the container's content box, plus WAVE_PAD on each side
+  // for the glow (see WAVE_PAD). Side padding and height come from the CSS
+  // (60 px / 36 px on the TV; tv.css makes both bigger on ELKO's 4K screen),
+  // so they're read here rather than hard-coded.
+  const cs = getComputedStyle(container);
+  const inner = container.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  const w = inner + 2 * WAVE_PAD;
+  waveformCanvas.style.height = '';  // let the stylesheet decide
+  const h = waveformCanvas.clientHeight || 36;
   waveformCanvas.width = w * dpr;
   waveformCanvas.height = h * dpr;
   waveformCanvas.style.width = w + 'px';
@@ -858,22 +1073,28 @@ function drawWaveform(progress) {
     gradient.addColorStop(1, 'rgba(0, 212, 255, 0)');
     waveformCtx.fillStyle = gradient;
     waveformCtx.fillRect(cursorX - r, 0, r * 2, h);
+    drawPlayheadSparks(cursorX, centerY, ['180, 240, 255']);
+  }
+}
 
-    // Sparks: each has its own cycle speed; `life` runs 0→1 then the
-    // spark is reborn at a new angle (the integer cycle count seeds it).
-    const SPARKS = 7;
-    for (let i = 0; i < SPARKS; i++) {
-      const speed = 0.9 + i * 0.13;
-      const phase = t * speed + i * 0.37;
-      const life = phase - Math.floor(phase);
-      const ang = i * 2.399 + Math.floor(phase) * 1.7;
-      const dist = 3 + life * 16;
-      const sx = cursorX + Math.cos(ang) * dist * 0.6;
-      const sy = centerY + Math.sin(ang) * dist - life * 8;
-      const a = (1 - life) * 0.9;
-      waveformCtx.fillStyle = `rgba(180, 240, 255, ${a.toFixed(3)})`;
-      waveformCtx.fillRect(sx, sy, 1.5, 1.5);
-    }
+// Sparks thrown off a playhead: each has its own cycle speed; `life` runs
+// 0→1 then the spark is reborn at a new angle (the integer cycle count
+// seeds it). A pure function of animFrame like the glow. `colors` are
+// "r, g, b" strings, cycled per spark.
+function drawPlayheadSparks(x, centerY, colors) {
+  const t = animFrame;
+  const SPARKS = 7;
+  for (let i = 0; i < SPARKS; i++) {
+    const speed = 0.9 + i * 0.13;
+    const phase = t * speed + i * 0.37;
+    const life = phase - Math.floor(phase);
+    const ang = i * 2.399 + Math.floor(phase) * 1.7;
+    const dist = 3 + life * 16;
+    const sx = x + Math.cos(ang) * dist * 0.6;
+    const sy = centerY + Math.sin(ang) * dist - life * 8;
+    const a = (1 - life) * 0.9;
+    waveformCtx.fillStyle = `rgba(${colors[i % colors.length]}, ${a.toFixed(3)})`;
+    waveformCtx.fillRect(sx, sy, 1.5, 1.5);
   }
 }
 
@@ -881,6 +1102,44 @@ function drawWaveform(progress) {
  * Van Halen EVH Frankenstein Stripes waveform
  * Red base with chaotic diagonal black & white stripes, clipped to waveform shape
  */
+// Stripe layout for the EVH scrubber. Same seeded generator as the app's
+// Van Halen artist page and Now Playing scrubber (LCG, seed 0x5EED; Math.imul
+// keeps the multiply exact in JS), so all three share one Frankenstrat:
+// random spots, angles up to ~69 deg off vertical (steeper smears into a flat
+// line on a bar this thin), white 7-13 px under black 12-21 px, one stripe
+// per ~40 px of width. The old fixed table sat on a regular 100 px grid with
+// strictly alternating angles, which read as a repeating pattern. Cached per
+// canvas size so it doesn't crawl between frames.
+let _evhStripeCache = { key: '', stripes: [] };
+function evhStripes(w, h) {
+  // Per-song pattern, stable for that song (same formula as the app).
+  const id = typeof currentSongId === 'number' ? currentSongId : 0;
+  const key = w + 'x' + h + '#' + id;
+  if (_evhStripeCache.key === key) return _evhStripeCache.stripes;
+  let seed = (0x5EED ^ Math.imul(id, 2654435761)) & 0x7fffffff;
+  if (seed === 0) seed = 0x5EED;
+  const rnd = () => {
+    seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+    return seed / 0x7fffffff;
+  };
+  // Jittered slots: one stripe inside each equal slice of the bar, so pure
+  // chance can't leave a stretch bare. Same draw order as the app.
+  const n = Math.max(8, Math.round(w / 32));
+  const slot = (w + 40) / n;
+  const stripes = [];
+  const strip = (i, color, sw) => stripes.push({
+    color, sw, x: -20 + (i + rnd()) * slot, y: rnd() * h, angle: (rnd() - 0.5) * 2.4,
+  });
+  for (let i = 0; i < n; i++) {
+    if (rnd() < 9 / 16) strip(i, '#FFFFFF', 7 + rnd() * 6);
+    else strip(i, '#000000', 12 + rnd() * 9);
+  }
+  // Black on top of white, as on the artist page.
+  stripes.sort((a, b) => (a.color === '#000000') - (b.color === '#000000'));
+  _evhStripeCache = { key, stripes };
+  return stripes;
+}
+
 function drawEVHWaveform(progress, w, h) {
   const barCount = waveformData.length;
   const centerY = h / 2;
@@ -936,58 +1195,31 @@ function drawEVHWaveform(progress, w, h) {
   waveformCtx.fillStyle = '#E31937';
   waveformCtx.fillRect(0, 0, w, h);
 
-  // Chaotic diagonal stripes (Frankenstein pattern)
-  const stripes = [
-    // Black stripes - wider, various angles
-    { color: '#000000', x: -20, angle: 0.4, sw: 18 },
-    { color: '#000000', x: 60, angle: -0.6, sw: 22 },
-    { color: '#000000', x: 150, angle: 0.3, sw: 16 },
-    { color: '#000000', x: 240, angle: -0.5, sw: 20 },
-    { color: '#000000', x: 350, angle: 0.7, sw: 18 },
-    { color: '#000000', x: 450, angle: -0.4, sw: 24 },
-    { color: '#000000', x: 550, angle: 0.5, sw: 16 },
-    { color: '#000000', x: 650, angle: -0.3, sw: 20 },
-    { color: '#000000', x: 750, angle: 0.6, sw: 18 },
-    { color: '#000000', x: 850, angle: -0.5, sw: 22 },
-    { color: '#000000', x: 950, angle: 0.4, sw: 16 },
-    { color: '#000000', x: 1050, angle: -0.6, sw: 20 },
-    { color: '#000000', x: 1150, angle: 0.3, sw: 18 },
-    { color: '#000000', x: 1250, angle: -0.4, sw: 22 },
-    // White stripes - thinner
-    { color: '#FFFFFF', x: 20, angle: -0.5, sw: 10 },
-    { color: '#FFFFFF', x: 100, angle: 0.6, sw: 8 },
-    { color: '#FFFFFF', x: 200, angle: -0.4, sw: 12 },
-    { color: '#FFFFFF', x: 300, angle: 0.5, sw: 10 },
-    { color: '#FFFFFF', x: 400, angle: -0.7, sw: 8 },
-    { color: '#FFFFFF', x: 500, angle: 0.4, sw: 12 },
-    { color: '#FFFFFF', x: 600, angle: -0.6, sw: 10 },
-    { color: '#FFFFFF', x: 700, angle: 0.3, sw: 8 },
-    { color: '#FFFFFF', x: 800, angle: -0.5, sw: 10 },
-    { color: '#FFFFFF', x: 900, angle: 0.6, sw: 12 },
-    { color: '#FFFFFF', x: 1000, angle: -0.4, sw: 8 },
-    { color: '#FFFFFF', x: 1100, angle: 0.5, sw: 10 },
-    { color: '#FFFFFF', x: 1200, angle: -0.3, sw: 12 },
-  ];
-
-  for (const s of stripes) {
+  // Frankenstrat stripes: random spots, angles and widths (see evhStripes).
+  for (const s of evhStripes(w, h)) {
     waveformCtx.save();
-    waveformCtx.translate(s.x, centerY);
+    waveformCtx.translate(s.x, s.y);
     waveformCtx.rotate(s.angle);
     waveformCtx.fillStyle = s.color;
-    waveformCtx.fillRect(-s.sw / 2, -h * 1.5, s.sw, h * 3);
+    waveformCtx.fillRect(-s.sw / 2, -h * 3, s.sw, h * 6);
     waveformCtx.restore();
   }
 
   waveformCtx.restore();
 
-  // Red glow on playhead
+  // Red glow on playhead, breathing like the default one, throwing
+  // Frankenstrat red and white sparks (Oct 30: it was the only static one).
   const playX = w * progress;
   if (playX > 0 && playX < w) {
-    const gradient = waveformCtx.createRadialGradient(playX, centerY, 0, playX, centerY, 20);
-    gradient.addColorStop(0, 'rgba(227, 25, 55, 0.5)');
+    const t = animFrame;
+    const flicker = 0.75 + 0.25 * Math.sin(t * 9.7) * Math.sin(t * 3.1 + 1.3);
+    const r = 18 + 6 * flicker;
+    const gradient = waveformCtx.createRadialGradient(playX, centerY, 0, playX, centerY, r);
+    gradient.addColorStop(0, `rgba(227, 25, 55, ${(0.35 + 0.2 * flicker).toFixed(3)})`);
     gradient.addColorStop(1, 'rgba(227, 25, 55, 0)');
     waveformCtx.fillStyle = gradient;
-    waveformCtx.fillRect(playX - 20, 0, 40, h);
+    waveformCtx.fillRect(playX - r, 0, r * 2, h);
+    drawPlayheadSparks(playX, centerY, ['255, 255, 255', '255, 60, 80']);
   }
 }
 
@@ -1302,6 +1534,7 @@ function parseLRC(lrcString) {
  */
 function buildLyricsDOM() {
   lyricsContainer.innerHTML = '';
+  _lineCenters = null;  // 'drift' re-measures the new lines
   if (!lyricsLines) return;
 
   lyricsLines.forEach((line, i) => {
@@ -1347,8 +1580,7 @@ function updateLyrics(currentTime) {
       const lineTop = lines[currentLyricIndex].offsetTop;
       const lineHeight = lines[currentLyricIndex].offsetHeight;
       const parentHeight = scrollParent.offsetHeight;
-      const targetScroll = lineTop - (parentHeight / 2) + (lineHeight / 2);
-      scrollParent.scrollTo({ top: targetScroll, behavior: 'smooth' });
+      _lyricsTargetY = Math.max(0, lineTop - (parentHeight / 2) + (lineHeight / 2));
     }
   }
 }
@@ -1373,6 +1605,7 @@ function toggleLyricsView(show) {
 
     // Force scroll after layout is computed (Chromecast needs longer delay)
     setTimeout(() => {
+      _lineCenters = null;  // laid out now: 'drift' re-measures
       const activeLine = lyricsContainer.querySelector('.lyric-line.active');
       const scrollParent = document.getElementById('lyrics-body');
       if (activeLine && scrollParent) {
@@ -1380,10 +1613,11 @@ function toggleLyricsView(show) {
         const lineTop = activeLine.offsetTop;
         const lineHeight = activeLine.offsetHeight;
         const parentHeight = scrollParent.offsetHeight;
-        scrollParent.scrollTop = lineTop - (parentHeight / 2) + (lineHeight / 2);
-      } else if (scrollParent) {
-        scrollParent.scrollTop = 0;
+        _lyricsY = _lyricsTargetY = Math.max(0, lineTop - (parentHeight / 2) + (lineHeight / 2));
+      } else {
+        _lyricsY = _lyricsTargetY = 0;
       }
+      _applyLyricsY();
     }, 100);
   } else {
     lyricsView.classList.remove('visible');
@@ -1432,14 +1666,114 @@ function stopSleepCountdown() {
 
 // ─── Progress Updates ──────────────────────────────────────────────
 
+function _writeLyricsTransform(y, glideMs) {
+  const t = glideMs ? 'transform ' + glideMs + 'ms cubic-bezier(0.45, 0, 0.55, 1)' : 'none';
+  if (lyricsContainer.style.transition !== t) lyricsContainer.style.transition = t;
+  lyricsContainer.style.transform = 'translate3d(0,' + (-y).toFixed(2) + 'px,0)';
+}
+
+// Snap to _lyricsY with no glide (view shown, new lyrics, mode switch).
+function _applyLyricsY() {
+  _glideFrom = _glideTo = _cssGlideTo = _lyricsY;
+  _writeLyricsTransform(_lyricsY, 0);
+}
+
+// Scroll position that centres each line. Layout only: the active line's
+// scale(1.08) is a transform and doesn't move offsetTop.
+function _measureLineCenters() {
+  const body = document.getElementById('lyrics-body');
+  const els = lyricsContainer.querySelectorAll('.lyric-line');
+  if (!body || !lyricsLines || els.length !== lyricsLines.length) return null;
+  const half = body.offsetHeight / 2;
+  return Array.from(els, (el) => Math.max(0, el.offsetTop - half + el.offsetHeight / 2));
+}
+
+// 'drift' position at song time t: line i's centre at its start, sliding
+// linearly to line i+1's centre by the time line i+1 starts.
+function _driftY(t) {
+  const L = lyricsLines;
+  if (!_lineCenters) _lineCenters = _measureLineCenters();
+  const C = _lineCenters;
+  if (!L || !C || t < 0) return null;
+  if (t <= L[0].time) return C[0];
+  let i = L.length - 1;
+  while (i > 0 && t < L[i].time) i--;
+  if (i === L.length - 1) return C[i];
+  const p = (t - L[i].time) / (L[i + 1].time - L[i].time || 1);
+  return C[i] + (C[i + 1] - C[i]) * Math.min(1, p);
+}
+
+// Move the lyrics per _lyricsScrollMode: drift with the song clock, or
+// glide to the active line over LYRICS_GLIDE_MS.
+function _tickLyricsScroll(now) {
+  if (!lyricsVisible) return;
+  if (_lyricsScrollMode === 'drift') {
+    const y = _driftY(_lyricsClock);
+    if (y !== null) {
+      if (Math.abs(y - _lyricsY) > 0.01) {
+        _lyricsY = y;
+        _writeLyricsTransform(y, 0);
+      }
+      return;
+    }
+  }
+  const target = _lyricsTargetY;
+  if (_lyricsScrollMode === 'css') {
+    if (target !== _cssGlideTo) {
+      _cssGlideTo = _lyricsY = target;
+      _writeLyricsTransform(target, LYRICS_GLIDE_MS);
+    }
+    return;
+  }
+  if (target !== _glideTo) {  // new line: glide from wherever we are now
+    _glideFrom = _lyricsY;
+    _glideTo = target;
+    _glideStart = now;
+  }
+  if (_lyricsY === _glideTo) return;
+  const p = Math.min(1, (now - _glideStart) / LYRICS_GLIDE_MS);
+  _lyricsY = p >= 1 ? _glideTo
+    : _glideFrom + (_glideTo - _glideFrom) * (0.5 - 0.5 * Math.cos(Math.PI * p));
+  _writeLyricsTransform(_lyricsY, 0);
+}
+
 function startProgressPolling() {
   stopProgressPolling();
   // Use requestAnimationFrame for butter-smooth waveform at native refresh rate (60/120fps)
   function tick() {
-    updateProgress();
+    // The next frame is scheduled no matter what: one exception in
+    // updateProgress used to end this loop, freezing the waveform / clock /
+    // lyrics while the music played on until the next song (Oct 30, after a
+    // seek to 0:00). The error is reported to the sender for the log.
+    try {
+      updateProgress();
+      _tickLyricsScroll(performance.now());
+    } catch (e) {
+      _reportUiError('updateProgress', e);
+    }
     progressInterval = requestAnimationFrame(tick);
   }
   progressInterval = requestAnimationFrame(tick);
+}
+
+// Report a UI exception to the sender once per song+message (the backend
+// logs it), so a frozen-screen cause names its line instead of hiding.
+const _uiErrorsSent = new Set();
+function _reportUiError(where, e) {
+  const msg = (e && e.message) || String(e);
+  const key = currentSongId + '|' + where + '|' + msg;
+  if (_uiErrorsSent.has(key)) return;
+  _uiErrorsSent.add(key);
+  console.log('[NASRadio] UI error in ' + where + ':', e);
+  sendDiagToSender({
+    type: 'DIAG_ERROR',
+    where: where,
+    message: msg,
+    stack: ((e && e.stack) || '').split('\n').slice(0, 4).join(' | '),
+    songId: currentSongId,
+    playerState: playerManager.getPlayerState(),
+    currentTime: playerManager.getCurrentTimeSec(),
+  });
 }
 
 function stopProgressPolling() {
@@ -1549,9 +1883,10 @@ function updateProgress() {
   }
 
   const currentTime = smoothedCurrentTime();
+  _lyricsClock = currentTime;
   const duration = playerManager.getDurationSec();
   updateUpNextCard(currentTime, duration);
-  applySegueVolume(currentTime, duration);
+  applyTrackGain();
 
   // Live stream: no scrubber math — just tick the elapsed listen time.
   // (Also catches a non-finite duration that slipped past LOAD metadata.)
@@ -1569,8 +1904,13 @@ function updateProgress() {
   }
 
   if (duration > 0) {
-    const progress = Math.min(currentTime / duration, 1);
-    drawWaveform(progress);
+    let progress = Math.min(currentTime / duration, 1);
+    if (_sweepUntil) {
+      const t = performance.now();
+      if (t < _sweepUntil) progress = ((t - _sweepStart) % 2000) / 2000;
+      else _sweepUntil = 0;
+    }
+    if (!_perfNoWave) drawWaveform(progress);
     // Throttle text/DOM updates to ~4fps (they don't need 60fps)
     const now = Date.now();
     if (now - _lastLyricsUpdate > 250) {
@@ -1841,7 +2181,19 @@ context.addCustomMessageListener(NASRADIO_NS, (event) => {
   const data = event.data;
   console.log('[NASRadio] Custom message type:', data.type);
 
-  if (data.type === 'WAVEFORM') {
+  if (data.type === 'TEST_PLAY') {
+    _testPlay(data.url, data.mime);
+
+  } else if (data.type === 'TEST_STOP') {
+    _testStop();
+
+  } else if (data.type === 'SESSION_ENDING') {
+    // A sender (the backend's /api/cast/stop) is about to close this
+    // receiver on purpose. Tell every phone BEFORE the socket drops, so
+    // none of them mistakes the close for a crash and relaunches.
+    broadcastToSenders({ type: 'CAST_ENDED', reason: data.reason || 'stopped' });
+
+  } else if (data.type === 'WAVEFORM') {
     waveformData = data.data;
     console.log('[NASRadio] Received waveform:', waveformData ? waveformData.length : 0, 'samples');
     setupWaveformCanvas();
@@ -1861,15 +2213,16 @@ context.addCustomMessageListener(NASRADIO_NS, (event) => {
 
     if (lyricsLines) {
       buildLyricsDOM();
-      // Reset scroll to top so lyrics don't start mid-list when toggled on
-      lyricsContainer.scrollTop = 0;
-      console.log('[NASRadio] Lyrics ready:', lyricsLines.length, 'lines (hidden until toggled)');
+      _lyricsY = _lyricsTargetY = 0;
+      _applyLyricsY();
+      console.log('[NASRadio] Lyrics ready:', lyricsLines.length, 'lines',
+                  lyricsWanted ? '(showing)' : '(hidden until toggled)');
+      if (lyricsWanted) toggleLyricsView(true);
     } else {
       lyricsContainer.innerHTML = '';
-      // If lyrics view was showing but new song has no lyrics, hide it
-      if (lyricsVisible) {
-        toggleLyricsView(false);
-      }
+      // No lyrics for this track: fade back to now-playing, but stay
+      // "wanted" so the next song with lyrics shows them again.
+      if (lyricsVisible) toggleLyricsView(false);
       console.log('[NASRadio] No synced lyrics for this track');
     }
 
@@ -1929,16 +2282,19 @@ context.addCustomMessageListener(NASRADIO_NS, (event) => {
     _sendTo(event.senderId, Object.assign({ type: 'STATE', requestId: data.requestId },
       currentStateForSenders()));
 
-  } else if (data.type === 'CROSSFADE') {
-    const secs = parseFloat(data.seconds);
-    crossfadeSec = isFinite(secs) ? Math.max(0, Math.min(secs, 12)) : 0;
-    try { localStorage.setItem('nasradio_crossfade', String(crossfadeSec)); } catch (e) {}
-    if (!crossfadeSec) castAudioEl.volume = 1;
-    console.log('[NASRadio] Crossfade set:', crossfadeSec + 's');
+  } else if (data.type === 'FPS_PROBE') {
+    _fpsProbe(data.variant || 'normal', data.seconds);
+
+  } else if (data.type === 'SCROLL_MODE') {
+    _lyricsScrollMode = ['css', 'tween'].includes(data.mode) ? data.mode : 'drift';
+    _lyricsY = _lyricsTargetY;
+    _applyLyricsY();
+    console.log('[NASRadio] Lyrics scroll mode:', _lyricsScrollMode);
 
   } else if (data.type === 'TOGGLE_LYRICS') {
     // Phone user pressed the lyrics button
-    const shouldShow = data.show !== undefined ? data.show : !lyricsVisible;
+    const shouldShow = data.show !== undefined ? !!data.show : !lyricsWanted;
+    lyricsWanted = shouldShow;
     console.log('[NASRadio] Toggle lyrics:', shouldShow);
     toggleLyricsView(shouldShow);
 
@@ -2049,9 +2405,60 @@ playerManager.addEventListener(
   }
 );
 
+let _fpsReported = false;
+let _perfNoWave = false;   // FPS_PROBE "nowave": skip waveform drawing
+function _measureFrameRate(variant, done) {
+  let frames = 0;
+  const start = performance.now();
+  function count(now) {
+    frames++;
+    if (now - start < 2000) { requestAnimationFrame(count); return; }
+    const fps = Math.round(frames * 1000 / (now - start));
+    console.log('[NASRadio] Measured frame rate (' + variant + '):', fps, 'fps');
+    sendDiagToSender({type: 'DIAG_FPS', fps: fps, variant: variant,
+                      screen: window.screen.width + 'x' + window.screen.height,
+                      dpr: window.devicePixelRatio});
+    if (done) done();
+  }
+  requestAnimationFrame(count);
+}
+function _reportFrameRate() {
+  if (_fpsReported) return;
+  _fpsReported = true;
+  _measureFrameRate('startup');
+}
+// FPS_PROBE (Oct 30): the C2 Cast app measured 30 fps. Turn one expensive
+// layer off for ~2.5 s, measure, restore, so we know what (if anything)
+// holds it there: normal | noblur | nobg | nowave | minimal.
+// FPS_PROBE "sweep": run the scrubber fill across the whole bar every 2 s
+// for `seconds`, sparks riding the edge, and measure meanwhile. The normal
+// fill creeps a fraction of a pixel per frame and looks smooth at any rate;
+// this moves fast enough to show the real one (Matt, Oct 30).
+let _sweepStart = 0;
+let _sweepUntil = 0;
+function _scrubSweep(seconds) {
+  _sweepStart = performance.now();
+  _sweepUntil = _sweepStart + seconds * 1000;
+  setTimeout(() => _measureFrameRate('sweep'), 500);
+}
+
+function _fpsProbe(variant, seconds) {
+  if (variant === 'sweep') { _scrubSweep(seconds || 15); return; }
+  const noblur = variant === 'noblur' || variant === 'nobg' || variant === 'minimal';
+  const nobg = variant === 'nobg' || variant === 'minimal';
+  document.body.classList.toggle('perf-noblur', noblur);
+  document.body.classList.toggle('perf-nobg', nobg);
+  _perfNoWave = variant === 'nowave' || variant === 'minimal';
+  setTimeout(() => _measureFrameRate(variant, () => {
+    document.body.classList.remove('perf-noblur', 'perf-nobg');
+    _perfNoWave = false;
+  }), 500);  // let the style change settle before counting
+}
+
 playerManager.addEventListener(
   cast.framework.events.EventType.PLAYER_LOAD_COMPLETE,
   (event) => {
+    setTimeout(_reportFrameRate, 3000);
     console.log('[NASRadio] Media loaded');
     const mediaInfo = playerManager.getMediaInformation();
     if (mediaInfo) updateMediaInfo(mediaInfo);
@@ -2130,7 +2537,8 @@ playerManager.addEventListener(
   cast.framework.events.EventType.SEEKED,
   () => {
     currentLyricIndex = -1; // Force lyrics re-sync after seek
-    updateProgress();
+    // Belt and braces: (re)start the progress loop after any seek.
+    startProgressPolling();
   }
 );
 
@@ -2150,8 +2558,11 @@ playerManager.addEventListener(
       _waveformRequestTimer = null;
     }
     _waveformRequestAttempts = 0;
-    // Hide lyrics view when song ends
-    toggleLyricsView(false);
+    // Fade back to now-playing for the song change; lyricsWanted stays on,
+    // so the next track's LYRICS (with lines) fades them back in. Leaving
+    // the empty lyrics view up hid everything when that message never came
+    // (Oct 30: a dropped socket at a song change = blank glassy screen).
+    if (lyricsVisible) toggleLyricsView(false);
     // Hide badges
     formatBadge.classList.add('hidden');
     atmosBadge.classList.add('hidden');
@@ -2174,6 +2585,7 @@ playerManager.addEventListener(
 function showIdle() {
   contentEl.classList.remove('visible');
   idleScreen.classList.remove('hidden');
+  lyricsWanted = false;
   toggleLyricsView(false);
   stopProgressPolling();
   waveformData = null;

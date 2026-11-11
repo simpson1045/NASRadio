@@ -752,12 +752,36 @@ class Database:
         cursor.execute("ALTER TABLE albums ADD COLUMN IF NOT EXISTS genres_source TEXT")
         cursor.execute("ALTER TABLE albums ADD COLUMN IF NOT EXISTS genres_fetched_at TIMESTAMP")
         cursor.execute("ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_group_mbid TEXT")
+        # Original release year from the release group's first-release-date
+        # (original_year.py): a 2014 deluxe reissue still reads 1984.
+        cursor.execute("ALTER TABLE albums ADD COLUMN IF NOT EXISTS original_year INTEGER")
+        cursor.execute("ALTER TABLE albums ADD COLUMN IF NOT EXISTS original_year_checked_at TIMESTAMP")
         cursor.execute("ALTER TABLE artists ADD COLUMN IF NOT EXISTS genres TEXT[]")
         cursor.execute("ALTER TABLE artists ADD COLUMN IF NOT EXISTS genres_fetched_at TIMESTAMP")
         # Where an artist image came from ("spotify:<id>", "fanart:<url>",
         # "manual:<url>", "upload"), so a wrong face is diagnosable.
         cursor.execute("ALTER TABLE artists ADD COLUMN IF NOT EXISTS image_source TEXT")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_genres ON albums USING GIN (genres)")
+
+        # Album references: a song that ALSO belongs on another album (e.g. a
+        # compilation track already owned in FLAC elsewhere). The song keeps
+        # one row and one play count; the album just lists it at a slot.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS album_track_refs (
+                id SERIAL PRIMARY KEY,
+                album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+                song_id INTEGER NOT NULL REFERENCES songs(id) ON DELETE CASCADE,
+                disc_number INTEGER NOT NULL DEFAULT 1,
+                track_number INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(album_id, song_id)
+            )
+        """
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_album_track_refs_song ON album_track_refs (song_id)")
+        # Albums an artist shuffle skips (e.g. isolated vocal stems).
+        cursor.execute("ALTER TABLE albums ADD COLUMN IF NOT EXISTS exclude_from_shuffle BOOLEAN DEFAULT FALSE")
 
         # Songs Essentia couldn't analyze (audio_analysis.py). attempts caps
         # retries; permanent = the input itself is the problem. The batch
@@ -858,6 +882,35 @@ class Database:
         )
         cursor.execute(
             "ALTER TABLE albums ADD COLUMN IF NOT EXISTS mb_release_id TEXT"
+        )
+        # Which edition a group card opens when the user has no pick of
+        # their own. NULL falls back to the unlabeled edition, then lowest id.
+        cursor.execute(
+            "ALTER TABLE album_groups ADD COLUMN IF NOT EXISTS default_album_id "
+            "INTEGER REFERENCES albums(id) ON DELETE SET NULL"
+        )
+        # The edition each user last picked per group ("remember my
+        # edition"); the group card opens straight to it.
+        cursor.execute(
+            """CREATE TABLE IF NOT EXISTS user_edition_prefs (
+                user_id INTEGER NOT NULL,
+                group_id INTEGER NOT NULL REFERENCES album_groups(id) ON DELETE CASCADE,
+                album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, group_id)
+            )"""
+        )
+        # 👎 'Not now' (until = now + 30 days) and 'Never play this' (until
+        # NULL): songs a user doesn't want coming up. Queues step over them
+        # (the app and server-run casts); a direct pick still plays.
+        cursor.execute(
+            """CREATE TABLE IF NOT EXISTS song_holds (
+                user_id INTEGER NOT NULL,
+                song_id INTEGER NOT NULL REFERENCES songs(id) ON DELETE CASCADE,
+                until TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, song_id)
+            )"""
         )
 
         cursor.execute("ALTER TABLE rss_feeds ADD COLUMN IF NOT EXISTS custom_author TEXT")

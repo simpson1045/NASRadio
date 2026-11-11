@@ -5,9 +5,12 @@ import 'package:cached_network_image/cached_network_image.dart';
 import '../models/rss_feed.dart';
 import '../services/api_service.dart';
 import '../services/audio_player_service.dart';
+import '../services/offline_service.dart';
+import '../models/song.dart';
 import '../services/device_sync_service.dart';
 import '../main.dart' show globalDeviceSyncService;
 import 'now_playing_screen.dart';
+import '../widgets/image_zoom.dart';
 
 class RssFeedDetailScreen extends StatefulWidget {
   final RssFeed feed;
@@ -883,12 +886,16 @@ class _RssFeedDetailScreenState extends State<RssFeedDetailScreen> {
           ClipRRect(
             borderRadius: BorderRadius.circular(8),
             child: widget.feed.artworkUrl != null
-                ? Image.network(
-                    widget.feed.artworkUrl!,
-                    width: 100,
-                    height: 100,
-                    fit: BoxFit.cover,
-                    errorBuilder: (_, __, ___) => _artworkPlaceholder(),
+                ? GestureDetector(
+                    onTap: () =>
+                        showImageZoom(context, imageUrl: widget.feed.artworkUrl!),
+                    child: Image.network(
+                      widget.feed.artworkUrl!,
+                      width: 100,
+                      height: 100,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => _artworkPlaceholder(),
+                    ),
                   )
                 : _artworkPlaceholder(),
           ),
@@ -1288,10 +1295,87 @@ class _RssFeedDetailScreenState extends State<RssFeedDetailScreen> {
                     _startDownload(episode);
                   },
                 ),
+              if (Platform.isAndroid && OfflineService.instance.isReady)
+                _phoneDownloadTile(episode),
             ],
           ),
         ),
       ),
+    );
+  }
+
+  /// Save an episode to the PHONE for listening with no signal
+  /// (offline_service.dart). Not the same as "Download episode" above, which
+  /// keeps a copy on the server.
+  Widget _phoneDownloadTile(RssEpisode episode) {
+    final o = OfflineService.instance;
+    final saved = o.collection(OfflineService.keyFor('episode', episode.id)) != null;
+    return ListTile(
+      leading: Icon(
+        saved ? Icons.phone_android : Icons.download_for_offline_outlined,
+        color: saved ? const Color(0xFF00d4ff) : Colors.white54,
+      ),
+      title: Text(
+        saved ? 'Remove from phone' : 'Save to phone for offline',
+        style: const TextStyle(color: Colors.white),
+      ),
+      subtitle: Text(
+        saved
+            ? 'Saved for listening with no signal'
+            : 'Listen with no signal (car, dead zones)',
+        style: const TextStyle(color: Colors.white38, fontSize: 12),
+      ),
+      onTap: () {
+        Navigator.pop(context);
+        if (saved) {
+          o.remove('episode', episode.id);
+          return;
+        }
+        final feed = widget.feed;
+        final author = feed.author.isNotEmpty ? feed.author : feed.title;
+        // The same Song the player builds for this episode (id = -episode),
+        // so playing it finds the saved file.
+        final song = Song(
+          id: -episode.id,
+          title: episode.title,
+          artistId: 0,
+          artistName: author,
+          albumId: -feed.id,
+          albumTitle: feed.title,
+          trackNumber: 0,
+          duration: episode.audioDuration ?? 0,
+          filePath: episode.audioUrl ?? _apiService.getRssStreamUrl(episode.id),
+          fileSize: episode.audioSize ?? 0,
+          bitrate: 0,
+          sourceType: 'podcast',
+          podcastFeedId: feed.id,
+          podcastEpisodeId: episode.id,
+          playedPosition: episode.playedPosition,
+          isCompleted: episode.isCompleted,
+        );
+        // The server row, so the car can start it with no signal.
+        final row = <String, dynamic>{
+          'id': episode.id,
+          'feed_id': feed.id,
+          'title': episode.title,
+          'audio_url': episode.audioUrl,
+          'audio_duration': episode.audioDuration,
+          'audio_size': episode.audioSize,
+          'artwork_url': episode.artworkUrl,
+          'played_position': episode.playedPosition,
+          'is_completed': episode.isCompleted ? 1 : 0,
+          'feed_title': feed.title,
+          'feed_artwork_url': feed.artworkUrl,
+          'feed_author': author,
+        };
+        o.downloadEpisode(song, row);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Saving "${episode.title}" to your phone'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      },
     );
   }
 

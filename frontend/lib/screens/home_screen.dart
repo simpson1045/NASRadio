@@ -196,6 +196,7 @@ class _HomeScreenState extends State<HomeScreen>
                       child: CachedNetworkImage(
                         imageUrl: _apiService.getArtistImageUrl(artist.id),
                         width: 40,
+                        memCacheWidth: 80,
                         height: 40,
                         fit: BoxFit.cover,
                         placeholder: (context, url) => Container(
@@ -265,6 +266,7 @@ class _HomeScreenState extends State<HomeScreen>
                       child: CachedNetworkImage(
                         imageUrl: _apiService.getArtworkUrl(album.id),
                         width: 50,
+                        memCacheWidth: 100,
                         height: 50,
                         fit: BoxFit.cover,
                         placeholder: (context, url) => Container(
@@ -337,6 +339,7 @@ class _HomeScreenState extends State<HomeScreen>
             child: CachedNetworkImage(
               imageUrl: _apiService.getArtworkUrl(song.albumId),
               width: 50,
+              memCacheWidth: 100,
               height: 50,
               fit: BoxFit.cover,
               placeholder: (context, url) => Container(

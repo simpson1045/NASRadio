@@ -360,6 +360,7 @@ class _TvTrackRow extends StatelessWidget {
                 child: CachedNetworkImage(
                   imageUrl: apiService.getArtworkUrl(song.albumId),
                   width: 48,
+                  memCacheWidth: 96,
                   height: 48,
                   fit: BoxFit.cover,
                   placeholder: (_, __) => Container(

@@ -12,6 +12,8 @@ import '../screens/manual_merge_screen.dart';
 import '../screens/album_merge_screen.dart';
 import '../screens/lastfm_stats_screen.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import '../services/update_service.dart';
 import 'artwork_picker_dialog.dart';
 import '../services/audio_player_service.dart';
 import '../services/weather_service.dart';
@@ -19,9 +21,12 @@ import '../main.dart' show globalWeatherService;
 import '../screens/exclusions_screen.dart';
 import '../screens/alert_history_screen.dart';
 import '../screens/duplicate_review_screen.dart';
+import '../screens/alarms_screen.dart';
 import 'package:socket_io_client/socket_io_client.dart' as io;
 import 'package:audioplayers/audioplayers.dart' as audioplayers;
 import 'package:url_launcher/url_launcher.dart';
+import 'offline_settings.dart';
+import '../screens/held_songs_screen.dart';
 
 class SettingsDialog extends StatefulWidget {
   final ApiService apiService;
@@ -977,6 +982,50 @@ class _SettingsDialogState extends State<SettingsDialog>
                       color: Colors.white,
                     ),
                   ),
+                  const SizedBox(width: 10),
+                  // Which build is this? Version + build, and a BETA chip on
+                  // beta-channel builds (scripts/beta.ps1 sets CHANNEL=beta).
+                  Flexible(
+                    child: FutureBuilder<PackageInfo>(
+                      future: PackageInfo.fromPlatform(),
+                      builder: (context, snap) {
+                        final info = snap.data;
+                        return Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (info != null)
+                              Flexible(
+                                child: Text(
+                                  'v${info.version} (${info.buildNumber})',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(color: Colors.grey[500], fontSize: 12),
+                                ),
+                              ),
+                            if (UpdateService.isBeta) ...[
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: Colors.amber.withOpacity(0.15),
+                                  borderRadius: BorderRadius.circular(4),
+                                  border: Border.all(color: Colors.amber),
+                                ),
+                                child: const Text(
+                                  'BETA',
+                                  style: TextStyle(
+                                    color: Colors.amber,
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
+                        );
+                      },
+                    ),
+                  ),
                   const Spacer(),
                   IconButton(
                     icon: const Icon(Icons.close, color: Colors.grey),
@@ -1219,6 +1268,43 @@ class _SettingsDialogState extends State<SettingsDialog>
               style: const TextStyle(fontSize: 11, color: Colors.grey),
             ),
           ],
+          if (Platform.isAndroid) ...[
+            const SizedBox(height: 32),
+            _buildSectionHeader('Offline & Downloads'),
+            const SizedBox(height: 4),
+            const OfflineSettingsSection(),
+          ],
+          const SizedBox(height: 32),
+          _buildSectionHeader('Not now'),
+          const SizedBox(height: 4),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.thumb_down_alt_outlined, color: Color(0xFF00d4ff)),
+            title: const Text('Held songs', style: TextStyle(color: Colors.white)),
+            subtitle: const Text('Songs you skipped with 👎 or never want to hear',
+                style: TextStyle(color: Colors.grey)),
+            trailing: const Icon(Icons.chevron_right, color: Colors.grey),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const HeldSongsScreen()),
+            ),
+          ),
+          if (Platform.isAndroid) ...[
+            const SizedBox(height: 32),
+            _buildSectionHeader('Alarms'),
+            const SizedBox(height: 4),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.alarm, color: Color(0xFF00d4ff)),
+              title: const Text('Wake-up alarms',
+                  style: TextStyle(color: Colors.white)),
+              subtitle: const Text('Wake up to NASRadio',
+                  style: TextStyle(color: Colors.grey)),
+              trailing: const Icon(Icons.chevron_right, color: Colors.grey),
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const AlarmsScreen()),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -1374,11 +1460,12 @@ class _SettingsDialogState extends State<SettingsDialog>
               }
             })
           else
+            // Report only: the server lists songs whose files it can't find
+            // and deletes nothing (see /api/cleanup-missing).
             _buildButton(
-              'Remove Missing Files',
-              Icons.cleaning_services,
+              'Check Missing Files',
+              Icons.manage_search,
               _cleanupMissingFiles,
-              color: Colors.orange,
             ),
           const SizedBox(height: 32),
           _buildSectionHeader('Excluded Files'),

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon (Android 8+): fills the launcher / Android Auto tile in
+     the logo's navy instead of a shrunken square icon on a white tile.
+     Foreground = the tower + NAS from assets/images/nasradio_logo.png at 47%
+     of the 108dp canvas, inside the 66dp safe zone so no mask shape clips it.
+     The older mipmap-*/ic_launcher.png stays for Android 7 and below. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background"/>
+    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+</adaptive-icon>

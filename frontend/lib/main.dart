@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show LogicalKeyboardKey;
+import 'package:flutter/services.dart'
+    show LogicalKeyboardKey, MethodChannel, MissingPluginException;
 import 'package:media_kit/media_kit.dart';
 import 'dart:async' show runZonedGuarded;
 import 'dart:io' show Platform;
@@ -10,6 +11,9 @@ import 'package:windows_taskbar/windows_taskbar.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'services/api_service.dart';
+import 'services/app_visibility.dart';
+import 'services/frame_watchdog.dart';
+import 'services/stall_watch.dart';
 import 'layout_context.dart';
 import 'services/audio_player_service.dart';
 import 'services/audio_handler.dart';
@@ -18,6 +22,7 @@ import 'models/song.dart';
 import 'services/device_sync_service.dart';
 import 'services/weather_service.dart';
 import 'services/app_logger.dart';
+import 'services/alarm_service.dart';
 import 'screens/main_navigation_screen.dart';
 import 'widgets/app_back_navigator.dart';
 import 'screens/tv/tv_main_navigation_screen.dart';
@@ -27,6 +32,8 @@ import 'screens/setup_admin_screen.dart';
 import 'screens/setup_wizard_screen.dart';
 import 'services/admin_settings_service.dart';
 import 'services/auth_service.dart';
+import 'services/offline_service.dart';
+import 'services/update_service.dart';
 
 /// Heuristic: Android device with a TV-class screen. Empirically Fire
 /// TV / Android TV report widely varying logical-pixel sizes — older
@@ -166,6 +173,13 @@ Future<void> _mainGuarded() async {
 
   // Create the audio player service first
   globalAudioPlayerService = AudioPlayerService();
+  // Tripwire: logs frames drawn (playing / paused / hidden) every 10 min and
+  // warns when the app keeps drawing while nothing should move.
+  FrameWatchdog.instance.start(
+    isPlaying: () => globalAudioPlayerService.isPlaying,
+  );
+  // Logs when the main thread gets stuck, with what it was doing.
+  StallWatch.instance.start();
 
   // Create cast service and wire it up (mobile only)
   globalCastService = CastService();
@@ -186,6 +200,11 @@ Future<void> _mainGuarded() async {
   // (preserved across the disconnect by the _onCastStateChanged gate).
   // Net effect: a momentary audio gap, then playback continues
   // automatically — user doesn't have to manually re-cast.
+  // Cast stopped from elsewhere (ADMS, TV remote): back to the phone's
+  // own queue, paused — never auto-relaunch, never auto-play.
+  globalCastService.onRemoteEnd =
+      () => globalAudioPlayerService.handleCastEndedRemotely();
+
   globalCastService.onAutoReconnect = () {
     // With UP_NEXT the receiver may have kept the queue going by itself
     // during the outage. If it's mid-song, follow it; only re-LOAD (old
@@ -289,6 +308,7 @@ class _NASRadioAppState extends State<NASRadioApp>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _setupMediaKeys();
+    AuthService.instance.addListener(_onAuthChanged);
 
     // Add window listener for desktop
     if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
@@ -299,6 +319,14 @@ class _NASRadioAppState extends State<NASRadioApp>
     if (Platform.isAndroid || Platform.isIOS) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _initAudioService();
+      });
+    }
+
+    // Wake-up alarms: listen for a ringing alarm (and catch one that
+    // launched the app). Separate from audio init so neither blocks the other.
+    if (Platform.isAndroid) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        AlarmService.instance.init();
       });
     }
   }
@@ -314,12 +342,40 @@ class _NASRadioAppState extends State<NASRadioApp>
     // `inactive` (transient — incoming call, pull-down notification
     // tray) with cast hiccups.
     AppLogger.instance.info('📱 [App] Lifecycle → ${state.name}');
+    AppVisibility.instance.setLifecycle(state);
+    if (state == AppLifecycleState.resumed) {
+      // Sliding session: coming back to the app renews the login (throttled
+      // to once an hour inside refreshSession).
+      AuthService.instance.refreshSession();
+      // Back after a while: look for an app update again (it used to look
+      // only at start-up).
+      final last = UpdateService.lastCheck;
+      if (last == null ||
+          DateTime.now().difference(last) > const Duration(hours: 1)) {
+        UpdateService.requestRecheck();
+      }
+    }
     if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
       // App going to background — save state immediately so resume is accurate
+      AppLogger.instance.info(
+          '💾 [save] ${state.name}: "${globalAudioPlayerService.currentSong?.title}" '
+          'at ${globalAudioPlayerService.position.inSeconds}s');
       globalAudioPlayerService.savePlaybackState();
     } else if (state == AppLifecycleState.detached) {
       // App is being closed - stop playback
       globalAudioPlayerService.stop();
+    }
+  }
+
+  /// A rejected session can't stream anything (every URL 401s), so stop
+  /// "playing" locally instead of showing a song with no sound. A cast keeps
+  /// going: the receiver plays server-minted URLs.
+  void _onAuthChanged() {
+    if (AuthService.instance.sessionExpired &&
+        globalAudioPlayerService.isPlaying &&
+        !globalAudioPlayerService.isCasting) {
+      AppLogger.instance.warning('🔑 [auth] session expired, pausing playback');
+      globalAudioPlayerService.pauseExplicit();
     }
   }
 
@@ -337,7 +393,17 @@ class _NASRadioAppState extends State<NASRadioApp>
           androidNotificationOngoing: false,
           androidStopForegroundOnPause: true,
           androidShowNotificationBadge: true,
-          androidNotificationIcon: 'mipmap/ic_launcher',
+          // A white tower silhouette: Android draws the small icon as a one-colour
+          // mask, and the full-bleed app icon came out as a white square (Nov 9).
+          androidNotificationIcon: 'drawable/ic_stat_nasradio',
+          // Android Auto: show the 🔍 search button, and honor the per-folder
+          // list/grid hints in audio_handler.dart (albums as cover grids).
+          androidBrowsableRootExtras: {
+            'android.media.browse.SEARCH_SUPPORTED': true,
+            'android.media.browse.CONTENT_STYLE_SUPPORTED': true,
+            'android.media.browse.CONTENT_STYLE_BROWSABLE_HINT': 1, // list
+            'android.media.browse.CONTENT_STYLE_PLAYABLE_HINT': 1, // list
+          },
         ),
       );
 
@@ -345,6 +411,57 @@ class _NASRadioAppState extends State<NASRadioApp>
       globalAudioPlayerService.playingStream.listen((_) {
         handler.updateMediaSessionPublic();
       });
+
+      // Home-screen widget buttons the media session can't take
+      // (NowPlayingWidgetProvider.tellApp): Shuffle, Repeat, podcast skips.
+      if (Platform.isAndroid) {
+        const widgetChannel = MethodChannel('com.nasradio/widget');
+        widgetChannel.setMethodCallHandler((call) async {
+          switch (call.method) {
+            case 'shuffle':
+              await handler.customAction('Shuffle');
+            case 'repeat':
+              await handler.customAction('Repeat');
+            case 'seekBy':
+              final ms = (call.arguments as num?)?.toInt() ?? 0;
+              final to = globalAudioPlayerService.position +
+                  Duration(milliseconds: ms);
+              await handler.seek(to < Duration.zero ? Duration.zero : to);
+          }
+          return null;
+        });
+      }
+
+      // Offline listening: downloads + the dead-zone pre-load / replay cache.
+      if (Platform.isAndroid) {
+        OfflineService.instance.init(globalAudioPlayerService);
+      }
+
+      // "Hey Google, play ___ on NASRadio" on the phone / Google TV: Android
+      // gives the request to MainActivity, which forwards it here. Android
+      // Auto calls the handler's playFromSearch through the media session.
+      if (Platform.isAndroid) {
+        const voice = MethodChannel('com.nasradio/voice');
+        Future<void> runVoice(dynamic args) async {
+          final m = Map<String, dynamic>.from(args as Map);
+          await handler.playFromSearch(
+            '${m['query'] ?? ''}',
+            Map<String, dynamic>.from((m['extras'] as Map?) ?? const {}),
+          );
+        }
+        voice.setMethodCallHandler((call) async {
+          if (call.method == 'playFromSearch') await runVoice(call.arguments);
+          return null;
+        });
+        try {
+          final pending = await voice.invokeMethod('takePending');
+          if (pending != null) await runVoice(pending);
+        } on MissingPluginException {
+          // Android Auto started the app without its screen: MainActivity
+          // (which owns this channel) hasn't run, so there's nothing parked.
+          // A phone voice request always comes through MainActivity anyway.
+        }
+      }
     } catch (e, stack) {
       print('⚠️ Failed to initialize audio service: $e');
       print('⚠️ Stack trace: $stack');
@@ -399,6 +516,8 @@ class _NASRadioAppState extends State<NASRadioApp>
   }
 
   bool _taskbarShowingPlay = true; // Track current icon state to avoid redundant updates
+  bool _taskbarSet = false;
+  Object? _smtcSent;
 
   void _setupTaskbarButtons() async {
     // Delay to ensure window is fully registered with Windows taskbar
@@ -407,13 +526,16 @@ class _NASRadioAppState extends State<NASRadioApp>
   }
 
   void _updateTaskbarButtons({required bool isPlaying}) async {
-    // Skip if the state hasn't changed
-    if (isPlaying == !_taskbarShowingPlay && !_taskbarShowingPlay) return;
+    // Skip if the buttons already show this state. (Until Nov 9 the check
+    // only ever skipped while playing, so while paused the three .ico
+    // buttons were rebuilt on every player notify.)
+    if (_taskbarSet && isPlaying == !_taskbarShowingPlay) return;
 
     final playPauseIcon = isPlaying ? 'assets/icons/pause.ico' : 'assets/icons/play.ico';
     final playPauseLabel = isPlaying ? 'Pause' : 'Play';
 
     try {
+      StallWatch.instance.note('taskbar.buttons');
       await WindowsTaskbar.setThumbnailToolbar([
         ThumbnailToolbarButton(
           ThumbnailToolbarAssetIcon('assets/icons/previous.ico'),
@@ -432,6 +554,7 @@ class _NASRadioAppState extends State<NASRadioApp>
         ),
       ]);
       _taskbarShowingPlay = !isPlaying;
+      _taskbarSet = true;
     } catch (e) {
       print('🖥️ Taskbar button error: $e');
     }
@@ -439,6 +562,20 @@ class _NASRadioAppState extends State<NASRadioApp>
 
   void _updateSmtcState() {
     if (_smtc == null) return;
+
+    // The service notifies 4x/s for position alone; only talk to Windows'
+    // media controls when what they show actually changed.
+    final svc = globalAudioPlayerService;
+    final sending = (
+      svc.currentSong?.id,
+      svc.displayTitle,
+      svc.displayArtist,
+      svc.currentSong?.albumTitle,
+      svc.isPlaying,
+    );
+    if (sending == _smtcSent) return;
+    _smtcSent = sending;
+    StallWatch.instance.note('smtc.update');
 
     final song = globalAudioPlayerService.currentSong;
     if (song != null) {
@@ -490,6 +627,8 @@ class _NASRadioAppState extends State<NASRadioApp>
 
   @override
   void onWindowMaximize() async {
+    // Restoring a minimized window that was maximized arrives as maximize.
+    AppVisibility.instance.setMinimized(false);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('window_maximized', true);
   }
@@ -501,14 +640,18 @@ class _NASRadioAppState extends State<NASRadioApp>
     await _saveWindowState();
   }
 
+  // Minimize/restore drive AppVisibility (Windows only ever reports
+  // `inactive` for a minimized window). Focus = definitely on screen; blur
+  // alone changes nothing: an unfocused window on a second monitor keeps
+  // animating.
   @override
-  void onWindowFocus() {}
+  void onWindowFocus() => AppVisibility.instance.setMinimized(false);
   @override
   void onWindowBlur() {}
   @override
-  void onWindowMinimize() {}
+  void onWindowMinimize() => AppVisibility.instance.setMinimized(true);
   @override
-  void onWindowRestore() {}
+  void onWindowRestore() => AppVisibility.instance.setMinimized(false);
   @override
   void onWindowEnterFullScreen() {}
   @override
@@ -567,6 +710,14 @@ class _NASRadioAppState extends State<NASRadioApp>
           elevation: 4,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
         ),
+        // Without this, a SnackBar that sets a dark backgroundColor but no
+        // text colour got the dark theme's "on inverse surface" text: dark
+        // navy on dark navy ("Joined the cast on ..." looked blank).
+        snackBarTheme: const SnackBarThemeData(
+          backgroundColor: Color(0xFF1a2332),
+          contentTextStyle: TextStyle(color: Colors.white),
+          actionTextColor: Color(0xFF00d4ff),
+        ),
       ),
       // THE desktop/mobile layout verdict (DESKTOP_UX_SPEC.md §3) is
       // made HERE, wrapping the Navigator itself — so pushed routes
@@ -574,12 +725,20 @@ class _NASRadioAppState extends State<NASRadioApp>
       // LayoutScope. It originally lived inside the shell, where
       // pushed routes couldn't see it and silently fell back to the
       // phone layout.
-      builder: (context, child) => LayoutBuilder(
-        builder: (context, constraints) => LayoutScope(
-          layout: constraints.maxWidth >= LayoutScope.desktopBreakpoint
-              ? AppLayout.desktop
-              : AppLayout.mobile,
-          child: child!,
+      // TickerMode off = every animation in the app (route transitions
+      // included) pauses while nobody can see the app; see AppVisibility.
+      builder: (context, child) => ValueListenableBuilder<bool>(
+        valueListenable: AppVisibility.instance.visible,
+        builder: (context, visible, _) => TickerMode(
+          enabled: visible,
+          child: LayoutBuilder(
+            builder: (context, constraints) => LayoutScope(
+              layout: constraints.maxWidth >= LayoutScope.desktopBreakpoint
+                  ? AppLayout.desktop
+                  : AppLayout.mobile,
+              child: child!,
+            ),
+          ),
         ),
       ),
       home: _AuthGate(audioPlayerService: globalAudioPlayerService),

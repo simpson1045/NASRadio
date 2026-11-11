@@ -2368,6 +2368,12 @@ class _YouTubeDownloadScreenState extends State<YouTubeDownloadScreen> {
     final needPick = (sum['suspect'] ?? 0) - (sum['replaced'] ?? 0);
     if (needPick > 0) parts.add('$needPick need a pick');
     if ((sum['unverified'] ?? 0) > 0) parts.add('${sum['unverified']} unverified');
+    // Counted from the live list so a picked replacement counts too.
+    final official = (_playlistTracks ?? const []).where((t) => t['is_topic'] == true).length;
+    if (official > 0) {
+      final total = _playlistTracks!.length;
+      parts.add(official == total ? 'all official' : '$official of $total official');
+    }
     final head = [
       if (artist.isNotEmpty) artist,
       if (album.isNotEmpty) album,
@@ -2392,6 +2398,42 @@ class _YouTubeDownloadScreenState extends State<YouTubeDownloadScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  /// Second line under a playlist track: who uploaded it and why it passed or
+  /// failed. "ok" alone hid whether a track was official Topic audio or just
+  /// a random upload with the right length.
+  Widget _trackSourceLine(Map<String, dynamic> track, bool isExcluded) {
+    final channel = (track['channel'] ?? track['uploader'] ?? '').toString().trim();
+    final isTopic = track['is_topic'] == true;
+    final reason = (track['reason'] ?? '').toString().trim();
+    final parts = <String>[
+      if (channel.isNotEmpty) channel,
+      if (isTopic) 'official album audio'
+      else if (reason.isNotEmpty) reason,
+    ];
+    if (parts.isEmpty) return const SizedBox.shrink();
+    final color = isExcluded
+        ? Colors.grey[700]
+        : isTopic
+            ? Colors.green[400]
+            : Colors.grey[500];
+    return Row(
+      children: [
+        if (isTopic) ...[
+          Icon(Icons.verified, size: 12, color: color),
+          const SizedBox(width: 4),
+        ],
+        Expanded(
+          child: Text(
+            parts.join(' · '),
+            style: TextStyle(color: color, fontSize: 11),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
     );
   }
 
@@ -2659,6 +2701,36 @@ class _YouTubeDownloadScreenState extends State<YouTubeDownloadScreen> {
                   fontWeight: FontWeight.bold,
                 ),
               ),
+              // OLAK5uy_ playlists are YouTube Music's auto-generated album
+              // playlists: the label's own upload of the whole album.
+              if (((_curation?['playlist_id'] as String?) ?? '').startsWith('OLAK5uy_') ||
+                  _urlController.text.contains('list=OLAK5uy_')) ...[
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: Colors.green.withOpacity(0.15),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: Colors.green.withOpacity(0.5)),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.verified, size: 12, color: Colors.green[400]),
+                        const SizedBox(width: 4),
+                        Flexible(
+                          child: Text(
+                            'Official YouTube Music album',
+                            style: TextStyle(color: Colors.green[400], fontSize: 10, fontWeight: FontWeight.bold),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
               const Spacer(),
               if (_excludedTrackIndices.isNotEmpty)
                 Text(
@@ -2704,10 +2776,14 @@ class _YouTubeDownloadScreenState extends State<YouTubeDownloadScreen> {
           const SizedBox(height: 8),
           // Track list with checkboxes
           _buildCurationSummary(),
+          // Part of the page, not its own scroll box: a capped inner list
+          // swallowed swipes (it had nothing to scroll) and hid the last
+          // track + the Download button below the fold.
           Container(
-            constraints: const BoxConstraints(maxHeight: 300),
             child: ListView.builder(
               shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              padding: EdgeInsets.zero,
               itemCount: _playlistTracks!.length,
               itemBuilder: (context, index) {
                 final track = _playlistTracks![index];
@@ -2747,19 +2823,25 @@ class _YouTubeDownloadScreenState extends State<YouTubeDownloadScreen> {
                         ),
                         const SizedBox(width: 8),
                         Expanded(
-                          child: Text(
-                            track['title'] ?? 'Unknown',
-                            style: TextStyle(
-                              color: isExcluded
-                                  ? Colors.grey[700]
-                                  : Colors.white,
-                              fontSize: 13,
-                              decoration: isExcluded
-                                  ? TextDecoration.lineThrough
-                                  : null,
-                            ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                track['title'] ?? 'Unknown',
+                                style: TextStyle(
+                                  color: isExcluded
+                                      ? Colors.grey[700]
+                                      : Colors.white,
+                                  fontSize: 13,
+                                  decoration: isExcluded
+                                      ? TextDecoration.lineThrough
+                                      : null,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              _trackSourceLine(track, isExcluded),
+                            ],
                           ),
                         ),
                         const SizedBox(width: 6),
@@ -3239,13 +3321,15 @@ class _YouTubeDownloadScreenState extends State<YouTubeDownloadScreen> {
           ),
           const SizedBox(height: 8),
           Container(
-            constraints: const BoxConstraints(maxHeight: 300),
             decoration: BoxDecoration(
               color: const Color(0xFF0d1b2a),
               borderRadius: BorderRadius.circular(8),
             ),
+            // Part of the page, not its own scroll box (see the playlist list).
             child: ListView.builder(
               shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              padding: EdgeInsets.zero,
               itemCount: _downloadedTracks.length,
               itemBuilder: (context, index) {
                 return Padding(

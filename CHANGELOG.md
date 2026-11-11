@@ -1,3 +1,726 @@
+## 1.4.18 - 2026-11-10 (build 200)
+
+The biggest NASRadio update yet: forty beta builds since 1.4.17.
+
+**Android Auto**
+- Playlists play in order from the song you tap, with Play All and Shuffle.
+- Search in the car, and voice requests that Google Assistant hands to
+  NASRadio (in the car, on the phone and on Google TV).
+- Stations, Most Played, album grids, artist Play All, a working Up Next
+  queue, and Favorite / Shuffle / Repeat / Not now buttons on the player.
+- A resume card for what you were playing, and no more stuck spinner when
+  the phone changes networks.
+
+**Offline listening (Android)**
+- Download playlists and albums to the phone in a compact Opus format.
+- Dead-zone pre-loading keeps the next stretch of your queue on the phone,
+  and a replay cache means a song you just heard can play again without a
+  signal.
+- With no signal at all, the car and the phone browse what's on the phone.
+
+**New ways to play**
+- 👎 Not now: skip a song for a while (or for good) without unliking it.
+- 🔂 Repeat once: long-press Repeat to hear this song one more time, then
+  your old repeat mode carries on.
+- Wake-up alarms (Android) and song recognition.
+- A home-screen widget that follows the music: blurred cover, live
+  waveform, crossfades with the song.
+
+**Your library**
+- Editions Available: album pages show every edition MusicBrainz knows
+  about (Dolby Atmos, 5.1, SACD, DVD-Audio, Blu-ray, hi-res, Japan / SHM-CD,
+  vinyl, remasters), with the ones you own checked off.
+- Importing picks the right release for you by comparing the files with
+  every MusicBrainz release (track count, track lengths, bit depth, source),
+  and tells you what a download actually contains.
+- Missing songs in playlists: one "Get this song" button (download the
+  album, find it on YouTube, add it from your device, or link it), and
+  missing songs fill in by themselves after an import.
+- Add music from any device: upload files or folders from a phone or PC
+  straight into the import queue.
+- Album editions (deluxe, remasters...) are grouped and counted once.
+
+**Desktop**
+- Much lighter: the app no longer redraws its window when nothing is
+  moving, so laptops stay cool and quiet; long titles scroll once instead
+  of forever; heavy artwork is decoded at the size it's shown.
+- Mac: in-app updates, the proper icon and name, and sign-in that sticks.
+- New downloads: a macOS app (one universal build for Intel and Apple
+  Silicon Macs) and a Linux app (x64).
+  - macOS: open NASRadio-macos.dmg and drag NASRadio to Applications. It
+    isn't signed by Apple, so the first time, right-click the app and
+    choose Open.
+  - Linux: install libmpv first (`sudo apt install libmpv2` on Ubuntu,
+    Debian or Mint), extract nasradio-linux.tar.xz into a folder of its
+    own and run `nasradio`. After that, updates install from inside the
+    app.
+
+**Casting and lyrics**
+- Volume levelling (ReplayGain) on casts, so a loud track no longer
+  blasts after a quiet one; the TV shows each album's year.
+- NASRadio TV (Windows): a full-screen cast receiver for a PC connected to
+  a TV.
+- Synced lyrics glide smoothly and come back on their own after a lookup
+  service outage.
+
+**Updates and reliability**
+- Your server now fetches new stable releases from GitHub on its own, so
+  every device gets the update banner without copying files by hand.
+- The update banner appears after a refresh, no restart needed.
+- Your spot in the song survives app updates and restarts, and follows you
+  between devices.
+- Sign-in stays put (30-day sessions, refreshed when you open the app).
+- Dozens of smaller fixes: no endless spinners, search shows what you
+  typed, readable pop-ups, and more. The full list is in CHANGELOG.md.
+
+## 1.4.18-beta - 2026-11-10 (build 199)
+
+**Lighter in the background**
+- The System Logs and Torrents pages stop refreshing while you're not
+  looking at them (another section open, another page on top, or the app
+  minimized), and catch up as soon as you come back.
+- Torrents: your saved refresh interval and auto-stop setting now apply
+  right away (they were ignored until you opened the settings).
+- Favorite hearts can't get stuck spinning if the server doesn't answer.
+- Desktop: the Stations "now playing" bars animate more gently, so a
+  playing station doesn't keep the whole window redrawing.
+- Small album covers in lists load at their real size instead of full
+  resolution, which saves memory and makes scrolling lighter.
+
+## 1.4.18-beta - 2026-11-10 (build 198)
+
+**Android Auto fix**
+- The car no longer gets stuck showing a spinning play button that does
+  nothing. Leaving home Wi-Fi made the player report "buffering" for a
+  split second; the update saying it was done got dropped, so the car kept
+  spinning until you pressed pause and play. The car (and the lock screen)
+  now always gets the latest state.
+
+## 1.4.18-beta - 2026-11-09 (build 197)
+
+**Fixes**
+- Your saved spot now also loads from the server at startup. That fetch
+  ran before the app had loaded your login, so it failed on every start;
+  only the copy on the device itself was being used, which meant no
+  handoff between devices.
+- Android Auto: when the car starts the app and presses play right away,
+  that play now waits for the app to finish starting instead of being
+  dropped (it used to spin until you pressed play yourself).
+- Importing: if the top MusicBrainz result doesn't match the download, the
+  app now tries the next two before giving up (a single or a compilation
+  sometimes comes up first).
+
+## 1.4.18-beta - 2026-11-09 (build 196)
+
+**Importing: the app picks the release for you**
+- The import screen now says what a download actually contains: number
+  of tracks, total length, file type, bit depth and sample rate, and the
+  source if the download says (CD, WEB, vinyl...).
+- After the automatic MusicBrainz search, it opens the top result and, if
+  the files clearly match one release (track count, track lengths to the
+  second, bit depth, source), picks that release for you, with a
+  "Picked for you" box that lists why. Choosing a different release
+  yourself replaces it.
+- When it can't tell for sure, it says so, and the closest matches are
+  marked in the list.
+
+## 1.4.18-beta - 2026-11-09 (build 195)
+
+**Editions Available**
+- Album pages and Missing Albums now show every edition of the album that
+  MusicBrainz knows about: Dolby Atmos, 5.1 / surround, SACD, DVD-Audio /
+  DualDisc, Blu-ray, hi-res, Japan / SHM-CD, vinyl, and remasters /
+  deluxe editions, with how many of each.
+- On albums you have, the editions you already own get a check mark.
+- Tap an edition to see each release (year, country, format, label, track
+  count; tap one to open it on MusicBrainz), or to search Prowlarr for
+  that edition.
+- If you own an Atmos or 5.1 copy that MusicBrainz doesn't list yet, the
+  album page says so, with a link to add it there.
+
+## 1.4.18-beta - 2026-11-09 (build 194)
+
+**Desktop: much lighter while music plays**
+- The mini player's progress bar no longer redraws the whole window every
+  frame: it updates 12 times a second (it moves about a pixel each time,
+  so it looks the same). The sparks stay on the phone.
+- Long song titles scroll once to show the whole name, then stop. Hover
+  over a title to scroll it again. They used to scroll forever, even
+  while paused.
+- Starting a song or changing tracks no longer re-blurs the whole
+  background for about a second.
+- The Now Playing waveform is drawn once per song instead of every frame.
+  It still runs at 60 fps.
+- Home, album pages, Stations and the queue only refresh when the song or
+  play state changes, instead of four times a second.
+- Windows' media controls and taskbar buttons only update when something
+  changes.
+- Saving your spot no longer rewrites your whole queue every few seconds.
+- If the app's screen ever gets stuck for more than a second, it now logs
+  how long and what it was doing at that moment, so stalls can be tracked
+  down from the logs.
+
+## 1.4.18-beta - 2026-11-09 (build 193)
+
+**Desktop: no more running hot (and the freezes that came with it)**
+- The app kept redrawing its window about 60 times a second even when
+  nothing on screen was moving: the waveform bar's animation clock never
+  stopped, Now Playing's clock ran while paused, and sections you weren't
+  looking at kept animating in the background. Now it only draws when
+  something actually moves. Playing still updates the waveform at 60 fps,
+  and the themed-song glow still breathes while paused (more gently).
+- The app now logs its own frame rate, so if this ever creeps back it
+  shows up in the logs right away.
+
+**Missing songs in playlists**
+- One "Get this song" button on each missing song: download the album,
+  find it on YouTube, add it from this device, or link it to a song that's
+  already in your library.
+- Find on YouTube opens already searched for that song.
+- The link box now tells you when a song isn't in your library yet, with
+  buttons to get it, instead of only showing the nearest wrong matches.
+- Missing songs now fill in on their own after you import an album or a
+  YouTube song. No more "Re-link" button.
+- A song preview resumes your music when it ends.
+
+## 1.4.18-beta - 2026-11-09 (build 192)
+
+**Android Auto fixes**
+- The Up Next queue in the car no longer keeps jumping back to the top, so
+  you can scroll it and tap a song.
+- Fixed a case where play could be ignored for the rest of a session after
+  starting up.
+- Extra logging around the car's play and pause, to track down Android
+  Auto's auto-play not starting when it connects.
+
+## 1.4.18-beta - 2026-11-09 (build 191)
+
+**Fixes**
+- Your spot in the song now survives app updates and restarts. It was
+  being saved correctly, but the player reset it to 0:00 at start-up
+  before you pressed play.
+- With crossfade on, the song name in the status bar, on the lock screen
+  and in Android Auto now changes at the same moment as the album art,
+  instead of a few seconds later.
+
+## 1.4.18-beta - 2026-11-09 (build 190)
+
+**🔂 Repeat once**
+- Long-press the Repeat button to play the current song one more time.
+  A little "1×" shows while it's set. After the replay, your repeat
+  setting carries on exactly as it was (Repeat All stays Repeat All).
+- Pressing Next or picking another song cancels it.
+
+**Add music from this device**
+- Import Queue has a new Upload button: pick songs or a whole album folder
+  from your phone, or on a PC from its drives and network shares, and it
+  lands in the queue ready to import like any download.
+- A missing track in a playlist has a new "Add from this device" button:
+  pick the file, import it, and the playlist slot links to it by itself
+  (or the link box opens if more than one song could match).
+- On Android, picking files always works; picking a whole folder works when
+  Android lets the app read it.
+
+## 1.4.18-beta - 2026-11-09 (build 189)
+
+**👎 Not now**
+- New 👎 next to the ❤️ on Now Playing: tap it to skip the song and keep it
+  out of your queues for 30 days (with Undo). Press and hold it for "Never
+  play this".
+- It applies everywhere: shuffles, playlists played in order, albums, the
+  car, and casts to the TV. Tapping a held song directly still plays it.
+- Also in a song's ⋮ menu (Not now / Never play this / Play again), and as
+  a 👎 button in Android Auto.
+- Settings > Playback > Not now > Held songs lists everything you've held
+  back, with "Play again" to lift one early.
+
+**Fixes**
+- Updating the app no longer loses your place in the song. The phone's own
+  saved spot now wins when it's newer than the server's.
+- Home-screen widget: the blurred album art now fills the whole widget
+  (no dark frame), the blur is smooth, and light album covers are darkened
+  enough that the text stays readable.
+
+## 1.4.18-beta - 2026-11-09 (build 188)
+
+**The home-screen widget comes alive**
+- The album art now fills the whole widget, blurred and darkened, instead
+  of a flat colour.
+- The progress bar is the song's own waveform, lit in a colour taken from
+  the album art as it plays.
+- Shuffle and Repeat on the widget now actually work (they did nothing
+  before) and light up when they're on. For podcasts they skip back 10 s
+  and forward 30 s.
+- With crossfade on, the widget's song, artist and art now change at the
+  same moment as its progress bar, instead of about 7 seconds later.
+- Lighter on the battery: the art is processed once per song instead of
+  every second.
+
+**Update banner without restarting**
+- The refresh button on the home screen now also checks for an app update,
+  and so does coming back to the app after an hour or more.
+
+**Fixes**
+- Linking a missing playlist track to a library song no longer pops up the
+  keyboard over the results; the search is already filled in.
+- NASRadio's icon in the status bar and on the lock-screen player is now a
+  little tower instead of a white square.
+
+## 1.4.18-beta - 2026-11-09 (build 187)
+
+**Fixed: Now Playing buttons not responding right after starting music**
+- Pre-loading for dead zones grabbed a big batch of songs at full speed
+  the moment you started a playlist, which tied up the app (shuffle
+  wouldn't toggle) and slowed the server down for everything else.
+- Pre-loading now runs in the background at a gentle pace, one song at a
+  time, so the app stays responsive. An hour of music still pre-loads in
+  about a minute.
+- It now fetches the next song first (it was grabbing the song an hour
+  away first), and it stops pre-loading songs from a queue you've moved on
+  from.
+
+## 1.4.18-beta - 2026-11-06 (build 186)
+
+**Offline library: no signal, still music**
+- With no signal, Android Auto now shows what's on your phone instead of
+  spinning: Playlists shows your downloaded playlists, and Favorites, Most
+  Played, Recently Played, albums and artists show the songs you have on
+  the phone. Search and "Hey Google" search the phone too.
+- Library has a new Downloads section: downloaded playlists, albums and
+  podcast episodes, plus "Everything on this phone".
+- When the server stops answering, the car stops waiting on it for a
+  minute, so the lists come up right away.
+- Podcasts: long-press an episode and pick "Save to phone for offline".
+  Saved episodes show under Podcasts in the car.
+- On the phone: a Downloads button at the top of the Playlists screen (and
+  in Settings) lists everything downloaded, works with no signal, and lets
+  you play or remove things.
+
+**New app icon**
+- The NASRadio icon now fills its tile (navy, no more white square) on the
+  phone and in Android Auto.
+
+**Faster on cellular**
+- Away from home Wi-Fi the app no longer tries your home network address
+  first, which cost about 3 seconds on every connection check.
+
+## 1.4.18-beta - 2026-11-06 (build 185)
+
+**Fixed: Android Auto showed an error instead of what's playing**
+- Since build 182 the car's Now Playing screen could fail to show the song
+  (music kept playing). The new ❤️, Shuffle, Repeat and podcast Speed
+  buttons had their icons stripped out of the app by the build, and the
+  car choked on the missing ❤️ icon. The icons are back.
+
+## 1.4.18-beta - 2026-11-06 (build 184)
+
+**Offline listening: downloads and dead zones**
+- New ⬇ Download button on every playlist and album. Downloaded music stays
+  on your phone until you remove it, and a downloaded playlist picks up
+  songs you add to it later.
+- Downloads are compressed to Opus 160 by default: about 4.8 MB a song,
+  half the size of AAC 320 and the same sound in a car. 20 GB holds about
+  4,000 songs. You can pick AAC 320 or Lossless instead.
+- Dead zones: NASRadio now keeps the next hour of whatever you're playing
+  on the phone, so music keeps going when the signal drops. Songs you've
+  played are kept for a few hours too, so you can go back and replay
+  something with no signal.
+- A downloaded or pre-loaded song plays from the phone automatically, also
+  in the car.
+- Settings > Playback > Offline & Downloads: pre-load on/off, use cellular
+  data on/off, download format, a storage limit (5 to 100 GB), how much
+  space it's using, and a button to clear the replay cache.
+
+## 1.4.18-beta - 2026-11-06 (build 183)
+
+**"Hey Google" works on the phone too**
+- "Hey Google, play Dokken on NASRadio" now works on the phone itself (and
+  on a Google TV box with NASRadio installed), not just in the car.
+
+**Playlists remember being played**
+- Starting a playlist with the Play or Shuffle buttons, from a playlist
+  card, or from the car now counts as playing it, so it shows up first in
+  the Playlists screen's "Recently played" row. Before, only tapping a
+  single song inside the playlist counted.
+
+**Android Auto**
+- When the car connects, Android Auto can offer to pick up where you left
+  off.
+- The car's queue shows what it's playing from ("Laid Back").
+- Library has new sections: Recently Added, Genres (with Play All and
+  Shuffle All), Decades and Podcasts.
+- Podcasts: "Continue listening" picks up where you stopped and shows the
+  time left; "New episodes" lists the latest from your shows. Intro and
+  outro skips work the same as on the phone.
+- While a podcast plays, a speed button cycles 1× → 1.25× → 1.5× → 1.75× →
+  2×, and the current speed shows under the title.
+
+## 1.4.18-beta - 2026-11-06 (build 182)
+
+**Android Auto: voice, search and a lot more**
+- Voice: "Hey Google, play Dokken on NASRadio" shuffles the artist. You can
+  also name a playlist ("play Laid Back"), an album, or a song ("play The
+  Hunter by Dokken").
+- The 🔍 search button on the car screen finds playlists, artists, albums
+  and songs.
+- Tapping a song in the car's queue (Up Next) list now plays it. Before,
+  nothing happened.
+- New Stations tab, and Most Played under Library. The tabs are now
+  Playlists, Favorites, Stations and Library (Recently Played, Most Played,
+  Albums, Artists).
+- Albums show as a grid of covers.
+- Every artist has "▶ Play All" and "🔀 Shuffle All" above their albums.
+- New ❤️ button on the car's Now Playing screen adds or removes the
+  current song from Favorites.
+- The Shuffle and Repeat buttons now actually show up in the car (and on
+  the phone's lock screen player). They were quietly missing before.
+- The car shows a loading spinner while a song is still buffering.
+
+## 1.4.18-beta - 2026-11-06 (build 181)
+
+**Android Auto: playlists play in order**
+- Tapping a song in a playlist on the car screen now plays the playlist
+  from that song onward, in order. Before, it played just that one song and
+  then carried on with the rest of that song's album.
+- Every playlist has a new "▶ Play All" at the top, next to "🔀 Shuffle All".
+- The same goes for Albums, Favorites and Recently Played: tap a song and
+  the rest of that list follows it.
+- Playlist entries that aren't in your library (from Spotify imports) no
+  longer show up as "Unknown" rows that do nothing.
+
+## 1.4.18-beta - 2026-11-04 (build 180)
+
+**Fixed: laptop running hot and freezing with Now Playing open**
+- The Now Playing screen's blurred background was being re-blurred on
+  every frame whenever anything on screen moved (scrubber, sparks, the new
+  lyrics drift). On a laptop that kept the graphics chip working flat out:
+  fans spinning up, and the whole computer freezing every few minutes.
+  The background is now blurred once and reused. It looks the same.
+- Lyrics now draw nothing at all while music is paused, and the glow on
+  the current line holds steady instead of pulsing.
+
+## 1.4.18-beta - 2026-11-03 (build 179)
+
+**Lyrics glide smoothly**
+- Synced lyrics no longer jump from line to line: they drift up at a
+  steady pace, so each line reaches the middle just as it's sung (the same
+  as the TV's cast screen).
+- The current line no longer changes size, so the list doesn't shuffle
+  around under you. It's highlighted with color and a soft glow instead.
+
+**Lyrics come back on their own**
+- When the lyrics service is down, the app says "Lyrics service is busy,
+  try again in a bit" instead of "No lyrics found", and quietly tries again
+  every minute while the lyrics are open.
+
+**Search shows what you typed**
+- Fixed search sometimes showing results for a half-typed word ("the hun"
+  instead of "the hunter") when the server was slow to answer.
+
+## 1.4.18-beta - 2026-10-27 (build 178)
+
+**Import Album: "Which release is this?"**
+- When you open a release group's list of releases (all the CDs, vinyl,
+  downloads...), NASRadio now compares them to the files you're importing
+  and marks the one that fits with a gold ★ BEST MATCH, moved to the top.
+- Under it you see why: track count, whether the track lengths match,
+  the audio quality (24-bit/96 kHz can't be a CD), what the .nfo says
+  about the source, and the label.
+- A line above the list shows what it measured from your files, e.g.
+  "Your files: 9 tracks · 24-bit/96 kHz · .nfo: WEBQ".
+- When two releases fit equally well, both are marked "possible match"
+  instead of guessing.
+
+## 1.4.18-beta - 2026-10-27 (build 177)
+
+**Prowlarr search**
+- Results now fill in as each indexer answers, instead of waiting for the
+  slowest one. A row of small chips shows each indexer: searching, how
+  many it found, too slow, or stopped.
+- While a search is running, the Search button turns into a red Cancel.
+  It tells the server to stop and keeps whatever already arrived.
+- 1337x moved to the "Also search" group with RuTracker. It sits behind
+  Cloudflare and could take 30+ seconds, which used to hold up every
+  search. The default search now answers in a second or two.
+- The Pirate Bay indexer was turned off (it failed every search).
+
+**Server (already live)**
+- Fixed a background job that had re-converted the same four very long
+  tracks every 30 minutes since September (and re-checked the whole
+  library each time). Long tracks now get enough time, podcasts are
+  skipped, and only songs that actually need converting are touched.
+
+## 1.4.18-beta - 2026-10-27 (build 176)
+
+**No more endless spinners**
+- Prowlarr search shows its results as soon as they arrive. The "in your
+  library" and "downloading" badges fill in a moment later instead of
+  holding up the whole list.
+- A search that takes too long now says so ("Prowlarr took longer than
+  45s to answer. Try the search again.") instead of spinning forever.
+- Starting the app can no longer get stuck on the loading screen if the
+  server is slow to answer: it opens anyway and catches up in the
+  background.
+- Fixed a hidden error that was recorded as a crash whenever the server
+  turned down a "this song was played" report.
+- Behind the scenes: any request that takes more than a few seconds is
+  now logged on both the phone and the server, so the next slowdown can
+  be tracked down instead of guessed at.
+
+## 1.4.18-beta - 2026-10-26 (build 175)
+
+**Sign-in**
+- Fixed: after 30 days the app's sign-in quietly expired. The player kept
+  showing "playing" (in Android Auto too) but no sound came out, because
+  the server refused every song. Your sign-in now renews itself every
+  time you open the app and about once a day while it runs, so a device
+  you use never gets signed out. Only a device you haven't opened in 30
+  days asks you to sign in again.
+- If a sign-in does run out, the app now says "Your session expired" on
+  the sign-in screen, local playback stops, and Android Auto shows "Signed
+  out of NASRadio. Open the app on your phone to sign in." instead of
+  pretending to play.
+- Song and artwork links now carry a pass that renews weekly instead of
+  monthly (they show up in server logs, so shorter is safer).
+- The home-screen widget no longer re-asks for album art every second when
+  it can't get it.
+
+## 1.4.18-beta - 2026-10-26 (build 174)
+
+**Desktop**
+- Fixed: a maximized window reopened maximized for a moment, then shrank
+  to a slightly smaller normal window, and the app forgot it was
+  maximized. It now stays maximized. (Maximize it once more after this
+  update; the old build had saved "not maximized".)
+- Even less work in the background: the app was refreshing its screen
+  every time the player reported the song position, dozens of times a
+  second, even while minimized. It now updates 4 times a second while
+  you can see it (progress bars still glide smoothly) and once a second
+  while minimized.
+
+## 1.4.18-beta - 2026-10-26 (build 173)
+
+**Desktop: no more hot laptop**
+- Fixed: the Windows app kept the graphics chip busy (about a quarter of
+  it on a laptop) the whole time music played, even minimized, which made
+  laptops run hot with loud fans. The mini player was redrawing itself
+  completely 60+ times a second, forever, just to move its progress bar.
+- Now only the progress bar itself animates, and only while a song is
+  actually playing. Minimize the app (or hide it) and every animation
+  stops; bring it back and it's all smooth again. A window that's visible
+  but not focused, like on a second screen, keeps animating.
+
+## 1.4.18-beta - 2026-10-25 (build 172)
+
+**YouTube Download**
+- Fixed: the last track of a playlist (and the Download button) could hide
+  below the screen, and swiping on the track list didn't scroll. The track
+  list now scrolls with the rest of the page, so everything is reachable.
+- Each track now shows who uploaded it and why it passed: official album
+  audio from the artist's "Topic" channel gets a green check, anything
+  else shows the channel and the reason (for example "length matches
+  album cut").
+- The summary line says how many tracks are official ("all official" or
+  "5 of 8 official"), and a YouTube Music album playlist gets an
+  "Official YouTube Music album" tag.
+
+## 1.4.18-beta - 2026-10-24 (build 171)
+
+**Song recognition**
+- Fixed: "What's this song?" stopped finding anything around Oct 19.
+  Shazam quietly stopped answering short recordings; the server now
+  sends them the way Shazam wants (already live, so it works in older
+  builds too), and a few seconds of music is usually enough again.
+- You can now see what it's doing: a status line under the timer shows
+  each try ("Checking with Shazam...", "no match yet, keep it playing").
+- If Shazam itself is down, an orange banner says so right away, the
+  backup (AcoustID) keeps trying, and the app stops early instead of
+  counting to the end for nothing.
+- Different problems get different screens: "No match", "Shazam is
+  down", or "Can't reach your server".
+
+**Wake-up alarms (new, Android)**
+- Settings > Alarms: wake up to your own music. An alarm plays a playlist,
+  an album, a station, or a shuffle of your whole library, with its own
+  volume, an optional fade-in (30s, 1m or 2m), snooze, and a one-minute
+  test button. If the music can't start within 15 seconds, the phone's
+  normal alarm sound plays instead, so a network problem never means
+  oversleeping.
+- The ring screen works over the lock screen: Stop, Snooze, what's
+  playing, and "I'm up, keep playing" to hand the music over to the app
+  and start the day with it.
+- Alarms survive reboots, app updates and time changes, and ring even
+  with the app closed.
+- The Sleep Timer dialog has a shortcut to Alarms.
+
+**Reliability**
+- Fixed: the app could start up "media-dead" - every song skipped as if
+  its file were missing, and no album covers loaded - until you restarted
+  it. If fetching the media pass failed at launch (a brief network or
+  server hiccup was enough), the app never tried again. It now keeps
+  retrying on its own, and the player also grabs a fresh pass before
+  retrying a failed stream, so playback heals within one song instead of
+  skipping whole albums.
+
+## 1.4.18-beta - 2026-10-08 (build 168)
+
+**Artist page**
+- The Popular list shows each song's album on its own line, right under
+  the song title. Long album names used to run under the menu button and
+  off the edge of the screen. "My Stats" shows the album too, above the
+  play count.
+
+**Server (already live)**
+- Songs in Apple's lossless format (ALAC) played as silence on Android
+  phones. Every ALAC song in the library is now FLAC, which is just as
+  lossless (the audio is bit-for-bit identical), and new imports convert
+  ALAC to FLAC automatically.
+
+## 1.4.18-beta - 2026-10-08 (build 167)
+
+**Android Auto**
+- The background on the Android Auto screen no longer flashes and
+  glitches during playback. The app was re-sending the same song info
+  twice a second, which made the screen redraw the picture each time.
+- Trying out the artist photo as the Android Auto background (like the
+  Now Playing screen), with the album cover still shown as the song art.
+
+## 1.4.18-beta - 2026-10-07 (build 166)
+
+**Android Auto**
+- Music no longer goes silent in the car. If the app lost the audio to
+  Android Auto (or anything else) and then restarted itself, for example
+  after a network hiccup, it kept "playing" without permission, so the
+  car got nothing. It now asks for the audio again every time.
+- Turning the car off (or disconnecting Bluetooth, USB or headphones)
+  pauses the music instead of carrying on out of the phone speaker.
+- Album art shows on the Android Auto screen, the lock screen and the
+  notification again.
+
+**Settings**
+- "Remove Missing Files" is now "Check Missing Files". It only reports
+  songs whose files can't be found and never deletes anything.
+
+**Server (already live)**
+- The TV reports what audio and video formats it supports, for future
+  casting work.
+
+## 1.4.18-beta - 2026-10-06 (build 164)
+
+**Albums**
+- Editions: an album you own in several versions (stereo, Dolby Atmos,
+  5.1, a remaster, a deluxe) is now ONE album everywhere, marked with a
+  small "4 editions" badge. Open it and pick the edition from the chips
+  under the title: the tracklist, track count, length and badges swap in
+  place, without leaving the page. The edition you pick is remembered,
+  so the album opens to it next time.
+- The album page shows the album's own year, plus the edition's year when
+  it came out later ("1985 · 2025 edition").
+- Long album titles wrap onto more lines instead of being cut off, and the
+  title no longer slides up over the cover.
+- On a desktop-sized window the album page is two columns: cover and info
+  on the left, the tracklist on the right.
+- Images: albums with scans, back covers, photos or booklets in their
+  folder get an Images button with a swipe-and-zoom viewer (PDF booklets
+  open too).
+
+**Artwork**
+- Tap any big cover (album, Now Playing, playlist, podcast, release
+  preview, missing album, artist photo) for a full-screen view you can
+  pinch to zoom, double-tap to zoom in, and tap to close.
+- The artwork picker shows previews for images found in the album folder.
+
+**Formats**
+- Dolby TrueHD / Atmos disc rips (.mka) play and show their own badge.
+
+**Mac**
+- In-app updates work on the Mac, the app has its NASRadio icon and name,
+  and signing in sticks between launches.
+
+**Server (already live)**
+- Album lists, search and the library count an album's editions once.
+- The TV's title, artist and album lines are evenly spaced and closer
+  together, and the album line is easier to read.
+- Importing .mka (TrueHD) rips records their real channels and Atmos, and
+  disc sub-folders are skipped.
+
+## 1.4.18-beta - 2026-09-30 (build 163)
+
+**Now Playing**
+- Van Halen tracks: every song gets its own Frankenstrat scrubber (the
+  same pattern each time you play it), with stripes along the whole bar
+  instead of bunching up.
+
+**Casting**
+- Casts started from the phone tell the TV which tracks are Dolby Atmos /
+  surround, so the TV's Atmos and surround badges show for them too.
+
+**Server (already live)**
+- The TV plays each song through at full volume (ReplayGain still
+  applies). Cast crossfade is gone: the TV's Cast player can only play
+  one track at a time, so songs can't overlap there.
+- "Play artist": everything by an artist across every album, shuffled if
+  you like (albums can be excluded from shuffles).
+- Casts only start once the TV and the receiver are confirmed on.
+- Album covers and disc names ("Reel One" / "Reel Two") for newly added
+  albums.
+
+## 1.4.18-beta - 2026-09-30 (build 162)
+
+**Casting**
+- Disconnecting from a cast always comes back to the phone paused, never
+  playing. If you'd joined someone else's cast, the phone goes back to
+  its own queue and position from before you joined.
+- A cast stopped from elsewhere (the server, a voice assistant, the TV
+  remote) now ends on the phone too, instead of the phone relaunching it
+  and waking the TV back up.
+- Van Halen tracks: the Frankenstrat scrubber uses the same random stripe
+  pattern as the Van Halen artist page, instead of a few squashed zigzags.
+
+**Albums**
+- Album references: a track you already own on another album can be
+  listed on a compilation too, with no second copy. Linked tracks show
+  "from <album>" (tap to go there). Long-press for Go to home album or
+  Unlink. The link button on a disc header searches your library and
+  adds a track at the first free number.
+
+**Server (already live)**
+- M4A files scan with their real title, artist, album and year (they
+  all came in as "Unknown").
+- Dolby Atmos / DD+ tracks are recorded with their real channel count
+  (5.1, not stereo).
+- Finished downloads show up in the import list again.
+- Stereo and Dolby Atmos editions of the same album can share one album
+  page with a Stereo / Dolby Atmos switch.
+
+## 1.4.18-beta - 2026-09-30 (build 161)
+First beta-channel build.
+
+**Casting**
+- The TV shows the release year on the album line ("Rumours · 1977").
+- A track with no album art shows the placeholder instead of leaving the
+  previous song's cover on screen.
+- ReplayGain on casts: loud tracks are turned down toward -14 LUFS on the
+  TV/Chromecast, so a hot master no longer blasts after a quiet one. Casts
+  can only turn down, not up. Uses the phone's ReplayGain on/off switch.
+
+**Beta channel**
+- Settings shows the app's version and build, with a BETA badge on beta
+  builds; the update banner says "Beta available" for a beta.
+
+**Fixes**
+- Update check reads versions like "1.4.18-beta" correctly (it saw them
+  as 1.4.0 and never offered them).
+- Downloads: the swarm counts and the connected peers are labelled apart
+  ("Swarm 8 seed · 2 leech", "Connected 2") instead of three chips that
+  read as impossible together.
+- Pop-up messages (like "Joined the cast on ...") are readable: white on
+  dark instead of dark navy text on a dark background.
+
+**Server (queued for 1.4.18)**
+- Servers fetch new stable releases from GitHub on their own
+  (UPDATE_SOURCE=github, the default); this server stays on manual.
+
 ## 1.4.17 - 2026-09-29 (build 158)
 A clean baseline release: the 1.4.16 fixes plus a readable update banner.
 

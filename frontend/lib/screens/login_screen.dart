@@ -26,6 +26,16 @@ class _LoginScreenState extends State<LoginScreen> {
   String? _error;
 
   @override
+  void initState() {
+    super.initState();
+    // Bounced here because a saved session stopped working: say so, instead
+    // of a bare login screen that looks like the app forgot you.
+    if (AuthService.instance.sessionExpired) {
+      _error = 'Your session expired. Sign in again to keep listening.';
+    }
+  }
+
+  @override
   void dispose() {
     _usernameController.dispose();
     _passwordController.dispose();

@@ -591,8 +591,8 @@ class _ArtworkPickerDialogState extends State<ArtworkPickerDialog> {
                           itemBuilder: (context, index) {
                             final image = widget.localImages[index];
                             final isSelected = _selectedLocalIndex == index;
-                            final imageUrl =
-                                '${ApiService.baseUrl}/album/${widget.albumId}/local-image/${image['filename']}';
+                            final imageUrl = ApiService.localImageUrl(
+                                widget.albumId, image['filename'] as String);
 
                             return Padding(
                               padding: const EdgeInsets.only(right: 8),

@@ -109,9 +109,11 @@ def check_transcode_service():
         return False
 
 
-def transcode_song(song_id, file_path, quality="high", is_hdcd=False):
+def transcode_song(song_id, file_path, quality="high", is_hdcd=False, duration=None):
     """Transcode a single song via the desktop service.
     Non-blocking from the caller's perspective when used with eventlet.spawn_n.
+    duration (seconds) lets the service scale its FFmpeg timeout to the track
+    (it allows duration/2 + 60 s); our wait follows it.
     """
     try:
         response = requests.post(
@@ -121,8 +123,10 @@ def transcode_song(song_id, file_path, quality="high", is_hdcd=False):
                 "file_path": map_path_for_transcode(file_path),
                 "quality": quality,
                 "is_hdcd": is_hdcd,
+                "duration": duration,
             },
-            timeout=180,  # 3 min timeout (most songs transcode in 1-2s)
+            # 3 min (most songs transcode in 1-2 s), longer for long tracks
+            timeout=max(180, int(duration or 0) // 2 + 90),
         )
 
         if response.status_code == 200:
@@ -214,15 +218,20 @@ def _poll_transcode_progress():
         _polling_active = False
 
 
-def start_transcode_background(quality="high"):
+def start_transcode_background(quality="high", song_ids=None):
     """Trigger batch transcoding on the desktop service.
     Returns immediately — the desktop service runs the batch in a background thread.
     Spawns a polling greenthread to emit WebSocket progress updates.
+    song_ids: transcode only these (the reconciler's missing set) instead of
+    re-scanning the whole library.
     """
     try:
+        body = {"quality": quality}
+        if song_ids:
+            body["song_ids"] = sorted(int(i) for i in song_ids)
         response = requests.post(
             f"{Config.TRANSCODE_SERVICE_URL}/transcode-all",
-            json={"quality": quality},
+            json=body,
             timeout=10,
         )
 

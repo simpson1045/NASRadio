@@ -41,7 +41,16 @@ class _SongRecognitionSheetState extends State<_SongRecognitionSheet> {
   int _maxSeconds = 15;
   String _statusText = 'Listening...';
   String _errorMessage = '';
+  RecognitionFailure _errorKind = RecognitionFailure.other;
+  String? _errorDetail;
   SongRecognitionResult? _result;
+
+  // Live per-try status under the timer, so a dead Shazam doesn't look like
+  // "still listening".
+  int _attempt = 0;
+  AttemptState? _attemptState;
+  bool _shazamDown = false;
+  String? _shazamDetail;
 
   // Library match
   final ApiService _apiService = ApiService();
@@ -77,6 +86,10 @@ class _SongRecognitionSheetState extends State<_SongRecognitionSheet> {
       _secondsElapsed = 0;
       _amplitude = 0.0;
       _statusText = 'Listening...';
+      _attempt = 0;
+      _attemptState = null;
+      _shazamDown = false;
+      _shazamDetail = null;
     });
 
     try {
@@ -98,6 +111,20 @@ class _SongRecognitionSheetState extends State<_SongRecognitionSheet> {
             }
           });
         },
+        onAttempt: (attempt, state, detail) {
+          if (mounted) setState(() {
+            _attempt = attempt;
+            _attemptState = state;
+            if (state == AttemptState.shazamDown) {
+              _shazamDown = true;
+              _shazamDetail = detail;
+            } else if (state == AttemptState.noMatch) {
+              // Shazam answered, so it's back.
+              _shazamDown = false;
+              _shazamDetail = null;
+            }
+          });
+        },
       );
 
       if (mounted) {
@@ -111,6 +138,8 @@ class _SongRecognitionSheetState extends State<_SongRecognitionSheet> {
       if (mounted) {
         setState(() {
           _errorMessage = e.toString().replaceFirst('Exception: ', '');
+          _errorKind = e is RecognitionException ? e.kind : RecognitionFailure.other;
+          _errorDetail = e is RecognitionException ? e.detail : null;
           _state = _RecognitionState.error;
         });
       }
@@ -286,7 +315,9 @@ class _SongRecognitionSheetState extends State<_SongRecognitionSheet> {
             }),
           ),
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 12),
+        _buildAttemptStatus(),
+        const SizedBox(height: 8),
         TextButton(
           onPressed: () {
             widget.service.cancelRecording();
@@ -296,6 +327,70 @@ class _SongRecognitionSheetState extends State<_SongRecognitionSheet> {
         ),
       ],
     );
+  }
+
+  /// One line under the timer that changes with every try: spinner while a
+  /// try is with the server, "no match yet" between tries, and an orange
+  /// banner while Shazam is down.
+  Widget _buildAttemptStatus() {
+    final grey = TextStyle(color: Colors.grey[400], fontSize: 13);
+    if (_shazamDown) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: Colors.orange.withOpacity(0.15),
+          border: Border.all(color: Colors.orange.withOpacity(0.6)),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 18),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text(
+                    "Shazam isn't responding: trying the backup (AcoustID)",
+                    style: const TextStyle(color: Colors.orange, fontSize: 13, fontWeight: FontWeight.w600),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ],
+            ),
+            if (_shazamDetail != null) ...[
+              const SizedBox(height: 2),
+              Text(_shazamDetail!, style: TextStyle(color: Colors.grey[500], fontSize: 11), textAlign: TextAlign.center),
+            ],
+          ],
+        ),
+      );
+    }
+    switch (_attemptState) {
+      case null:
+        return Text('First try in a moment...', style: grey);
+      case AttemptState.checking:
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00d4ff)),
+            ),
+            const SizedBox(width: 8),
+            Text('Checking with Shazam (try $_attempt)...', style: grey),
+          ],
+        );
+      case AttemptState.noMatch:
+        return Text('Try $_attempt: no match yet, keep it playing', style: grey);
+      case AttemptState.serverUnreachable:
+        return Text("Try $_attempt: can't reach your NASRadio server",
+            style: const TextStyle(color: Colors.orange, fontSize: 13));
+      case AttemptState.shazamDown:
+        return const SizedBox.shrink(); // covered by the banner above
+    }
   }
 
   Widget _buildIdentifying() {
@@ -369,7 +464,9 @@ class _SongRecognitionSheetState extends State<_SongRecognitionSheet> {
         ],
         const SizedBox(height: 4),
         Text(
-          'Identified via ${r.source == "shazam" ? "Shazam" : "AcoustID"}',
+          r.shazamWasDown
+              ? "Identified via AcoustID (Shazam wasn't responding)"
+              : 'Identified via ${r.source == "shazam" ? "Shazam" : "AcoustID"}',
           style: TextStyle(color: Colors.grey[600], fontSize: 11),
         ),
         const SizedBox(height: 20),
@@ -470,14 +567,22 @@ class _SongRecognitionSheetState extends State<_SongRecognitionSheet> {
   }
 
   Widget _buildError() {
+    // Three different problems, three different screens: only "no match" is
+    // fixed by trying again closer to the speaker.
+    final (IconData icon, Color color, String title) = switch (_errorKind) {
+      RecognitionFailure.shazamDown => (Icons.cloud_off, Colors.orange, 'Shazam is down'),
+      RecognitionFailure.serverUnreachable => (Icons.wifi_off, Colors.redAccent, "Can't reach your server"),
+      RecognitionFailure.noMatch => (Icons.hearing_disabled, Colors.grey, 'No match'),
+      RecognitionFailure.other => (Icons.error_outline, Colors.orange, 'Could not identify'),
+    };
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        const Icon(Icons.error_outline, color: Colors.orange, size: 40),
+        Icon(icon, color: color, size: 40),
         const SizedBox(height: 12),
-        const Text(
-          'Could not identify',
-          style: TextStyle(
+        Text(
+          title,
+          style: const TextStyle(
             color: Colors.white,
             fontSize: 20,
             fontWeight: FontWeight.bold,
@@ -489,6 +594,14 @@ class _SongRecognitionSheetState extends State<_SongRecognitionSheet> {
           style: TextStyle(color: Colors.grey[400], fontSize: 14),
           textAlign: TextAlign.center,
         ),
+        if (_errorDetail != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            _errorDetail!,
+            style: TextStyle(color: Colors.grey[600], fontSize: 12),
+            textAlign: TextAlign.center,
+          ),
+        ],
         const SizedBox(height: 16),
         Row(
           children: [

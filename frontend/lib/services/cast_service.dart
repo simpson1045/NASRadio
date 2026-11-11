@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' show pow;
 import 'dart:io' show Platform, Socket;
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
@@ -128,6 +129,12 @@ class CastService extends ChangeNotifier {
   /// set to where we left off.
   VoidCallback? onAutoReconnect;
 
+  /// Called when a cast ends ON PURPOSE from somewhere other than this
+  /// phone's disconnect button (stopped via ADMS/backend, or killed from
+  /// the TV remote). The player hands back to the phone's own queue,
+  /// paused. Hook it up in main.dart.
+  VoidCallback? onRemoteEnd;
+
   CastDevice? _lastConnectedDevice;
   bool _intentionalDisconnect = false;
   int _reconnectAttempt = 0;
@@ -166,6 +173,12 @@ class CastService extends ChangeNotifier {
   // ideal but still better than two kills-to-kill).
   DateTime? _receiverShutdownAt;
   static const Duration _shutdownGrace = Duration(seconds: 3);
+
+  // CAST_ENDED: the backend announced it is about to stop the cast (the
+  // receiver relays it to every phone ~1s before the close). Explicit, so
+  // it gets a longer window than the best-effort shutdown signal.
+  DateTime? _castEndedAt;
+  static const Duration _castEndedGrace = Duration(seconds: 15);
 
   // ── Drop-incident telemetry ──────────────────────────────────────
   // Goal: every disconnect emits ONE consolidated log line with all the
@@ -665,6 +678,7 @@ class CastService extends ChangeNotifier {
           // auto-reconnect after the user explicitly disconnected.
           _lastConnectedDevice = device;
           _intentionalDisconnect = false;
+          _castEndedAt = null;
           _reconnectAttempt = 0;
           _reconnectStartedAt = null;
           _resetDropTelemetry();
@@ -748,6 +762,7 @@ class CastService extends ChangeNotifier {
     _intentionalDisconnect = true;
     _lastConnectedDevice = null;
     _receiverShutdownAt = null;
+    _castEndedAt = null;
     _reconnectAttempt = 0;
     _reconnectStartedAt = null;
     _clearActiveCastMarker(); // user ended the session — nothing to rejoin
@@ -899,17 +914,24 @@ class CastService extends ChangeNotifier {
     // stuck in a kill-twice loop.
     final shutdownFresh = _receiverShutdownAt != null &&
         DateTime.now().difference(_receiverShutdownAt!) < _shutdownGrace;
-    if (!wasIntentional && shutdownFresh) {
+    final endedFresh = _castEndedAt != null &&
+        DateTime.now().difference(_castEndedAt!) < _castEndedGrace;
+    if (!wasIntentional && (shutdownFresh || endedFresh)) {
       AppLogger.instance.info(
-        '🛑 [Cast] Receiver fired SHUTDOWN before drop — user killed cast '
-        'from TV, skipping auto-reconnect',
+        endedFresh
+            ? '🛑 [Cast] Cast was stopped on purpose (CAST_ENDED) — '
+                'skipping auto-reconnect'
+            : '🛑 [Cast] Receiver fired SHUTDOWN before drop — user killed '
+                'cast from TV, skipping auto-reconnect',
       );
       _receiverShutdownAt = null;
+      _castEndedAt = null;
       _lastConnectedDevice = null;
       _reconnectAttempt = 0;
       _reconnectStartedAt = null;
       _clearActiveCastMarker(); // receiver is gone — nothing to rejoin
       CastKeepAlive.release(); // user killed cast from the TV — session over
+      onRemoteEnd?.call();
       return;
     }
     // NOT while a reconnect attempt is in flight: connectToDevice()'s
@@ -1028,6 +1050,10 @@ class CastService extends ChangeNotifier {
   /// [startPosition] allows resuming from a specific position (e.g., when casting
   /// mid-song from the phone player).
   Future<void> loadAndPlay(Song song, {String quality = 'lossless', Duration? startPosition, String? podcastArtworkUrl}) async {
+    try {
+      _castReplayGain =
+          (await SharedPreferences.getInstance()).getBool('replaygain_enabled') ?? true;
+    } catch (_) {}
     if (_session == null || !_isConnected) {
       print('❌ [Cast] Cannot play — not connected');
       return;
@@ -1135,11 +1161,17 @@ class CastService extends ChangeNotifier {
         'fileFormat': song.fileFormat,
         'isHdcd': song.isHdcd,
         'isExplicit': song.isExplicit,
+        // Dolby bitstreams (DD+/Atmos) must not go on the receiver's
+        // crossfade deck, and the badges key off these (same fields the
+        // backend's headless casts send).
+        'isAtmos': song.isAtmos,
+        'audioChannels': song.audioChannels,
         // Track the song id on the receiver so it can ask us to
         // re-send waveform/lyrics if the deferred-send race causes
         // them to be dropped (PLAYING state transition missed,
         // sender restart mid-cast, etc).
         'songId': song.id,
+        'gain': _castGain(song),
       },
     };
 
@@ -1349,6 +1381,22 @@ class CastService extends ChangeNotifier {
 
   /// One UP_NEXT item — a complete, receiver-loadable description of a
   /// MUSIC song (stations/podcasts never enter the self-advance list).
+  // ReplayGain on casts. The receiver sets an <audio> element's volume, which
+  // tops out at 1, so casts can only turn loud tracks DOWN: bring them toward
+  // -14 LUFS and never boost. Same math as the backend's
+  // cast_sender._cast_gain. Honors the phone's ReplayGain switch, cached here
+  // because _upNextItem is synchronous (refreshed on every loadAndPlay).
+  static const double _castTargetLufs = -14.0;
+  bool _castReplayGain = true;
+
+  double _castGain(Song song) {
+    if (!_castReplayGain || song.isStation || song.isPodcast) return 1.0;
+    final lufs = song.integratedLoudnessLufs;
+    if (lufs == null || !lufs.isFinite || lufs >= 0 || lufs < -60) return 1.0;
+    final gainDb = (_castTargetLufs - lufs).clamp(-12.0, 0.0);
+    return double.parse(pow(10, gainDb / 20.0).toStringAsFixed(4));
+  }
+
   Map<String, dynamic> _upNextItem(Song song) {
     final host =
         _usingCustomReceiver ? ApiService.wanHost : ApiService.lanHost;
@@ -1376,7 +1424,13 @@ class CastService extends ChangeNotifier {
         'fileFormat': song.fileFormat,
         'isHdcd': song.isHdcd,
         'isExplicit': song.isExplicit,
+        // Dolby bitstreams (DD+/Atmos) must not go on the receiver's
+        // crossfade deck, and the badges key off these (same fields the
+        // backend's headless casts send).
+        'isAtmos': song.isAtmos,
+        'audioChannels': song.audioChannels,
         'songId': song.id,
+        'gain': _castGain(song),
       },
     };
   }
@@ -1807,6 +1861,11 @@ class CastService extends ChangeNotifier {
         '🛑 [Cast] Receiver SHUTDOWN signal: reason=${message['reason']}',
       );
       _receiverShutdownAt = DateTime.now();
+    } else if (type == 'CAST_ENDED') {
+      AppLogger.instance.info(
+        '🛑 [Cast] CAST_ENDED from receiver: reason=${message['reason']}',
+      );
+      _castEndedAt = DateTime.now();
     } else if (type == 'DIAG_HEARTBEAT') {
       // Receiver-side state snapshot pushed every ~5s. We stash the
       // latest so the drop-incident report can include "what was the
