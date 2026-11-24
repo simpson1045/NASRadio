@@ -140,6 +140,15 @@ def _auto_rejoin(name):
     st = cs._load_state(name)
     if not st or st.get("stopped") or st.get("player_state") not in ("PLAYING", "BUFFERING", "PAUSED"):
         return
+    # Same limit as the TV's auto-resume: a cast whose state hasn't moved in
+    # 15 min ended without a clean stop (ELKO slept, the app was closed...).
+    # Without this, every reconnect (ELKO booting, the TV app restarting)
+    # re-attached to a cast that had been over for hours or days.
+    age = time.time() - float(st.get("updated_at") or 0)
+    if age > cs.AUTO_RESUME_MAX_AGE_SEC:
+        print(f"🖥️ [cast-relay] {name}: saved cast is {int(age // 60)} min old, "
+              f"not re-attaching")
+        return
     try:
         s = cs._guest_session(name)
     except Exception as e:

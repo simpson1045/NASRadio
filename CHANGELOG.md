@@ -1,3 +1,69 @@
+## 1.4.19 - 2026-11-24 (build 212)
+
+Linux fixes first: the 1.4.18 Linux download crashed at startup on most
+systems, and fixing that exposed a bug that could break a Linux login
+keyring. Both are fixed here, along with eleven beta builds of changes.
+
+**Linux**
+- Fixed: the 1.4.18 Linux download crashed at startup ("Non-C locale
+  detected") on most systems.
+- Fixed: on desktops whose login keyring has no password (common on Linux
+  Mint), NASRadio's saved sign-in could corrupt the keyring file. The next
+  login then asked you to create a new keyring, and other apps lost their
+  saved passwords. NASRadio now saves its sign-in in a form that can't break
+  the file, and fixes an old saved copy the first time it starts.
+- The keyboard's media keys and the desktop's sound menu control NASRadio
+  (song, artist, cover and controls), instead of "Not Available".
+- NASRadio has its own icon in the taskbar and Alt-Tab.
+- Closing the window while music plays quits cleanly, instead of freezing
+  and stuttering for a few seconds.
+- In-app updates work on Linux, the same as on Windows.
+
+**Desktop**
+- Now Playing scales down evenly to fit shorter windows (the volume slider
+  used to slide off the bottom).
+- Lighter in the background: behind other windows the scrubber slows to
+  30 frames a second, and it's back to full speed when you click back in.
+- Windows: no more empty, see-through white window flashing at startup. The
+  window appears once the app has drawn itself, at the size and position
+  you left it.
+
+**Updates**
+- New versions download quietly in the background: all the way on your
+  home network, and elsewhere only while the connection is fast. Never
+  while Android Auto is in use. The banner then says "ready" and Install is
+  instant.
+- The Download button shows the update's size, there's a Cancel button, and
+  an interrupted download picks up where it stopped.
+
+**Android Auto**
+- Playlists you've played before start right away from the copy on your
+  phone, and the current list loads in the background.
+- Taps never just do nothing: a spinner shows until the music starts, and
+  if it can't load, the car screen says why. A slow server gets up to 30
+  seconds.
+- When the car starts NASRadio by itself, it now offers the song you left
+  off on.
+
+**Shuffle that feels like shuffle**
+- Shuffles spread each artist out through the queue, so the same artist no
+  longer plays twice in a row (Shuffle button, genres, Android Auto, alarms
+  and casts).
+
+**Library**
+- Settings has a new "MusicBrainz gaps" screen: the Dolby Atmos and 5.1
+  albums you own that MusicBrainz doesn't list in that format yet.
+
+**Casting and NASRadio TV (server and TV app)**
+- NASRadio TV on Windows can play through mpv, if it's installed. Dolby
+  Atmos (DD+ and TrueHD) and other Dolby/DTS tracks then go to the AV
+  receiver as an untouched bitstream, and everything else plays as before.
+- Casting a single song plays just that song, and song requests can name
+  the artist.
+- A cast that ended without a clean stop no longer comes back to life when
+  the TV app reconnects later, and a track that won't play is skipped
+  instead of stalling the queue.
+
 ## 1.4.18 - 2026-11-10 (build 200)
 
 The biggest NASRadio update yet: forty beta builds since 1.4.17.

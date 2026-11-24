@@ -105,8 +105,8 @@ def create_app():
         if sdk not in html:
             abort(500)
         html = html.replace(sdk, '<script src="/cast/socket.io.min.js"></script>\n'
-                                 '  <script src="/cast/caf_local.js?v=1"></script>')
-        html = html.replace('</head>', '  <link rel="stylesheet" href="/cast/tv.css?v=1">\n</head>', 1)
+                                 '  <script src="/cast/caf_local.js?v=2"></script>')
+        html = html.replace('</head>', '  <link rel="stylesheet" href="/cast/tv.css?v=2">\n</head>', 1)
         response = Response(html, mimetype='text/html')
         response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
         return response

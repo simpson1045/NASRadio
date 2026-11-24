@@ -20,12 +20,40 @@ class _UpdateBannerState extends State<UpdateBanner> {
   double _progress = 0.0;
   String? _downloadedPath;
   String? _errorMessage;
+  String? _note; // "Paused at 42%" after a Cancel
   bool _dismissed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Already fetched in the background (this run or an earlier one)?
+    // Then it's "Install", no download.
+    UpdateService.readyPath.addListener(_onReady);
+    UpdateService.findReady(widget.info.buildNumber).then((_) => _onReady());
+  }
+
+  @override
+  void dispose() {
+    UpdateService.readyPath.removeListener(_onReady);
+    super.dispose();
+  }
+
+  void _onReady() {
+    final path = UpdateService.readyFor(widget.info.buildNumber);
+    if (path != null && mounted && _state != _UpdateState.ready) {
+      setState(() {
+        _state = _UpdateState.ready;
+        _downloadedPath = path;
+        _note = null;
+      });
+    }
+  }
 
   Future<void> _startDownload() async {
     setState(() {
       _state = _UpdateState.downloading;
       _progress = 0.0;
+      _note = null;
     });
 
     try {
@@ -33,11 +61,21 @@ class _UpdateBannerState extends State<UpdateBanner> {
         onProgress: (p) {
           if (mounted) setState(() => _progress = p);
         },
+        build: widget.info.buildNumber,
       );
       if (mounted) {
         setState(() {
           _state = _UpdateState.ready;
           _downloadedPath = path;
+        });
+      }
+    } on UpdateDownloadStopped {
+      // Cancelled: the partial file stays, Download picks up from there.
+      if (mounted) {
+        setState(() {
+          _state = _UpdateState.available;
+          _note = 'Paused at ${(_progress * 100).toStringAsFixed(0)}%. '
+              'Download picks up where it stopped.';
         });
       }
     } catch (e) {
@@ -162,6 +200,14 @@ class _UpdateBannerState extends State<UpdateBanner> {
                 ],
               ),
             ),
+          if (_state == _UpdateState.available && _note != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                _note!,
+                style: TextStyle(fontSize: 11, color: Colors.grey[500]),
+              ),
+            ),
           // Error message
           if (_state == _UpdateState.error && _errorMessage != null)
             Padding(
@@ -181,10 +227,12 @@ class _UpdateBannerState extends State<UpdateBanner> {
   Widget _buildActionButton() {
     switch (_state) {
       case _UpdateState.available:
+        final mb = widget.info.sizeBytes / (1024 * 1024);
         return ElevatedButton.icon(
           onPressed: _startDownload,
           icon: const Icon(Icons.download, size: 16),
-          label: const Text('Download', style: TextStyle(fontSize: 12)),
+          label: Text(mb >= 1 ? 'Download (${mb.round()} MB)' : 'Download',
+              style: const TextStyle(fontSize: 12)),
           style: ElevatedButton.styleFrom(
             backgroundColor: const Color(0xFF00D4FF),
             foregroundColor: Colors.white,
@@ -193,11 +241,12 @@ class _UpdateBannerState extends State<UpdateBanner> {
           ),
         );
       case _UpdateState.downloading:
-        // The bar below already animates; a 20px spinner here just read as a
-        // stray comma. Show the number instead.
-        return Text(
-          '${(_progress * 100).toStringAsFixed(0)}%',
-          style: const TextStyle(fontSize: 12, color: Color(0xFF00D4FF), fontWeight: FontWeight.w600),
+        // The bar below shows the percentage; the button is the way out
+        // (until Nov 16 the only way out was force-closing the app).
+        return TextButton.icon(
+          onPressed: UpdateService.cancelDownload,
+          icon: const Icon(Icons.close, size: 16),
+          label: const Text('Cancel', style: TextStyle(fontSize: 12)),
         );
       case _UpdateState.ready:
         return ElevatedButton.icon(

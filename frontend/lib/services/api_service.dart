@@ -510,6 +510,15 @@ class ApiService {
     throw Exception('Failed to load editions');
   }
 
+  // Atmos / 5.1 you own that MusicBrainz doesn't list in that format.
+  // scan: start a background scan on the server (the answer is instant).
+  Future<Map<String, dynamic>> getEditionsGaps({bool scan = false}) async {
+    final response =
+        await _get('$baseUrl/editions/gaps${scan ? '?scan=1' : ''}');
+    if (response.statusCode == 200) return json.decode(response.body);
+    throw Exception('Failed to load the MusicBrainz gaps report');
+  }
+
   // Same for an album you don't have yet (Missing Albums), by name.
   Future<Map<String, dynamic>> getEditionsByName(
       String artist, String album) async {

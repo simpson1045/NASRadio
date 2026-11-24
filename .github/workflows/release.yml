@@ -92,7 +92,10 @@ jobs:
 
   macos:
     # Unsigned (no Apple Developer Program): first launch is right-click > Open.
-    runs-on: macos-14
+    # macos-latest: GitHub retired the macos-14 image ("configuration not
+    # supported"), which skipped the Mac build of v1.4.18 (its DMG/zip were
+    # attached from a tested iMac build of the same code instead).
+    runs-on: macos-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

@@ -1,5 +1,8 @@
+import '../utils/balanced_shuffle.dart';
 import 'dart:async';
-import 'dart:io' show SocketException;
+import 'dart:convert' show jsonDecode, jsonEncode;
+import 'dart:io' show Directory, File, SocketException;
+import 'package:path_provider/path_provider.dart';
 
 import 'package:audio_service/audio_service.dart';
 import 'package:http/http.dart' show ClientException;
@@ -10,6 +13,7 @@ import '../models/song.dart';
 import '../models/rss_feed.dart';
 import 'audio_player_service.dart' show AudioPlayerService, RepeatMode;
 import 'app_logger.dart';
+import 'car_activity.dart';
 import 'auth_service.dart';
 
 class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
@@ -60,6 +64,16 @@ class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
   // zone means instant lists instead of spinners.
   DateTime _offlineUntil = DateTime.fromMillisecondsSinceEpoch(0);
 
+  // What the car screen shows while a tap is handled, instead of the player:
+  // "loading" while a list is on its way, then a message for 8 s if it
+  // couldn't be loaded. Nov 15, 2026: shuffling a playlist on a slow server
+  // did nothing at all, twice - no spinner, no message, no log line.
+  bool _carLoading = false;
+  String? _carNotice;
+  Timer? _carNoticeTimer;
+  // Whether the last _loadCarList answer came from the phone, not the server.
+  bool _lastListFromPhone = false;
+
   static const _kGroupHint = 'android.media.browse.CONTENT_STYLE_GROUP_TITLE_HINT';
   // On a folder: show its albums as a cover grid, its playable rows (Play
   // All / Shuffle All) as a list.
@@ -79,6 +93,50 @@ class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
 
   /// Session expired: tell Android Auto / the lock screen the truth instead
   /// of a frozen "playing" with no audio (Oct 26 drive).
+  /// The car screen while a tap is handled: a spinner, or the message.
+  void _publishCarHold() {
+    if (_carNotice != null) {
+      playbackState.add(PlaybackState(
+        controls: const [],
+        processingState: AudioProcessingState.error,
+        playing: _playerService.isPlaying,
+        errorCode: 1,
+        errorMessage: _carNotice,
+      ));
+    } else {
+      playbackState.add(playbackState.value
+          .copyWith(processingState: AudioProcessingState.loading));
+    }
+  }
+
+  /// Back to the normal player state, published at once.
+  void _releaseCarHold() {
+    _lastPublishedState = null;
+    _lastUpdate = DateTime.fromMillisecondsSinceEpoch(0);
+    _updateMediaSession();
+  }
+
+  /// A message on the car screen for 8 s, then the player again.
+  void _showCarNotice(String message) {
+    _carLoading = false;
+    _carNotice = message;
+    AppLogger.instance.warning('🚗 [AudioHandler] told the car: $message');
+    _publishCarHold();
+    _carNoticeTimer?.cancel();
+    _carNoticeTimer = Timer(const Duration(seconds: 8), () {
+      _carNotice = null;
+      _releaseCarHold();
+    });
+  }
+
+  /// A tapped list came back empty: say why instead of doing nothing.
+  void _carListEmpty() {
+    _showCarNotice(_lastListFromPhone
+        ? "Couldn't reach NASRadio's server in time, and that list isn't "
+            'saved on the phone. Try again in a minute.'
+        : 'Nothing playable in that list.');
+  }
+
   void _showSignedOut() {
     playbackState.add(PlaybackState(
       controls: const [],
@@ -208,6 +266,12 @@ class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
     _trailingUpdate = null;
     _lastUpdate = now;
     _lastPublishedState = state;
+
+    // A tap being handled owns the car screen until it plays or fails.
+    if (_carLoading || _carNotice != null) {
+      _publishCarHold();
+      return;
+    }
 
     if (AuthService.instance.sessionExpired) {
       _showSignedOut();
@@ -409,6 +473,31 @@ class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
     }
   }
 
+  /// Android Auto starting the app cold (it wasn't running) asks it to get
+  /// ready with prepare(), and only then (if its auto-resume is on) sends
+  /// play. Until Nov 10 prepare() was audio_service's do-nothing default:
+  /// unlogged, no fresh state for the car, and no auto-start on the drive
+  /// home while a manual play worked at once. The restore has already put
+  /// the last song in place; make sure it's done and tell the car.
+  @override
+  Future<void> prepare() async {
+    CarActivity.touch();
+    AppLogger.instance.info('🚗 [AudioHandler] prepare (playing=${_playerService.isPlaying}, '
+        'song="${_playerService.currentSong?.title}")');
+    try {
+      await _playerService.restoredOnce.timeout(const Duration(seconds: 15));
+    } catch (_) {}
+    _lastUpdate = DateTime.now().subtract(const Duration(seconds: 1));
+    _updateMediaSession();
+  }
+
+  @override
+  Future<void> prepareFromMediaId(String mediaId,
+      [Map<String, dynamic>? extras]) async {
+    AppLogger.instance.info('🚗 [AudioHandler] prepareFromMediaId $mediaId');
+    await prepare();
+  }
+
   @override
   Future<void> play() async {
     // Explicit, not toggle — the OS told us WHICH way to go. See
@@ -496,6 +585,7 @@ class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
     String parentMediaId, [
     Map<String, dynamic>? options,
   ]) async {
+    CarActivity.touch();
     print('🚗 Android Auto requesting children for: $parentMediaId');
 
     if (parentMediaId == AudioService.recentRootId) {
@@ -1000,18 +1090,53 @@ class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
   /// (Until Nov 6 rows were a bare `song_<id>`, so tapping a playlist song
   /// played just that song and then carried on with its album.)
   Future<void> _playById(String id) async {
+    // Every car tap is logged and gets visible feedback: a spinner until it
+    // plays, a message if it can't (it used to print() and, on an empty
+    // list, silently return).
+    CarActivity.touch();
+    AppLogger.instance.info('🚗 [AudioHandler] tap: $id');
+    final sw = Stopwatch()..start();
+    _carNoticeTimer?.cancel();
+    _carNotice = null;
+    _carLoading = true;
+    _publishCarHold();
     try {
       if (id.startsWith('playlist_shuffle_') ||
           id.startsWith('playlist_play_')) {
         final playlistId = int.parse(id.substring(id.lastIndexOf('_') + 1));
-        final list = await _loadCarList('pl', playlistId);
-        print('🚗 Playlist $playlistId: ${list.songs.length} playable songs');
-        if (list.songs.isEmpty) return;
-        if (id.startsWith('playlist_shuffle_')) list.songs.shuffle();
+        // The phone's copy from the last time starts it instantly; the
+        // server's current list is fetched behind it and saved for next
+        // time. Nov 16, 2026: Matt's Mix took 1.6 s to list (804 songs)
+        // before the first song could even start buffering.
+        final copy = await _loadCarListCopy(playlistId);
+        final _CarList list;
+        if (copy != null && copy.songs.isNotEmpty) {
+          list = copy;
+          AppLogger.instance.info('🚗 [AudioHandler] list pl $playlistId: '
+              '${copy.songs.length} songs from the phone copy, refreshing behind it');
+          unawaited(_net(() => _loadCarListOnline('pl', playlistId),
+                  seconds: 30, userTap: true)
+              .then(_saveCarListCopy)
+              .catchError((Object e) => AppLogger.instance.info(
+                  '🚗 [AudioHandler] playlist $playlistId refresh failed: $e')));
+        } else {
+          list = await _loadCarList('pl', playlistId, userTap: true);
+        }
+        if (list.songs.isEmpty) {
+          _carListEmpty();
+          return;
+        }
+        if (id.startsWith('playlist_shuffle_')) {
+          balancedShuffleInPlace(list.songs, (s) => s.artistName);
+        }
         _startCarList(list, 0);
       } else if (id.startsWith('arplay_') || id.startsWith('arshuf_')) {
-        final list = await _loadCarList('ar', int.parse(id.substring(7)));
-        if (list.songs.isEmpty) return;
+        final list =
+            await _loadCarList('ar', int.parse(id.substring(7)), userTap: true);
+        if (list.songs.isEmpty) {
+          _carListEmpty();
+          return;
+        }
         if (id.startsWith('arshuf_')) list.songs.shuffle();
         _startCarList(list, 0);
       } else if (id.startsWith('st_')) {
@@ -1019,14 +1144,21 @@ class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
       } else if (id == 'resume') {
         await play();
       } else if (id.startsWith('gplay|') || id.startsWith('gshuf|')) {
-        final list = await _loadGenre(Uri.decodeComponent(id.substring(6)));
-        if (list.songs.isEmpty) return;
-        if (id.startsWith('gshuf|')) list.songs.shuffle();
+        final list = await _loadGenre(Uri.decodeComponent(id.substring(6)),
+            userTap: true);
+        if (list.songs.isEmpty) {
+          _carListEmpty();
+          return;
+        }
+        if (id.startsWith('gshuf|')) {
+          balancedShuffleInPlace(list.songs, (s) => s.artistName);
+        }
         _startCarList(list, 0);
       } else if (id.startsWith('gs|')) {
         final parts = id.split('|'); // gs, index, songId, genre
         if (parts.length != 4) return;
-        final list = await _loadGenre(Uri.decodeComponent(parts[3]));
+        final list =
+            await _loadGenre(Uri.decodeComponent(parts[3]), userTap: true);
         final index = int.parse(parts[1]);
         final songId = int.parse(parts[2]);
         final start = index < list.songs.length && list.songs[index].id == songId
@@ -1039,7 +1171,8 @@ class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
       } else if (id.startsWith('q_')) {
         final parts = id.split('_'); // q, kind, listId, index, songId
         if (parts.length != 5) return;
-        final list = await _loadCarList(parts[1], int.parse(parts[2]));
+        final list =
+            await _loadCarList(parts[1], int.parse(parts[2]), userTap: true);
         final index = int.parse(parts[3]);
         final songId = int.parse(parts[4]);
         // The index handles a song that's in the list twice; fall back to
@@ -1069,27 +1202,94 @@ class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
         }
       }
     } catch (e) {
-      print('❌ [AudioHandler] could not play $id: $e');
+      AppLogger.instance.error(
+          '🚗 [AudioHandler] could not play $id after ${sw.elapsedMilliseconds} ms: $e');
+      _showCarNotice(e is TimeoutException || e is SocketException ||
+              e is ClientException || e is _CarOffline
+          ? "NASRadio's server didn't answer in time. Try again in a minute."
+          : "Couldn't play that ($e).");
+    } finally {
+      if (_carLoading) {
+        _carLoading = false;
+        if (_carNotice == null) _releaseCarHold();
+        AppLogger.instance.info(
+            '🚗 [AudioHandler] tap $id handled in ${sw.elapsedMilliseconds} ms');
+      }
     }
   }
 
   /// The songs behind one car list. getChildren (what the car shows) and
   /// _playById (what plays) both use this, so the indexes always line up.
   /// No signal: the same list from what's on the phone.
-  Future<_CarList> _loadCarList(String kind, int listId) async {
+  Future<_CarList> _loadCarList(String kind, int listId,
+      {bool userTap = false}) async {
+    _lastListFromPhone = false;
     if (kind == 'loc') return _offlineCarList(kind, listId)!;
+    final sw = Stopwatch()..start();
     try {
       final list = await _net(() => _loadCarListOnline(kind, listId),
-          seconds: kind == 'ar' ? 30 : 10);
+          seconds: userTap || kind == 'ar' ? 30 : 10, userTap: userTap);
       if (kind == 'fav' || kind == 'mp') {
         OfflineService.instance.rememberList(kind, list.songs);
       }
+      if (kind == 'pl') _saveCarListCopy(list);
+      if (userTap) {
+        AppLogger.instance.info('🚗 [AudioHandler] list $kind $listId: '
+            '${list.songs.length} songs from the server in ${sw.elapsedMilliseconds} ms');
+      }
       return list;
     } catch (e) {
-      final off = _offlineCarList(kind, listId);
+      var off = _offlineCarList(kind, listId);
+      // Nothing downloaded: the playlist as it was last loaded. Its songs
+      // still stream from the server, which is slow, not gone.
+      if ((off == null || off.songs.isEmpty) && kind == 'pl') {
+        off = await _loadCarListCopy(listId) ?? off;
+      }
+      _lastListFromPhone = true;
+      AppLogger.instance.info('🚗 [AudioHandler] list $kind $listId: server failed '
+          'after ${sw.elapsedMilliseconds} ms ($e); ${off?.songs.length ?? 0} songs from the phone');
       if (off == null) rethrow;
-      print('🚗 offline list $kind $listId: ${off.songs.length} songs on the phone');
       return off;
+    }
+  }
+
+  /// The last server copy of each playlist, for when the server is too slow
+  /// to answer (car_lists/pl_<id>.json in the app's support folder).
+  Future<File> _carListFile(int listId) async {
+    final dir = Directory('${(await getApplicationSupportDirectory()).path}/car_lists');
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    return File('${dir.path}/pl_$listId.json');
+  }
+
+  Future<void> _saveCarListCopy(_CarList list) async {
+    // Snapshot the songs NOW, before any await: the caller shuffles
+    // list.songs in place right after, and a copy saved after that await
+    // was in shuffled order (wrong for "Play", which plays in order).
+    final body = jsonEncode({
+      'name': list.sourceName,
+      'songs': [for (final s in list.songs) s.toJson()],
+    });
+    try {
+      final f = await _carListFile(list.listId);
+      await f.writeAsString(body);
+    } catch (e) {
+      AppLogger.instance.warning('🚗 [AudioHandler] saving playlist ${list.listId} copy failed: $e');
+    }
+  }
+
+  Future<_CarList?> _loadCarListCopy(int listId) async {
+    try {
+      final f = await _carListFile(listId);
+      if (!f.existsSync()) return null;
+      final data = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+      final songs = [
+        for (final s in (data['songs'] as List? ?? const []))
+          Song.fromJson(Map<String, dynamic>.from(s as Map)),
+      ];
+      return _CarList('pl', listId, songs, 'playlist', data['name'] as String?);
+    } catch (e) {
+      AppLogger.instance.warning('🚗 [AudioHandler] reading playlist $listId copy failed: $e');
+      return null;
     }
   }
 
@@ -1389,7 +1589,7 @@ class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
         }
         final fav = await _loadCarList('fav', 0);
         if (fav.songs.isEmpty) return;
-        fav.songs.shuffle();
+        balancedShuffleInPlace(fav.songs, (s) => s.artistName);
         _startCarList(fav, 0);
         log.info('🎙️ [AudioHandler] voice -> shuffle Favorites');
         return;
@@ -1564,9 +1764,9 @@ class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
     }
   }
 
-  Future<_CarList> _loadGenre(String genre) async {
-    final data =
-        await _net(() => _apiService.getGenreSongs(genre, limit: 200), seconds: 10);
+  Future<_CarList> _loadGenre(String genre, {bool userTap = false}) async {
+    final data = await _net(() => _apiService.getGenreSongs(genre, limit: 200),
+        seconds: userTap ? 30 : 10, userTap: userTap);
     final songs = List<Song>.from((data['songs'] as List?) ?? const []);
     return _CarList('gn', 0, songs, 'genre', _genreName(genre));
   }
@@ -1659,10 +1859,19 @@ class NASRadioAudioHandler extends BaseAudioHandler with SeekHandler {
   /// A server call for the car, on a short leash. A network failure marks
   /// the server unreachable for a minute: the lists then come straight from
   /// the phone instead of each waiting out its own timeout.
-  Future<T> _net<T>(Future<T> Function() call, {int seconds = 8}) async {
-    if (DateTime.now().isBefore(_offlineUntil)) throw const _CarOffline();
+  /// userTap: someone tapped something and is waiting. It gets a real try
+  /// even inside the "unreachable" minute (a slow server isn't a dead one;
+  /// Nov 15, 2026 the NAS took 17 s per list and every tap failed instantly),
+  /// and a success ends that minute early.
+  Future<T> _net<T>(Future<T> Function() call,
+      {int seconds = 8, bool userTap = false}) async {
+    if (!userTap && DateTime.now().isBefore(_offlineUntil)) {
+      throw const _CarOffline();
+    }
     try {
-      return await call().timeout(Duration(seconds: seconds));
+      final result = await call().timeout(Duration(seconds: seconds));
+      if (userTap) _offlineUntil = DateTime.fromMillisecondsSinceEpoch(0);
+      return result;
     } catch (e) {
       if (e is TimeoutException || e is SocketException || e is ClientException) {
         _offlineUntil = DateTime.now().add(const Duration(seconds: 60));

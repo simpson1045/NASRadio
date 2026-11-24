@@ -1,3 +1,4 @@
+import '../utils/balanced_shuffle.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show Platform, HttpDate, File;
@@ -2645,7 +2646,8 @@ class AudioPlayerService extends ChangeNotifier {
       // the front so it doesn't restart. The engine isn't touched — the
       // current track keeps playing; only the lookahead is recomputed below.
       _originalQueue = List.from(_queue);
-      _queue.shuffle();
+      // Balanced: spreads each artist out (a plain shuffle clumps).
+      balancedShuffleInPlace(_queue, (s) => s.artistName);
       if (currentSongId != null) {
         final idx = _queue.indexWhere((s) => s.id == currentSongId);
         if (idx > 0) {
@@ -4480,6 +4482,28 @@ class AudioPlayerService extends ChangeNotifier {
     } else if (!_isPlaying) {
       _stopWidgetProgressTimer();
     }
+  }
+
+  /// The desktop window is closing (main.dart onWindowClose, Linux): save
+  /// where we are, then stop both decks while the app is still whole, so the
+  /// music ends cleanly. Until Nov 23, 2026 closing on Linux tore the engine
+  /// down around a playing libmpv: the window froze and the audio stuttered
+  /// for a few seconds before the process went. The local save (prefs +
+  /// queue) comes first inside savePlaybackState; the server copy may be cut
+  /// short by the timeout, which is fine (restore takes the newer one).
+  Future<void> shutdownForExit() async {
+    _stopSaveTimer();
+    _cancelCrossfade();
+    try {
+      await savePlaybackState().timeout(const Duration(seconds: 2));
+    } catch (_) {}
+    for (final deck in [_deckAEngine, _deckBEngine]) {
+      try {
+        await deck?.dispose().timeout(const Duration(seconds: 1));
+      } catch (_) {}
+    }
+    _deckAEngine = null;
+    _deckBEngine = null;
   }
 
   @override

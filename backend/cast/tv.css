@@ -6,32 +6,8 @@ body.local-mode * {
   cursor: none !important;
 }
 
-/* Bigger scrubber: ELKO lays out at 1707x960 CSS px on a 4K TV, where the
-   C2-sized 36 px waveform strip and 13 px times read tiny from the couch. */
-body.local-mode #waveform-container {
-  height: 124px;
-  padding: 14px 80px 20px;
-}
-
-body.local-mode #waveform-canvas {
-  height: 64px;
-}
-
-body.local-mode #time-display {
-  margin-top: 6px;
-  font-size: 20px;
-}
-
-body.local-mode #live-pill {
-  font-size: 20px;
-}
-
-/* Everything that sits just above the bar moves up with it (80 -> 124 px). */
-body.local-mode #lyrics-view {
-  bottom: 124px;
-}
-
-body.local-mode #tv-cards {
-  right: 80px;
-  bottom: 144px;
-}
+/* Sizes match the C2 on their own now: the TV app zooms the page to the
+   C2's 1280x720 layout (tv-app/main.js, Nov 14, 2026). The ELKO-only bigger
+   scrubber / time labels that lived here were making up for ELKO laying out
+   at 1707x960 or 1920x1080 and are gone; to resize anything, change
+   receiver.css so both screens stay the same. */

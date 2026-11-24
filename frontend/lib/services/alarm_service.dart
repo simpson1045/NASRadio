@@ -1,3 +1,4 @@
+import '../utils/balanced_shuffle.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show Platform;
@@ -277,7 +278,10 @@ class AlarmService {
         songs = [];
     }
     final list = [for (final s in songs) Map<String, dynamic>.from(s as Map)];
-    if (a.shuffle && a.sourceType != 'shuffle') list.shuffle(Random());
+    if (a.shuffle && a.sourceType != 'shuffle') {
+      balancedShuffleInPlace(
+          list, (m) => '${m['artist_name'] ?? m['artist'] ?? ''}');
+    }
     if (list.isEmpty) throw Exception('nothing to play');
 
     final base = ApiService.baseUrl;

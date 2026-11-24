@@ -592,7 +592,10 @@ try { localStorage.removeItem('nasradio_crossfade'); } catch (e) {}
 let trackGain = 1;
 
 function applyTrackGain() {
-  if (castAudioEl.volume !== trackGain) castAudioEl.volume = trackGain;
+  // ELKO plays through mpv (caf_local.js window.__nasradioMediaEl), not
+  // this element; the Chromecast plays through this element.
+  const el = window.__nasradioMediaEl || castAudioEl;
+  if (el.volume !== trackGain) el.volume = trackGain;
 }
 
 function _cancelSelfAdvance() {
@@ -2107,6 +2110,9 @@ function currentStateForSenders() {
   const c = info.customData || {};
   return {
     playerState: playerManager.getPlayerState(),
+    // The real clock, so a sender can tell "PLAYING" from actually playing
+    // (Nov 14, 2026: ELKO said PLAYING after a resume with no sound).
+    currentTime: playerManager.getCurrentTimeSec(),
     nowPlaying: info.contentId ? {
       songId: c.songId || null, title: m.title || null,
       artist: m.artist || m.albumArtist || null, album: m.albumName || null,

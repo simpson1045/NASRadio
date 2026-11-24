@@ -244,6 +244,14 @@ class AppLogger {
     _saveTimer = Timer(_saveDebounce, _saveToDisk);
   }
 
+  /// Write the log file now (app closing): the debounced save is up to 5 s
+  /// behind, so the last lines of a session never reached the file.
+  Future<void> flushNow() async {
+    _saveTimer?.cancel();
+    _saveTimer = null;
+    await _saveToDisk();
+  }
+
   Future<void> _saveToDisk() async {
     if (_logFilePath == null) return;
     try {

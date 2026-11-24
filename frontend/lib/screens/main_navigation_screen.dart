@@ -339,6 +339,8 @@ class MainNavigationScreenState extends State<MainNavigationScreen>
     final info = await UpdateService.checkForUpdate();
     if (mounted && info != null) {
       setState(() => _updateInfo = info);
+      // Fetch it quietly where that's fast, so "Install" is instant later.
+      unawaited(UpdateService.prefetch(info));
     }
   }
 

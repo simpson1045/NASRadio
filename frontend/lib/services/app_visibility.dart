@@ -16,6 +16,15 @@ class AppVisibility {
 
   final ValueNotifier<bool> visible = ValueNotifier<bool>(true);
 
+  /// Desktop: the window has keyboard focus (window_manager focus/blur).
+  /// Visible but unfocused (behind other windows) still draws; Now Playing
+  /// slows its scrubber to 30 fps then. Always true on phones.
+  final ValueNotifier<bool> focused = ValueNotifier<bool>(true);
+
+  void setFocused(bool value) {
+    if (focused.value != value) focused.value = value;
+  }
+
   AppLifecycleState _lifecycle = AppLifecycleState.resumed;
   bool _minimized = false;
 

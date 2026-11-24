@@ -247,6 +247,139 @@
     }
   }
 
+  // Phase 3 (Nov 21, 2026): when the NASRadio TV app has mpv (preload.js
+  // window.nasradioTV.mpv), the audio plays through mpv, which sends Dolby
+  // and DTS to the Denon as untouched bitstreams. Chromium can't (no Dolby
+  // decoder, no passthrough to HDMI): a Dolby Atmos .m4a sat IDLE on ELKO.
+  // This object looks like the slice of an <audio> element that this file
+  // and receiver.js use, so nothing else changes. mpv reports its position
+  // 4x a second; between reports it's extrapolated so the waveform stays
+  // smooth.
+  let usingMpv = false;
+
+  function mpvMediaElement(api) {
+    const el = new EventTarget();
+    let src = '';
+    let pos = 0;          // last time-pos from mpv (s)
+    let posAt = 0;        // performance.now() when it arrived
+    let dur = NaN;
+    let paused = true;
+    let ended = false;
+    let cacheWait = false;
+    let vol = 1;
+    let loading = false;  // between loadfile and file-loaded / its error
+    const fire = (t) => el.dispatchEvent(new Event(t));
+    const stamp = () => { posAt = performance.now(); };
+
+    api.onEvent((ev) => {
+      switch (ev.event) {
+        case 'file-loaded':
+          loading = false;
+          ended = false;
+          fire('loadedmetadata');
+          break;
+        case 'end-file':
+          // 'stop' / 'redirect' = replaced by the next loadfile: ignore.
+          if (ev.reason === 'error' && loading) {
+            loading = false;
+            fire('error');
+          } else if (ev.reason === 'eof' || ev.reason === 'error') {
+            // A mid-song error ends the song: the queue moves on.
+            ended = true;
+            paused = true;
+            fire('ended');
+          }
+          break;
+        case 'playback-restart':  // playback (re)started: after a load or a seek
+          stamp();
+          fire('seeked');
+          if (!paused && !cacheWait) fire('playing');
+          break;
+        case 'property-change':
+          if (ev.name === 'time-pos') {
+            if (typeof ev.data === 'number') { pos = ev.data; stamp(); }
+          } else if (ev.name === 'duration') {
+            if (typeof ev.data === 'number') dur = ev.data;
+          } else if (ev.name === 'pause') {
+            const p = !!ev.data;
+            if (p !== paused) {
+              paused = p;
+              stamp();
+              // The pause=yes a load starts with is not a user pause.
+              if (!loading) fire(p ? 'pause' : 'playing');
+            }
+          } else if (ev.name === 'paused-for-cache') {
+            cacheWait = !!ev.data;
+            stamp();
+            if (cacheWait) fire('waiting');
+            else if (!paused) fire('playing');
+          }
+          break;
+        case 'mpv-exit':
+          // mpv crashed or was closed (the app restarts it): end this song.
+          if (src && !ended) {
+            if (loading) { loading = false; fire('error'); } else { ended = true; paused = true; fire('ended'); }
+          }
+          break;
+        default:
+          break;
+      }
+    });
+
+    el.load = () => {
+      ended = false;
+      dur = NaN;
+      pos = 0;
+      stamp();
+      if (src) {
+        loading = true;
+        // Paused until caf_local's load() has seeked to the start position
+        // and calls play(), like an <audio> element.
+        api.command(['loadfile', src, 'replace', -1, 'pause=yes']);
+      } else {
+        loading = false;
+        api.command(['stop']);
+      }
+    };
+    el.play = () => {
+      if (!ended) api.command(['set_property', 'pause', false]);
+      return Promise.resolve();
+    };
+    el.pause = () => { api.command(['set_property', 'pause', true]); };
+    el.removeAttribute = (name) => { if (name === 'src') src = ''; };
+    // mpv plays it all (Dolby / DTS as bitstreams), so report every type
+    // playable: receiver.js reports that to the backend as its capabilities.
+    el.canPlayType = () => 'probably';
+    Object.defineProperties(el, {
+      src: { get: () => src, set: (v) => { src = String(v || ''); } },
+      currentTime: {
+        get: () => {
+          if (paused || cacheWait || ended || loading) return pos;
+          const t = pos + (performance.now() - posAt) / 1000;
+          return isFinite(dur) && dur > 0 ? Math.min(t, dur) : t;
+        },
+        set: (t) => {
+          pos = Number(t) || 0;
+          stamp();
+          api.command(['seek', pos, 'absolute']);
+        },
+      },
+      duration: { get: () => dur },
+      paused: { get: () => paused },
+      ended: { get: () => ended },
+      // receiver.js's per-song gain (0..1). No effect on a bitstream: the
+      // Denon decodes those, and it's the volume knob anyway.
+      volume: {
+        get: () => vol,
+        set: (v) => {
+          vol = Math.max(0, Math.min(1, Number(v) || 0));
+          api.command(['set_property', 'volume', Math.round(vol * 100)]);
+        },
+      },
+    });
+    return el;
+  }
+
   function wireAudio(el) {
     audio = el;
     el.addEventListener('playing', () => { setState(PlayerState.PLAYING); pmEvents.fire('PLAYING', {}); });
@@ -282,10 +415,22 @@
     addCustomMessageListener: (ns, fn) => { (customListeners[ns] = customListeners[ns] || []).push(fn); },
     sendCustomMessage: (ns, senderId, data) => send(ns, data),
     canDisplayType: (type) => !!(audio && audio.canPlayType(type)),
-    getDeviceCapabilities: () => ({ display_supported: true, local_player: PLAYER }),
+    getDeviceCapabilities: () => ({
+      display_supported: true, local_player: PLAYER,
+      // The backend sends bitstream originals (Dolby / DTS untouched) only to
+      // a player that says it can pass them through.
+      passthrough: usingMpv ? 'mpv' : null,
+    }),
     start(options) {
-      const el = (options && options.playbackConfig && options.playbackConfig.mediaElement)
-        || document.getElementById('castMediaElement');
+      const mpvApi = window.nasradioTV && window.nasradioTV.mpv;
+      usingMpv = !!mpvApi;
+      const el = usingMpv
+        ? mpvMediaElement(mpvApi)
+        : ((options && options.playbackConfig && options.playbackConfig.mediaElement)
+          || document.getElementById('castMediaElement'));
+      // receiver.js sets the per-song gain on whatever element is playing.
+      window.__nasradioMediaEl = el;
+      console.log('[caf_local] audio through', usingMpv ? 'mpv (bitstream passthrough)' : 'Chromium');
       wireAudio(el);
       document.body.classList.add('local-mode');
       socket = io('/castdev', { auth: { player: PLAYER, key: KEY }, transports: ['websocket'] });

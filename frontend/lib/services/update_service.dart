@@ -8,6 +8,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'api_service.dart';
 import 'app_logger.dart';
+import 'car_activity.dart';
 
 /// Info about an available update
 class UpdateInfo {
@@ -28,6 +29,15 @@ class UpdateInfo {
   });
 
   bool get isBeta => channel == 'beta';
+}
+
+/// A download stopped on purpose (Cancel, or a background download backing
+/// off). Its partial file stays on disk for a later resume.
+class UpdateDownloadStopped implements Exception {
+  UpdateDownloadStopped(this.reason);
+  final String reason;
+  @override
+  String toString() => reason;
 }
 
 /// Handles checking, downloading, and applying app updates.
@@ -131,41 +141,175 @@ class UpdateService {
     return serverBuild > currentBuild;
   }
 
-  /// Download the update file for the current platform.
-  /// Calls [onProgress] with 0.0..1.0 as bytes arrive.
-  /// Returns the path to the downloaded file.
-  static Future<String> downloadUpdate({
-    required void Function(double progress) onProgress,
-  }) async {
-    final log = AppLogger.instance;
-    // Backend serves three artifact slots: android/windows/linux. The
-    // download endpoint maps these to the file name on disk.
-    final String platform;
+  // ---- Download state shared by the banner and the background prefetch ----
+  //
+  // Nov 16, 2026: a 96 MB beta over cellular in the truck took over a minute,
+  // fought the music for the connection, and couldn't be cancelled. Now an
+  // update is fetched in the background where it's fast (the home network,
+  // or any connection that proves fast), never while the car is in use, and
+  // a manual download has a Cancel. The partial file plus a small note of
+  // which build it belongs to survive restarts, so every attempt resumes.
+
+  /// Set when a finished download is on disk (the banner listens).
+  static final ValueNotifier<String?> readyPath = ValueNotifier(null);
+  static int _readyBuild = 0;
+  static bool _downloading = false;
+  static bool _stopRequested = false;
+
+  /// A background download only keeps going off the home network at this
+  /// speed or better (bytes/s, measured over ~5 s).
+  static const int _minBackgroundRate = 1024 * 1024;
+
+  /// The finished download for [build], if it's on disk.
+  static String? readyFor(int build) =>
+      build > 0 && _readyBuild == build ? readyPath.value : null;
+
+  /// Stop the download in progress; its partial file stays for a resume.
+  static void cancelDownload() {
+    if (_downloading) _stopRequested = true;
+  }
+
+  static Future<void> _stopAndWait() async {
+    if (!_downloading) return;
+    _stopRequested = true;
+    while (_downloading) {
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+  }
+
+  static Future<(String, String)> _downloadTarget() async {
     final String ext;
     if (Platform.isWindows) {
-      platform = 'windows';
       ext = '.zip';
     } else if (Platform.isLinux) {
-      platform = 'linux';
       ext = '.tar.xz';
     } else if (Platform.isMacOS) {
-      platform = 'macos';
       ext = '.zip';
     } else {
-      platform = 'android';
       ext = '.apk';
     }
-
-    final uri = Uri.parse('${ApiService.baseHost}/api/update/download/$platform');
     final dir = await getTemporaryDirectory();
     final filePath = '${dir.path}/nasradio-update$ext';
+    return (filePath, '$filePath.json');
+  }
+
+  /// A download for [build] already complete on disk (from this run or an
+  /// earlier one): its path, else null.
+  static Future<String?> findReady(int build) async {
+    if (build <= 0) return null;
+    if (readyFor(build) != null) return readyPath.value;
+    try {
+      final (filePath, notePath) = await _downloadTarget();
+      final note = File(notePath);
+      final file = File(filePath);
+      if (!await note.exists() || !await file.exists()) return null;
+      final n = jsonDecode(await note.readAsString()) as Map<String, dynamic>;
+      final total = (n['total'] as num?)?.toInt() ?? 0;
+      if ((n['build'] as num?)?.toInt() == build && total > 0 && await file.length() == total) {
+        _readyBuild = build;
+        readyPath.value = filePath;
+        return filePath;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Fetch [info]'s update in the background so it's ready to install. On
+  /// the home network it runs to the end; elsewhere it only keeps going
+  /// while the connection is fast; never while the car is in use. When it
+  /// stops it just stops (logged), and the next try resumes from the
+  /// partial file. Called after every update check that finds an update.
+  static Future<void> prefetch(UpdateInfo info) async {
+    final log = AppLogger.instance;
+    if (_downloading || await findReady(info.buildNumber) != null) return;
+    if (CarActivity.recent) {
+      log.info('Update ${info.buildNumber} pre-download skipped: the car is in use');
+      return;
+    }
+    try {
+      await downloadUpdate(onProgress: (_) {}, build: info.buildNumber, background: true);
+      log.info('Update ${info.buildNumber} pre-downloaded, ready to install');
+    } on UpdateDownloadStopped catch (e) {
+      log.info('Update ${info.buildNumber} pre-download paused: $e');
+    } catch (e) {
+      log.info('Update ${info.buildNumber} pre-download failed: $e');
+    }
+  }
+
+  /// Download the update file for the current platform.
+  /// Calls [onProgress] with 0.0..1.0 as bytes arrive.
+  /// Returns the path to the downloaded file. [build] ties a partial file to
+  /// its update so it can be resumed later; [background] = the quiet
+  /// prefetch (backs off when slow or in the car). Throws
+  /// [UpdateDownloadStopped] when cancelled or backed off.
+  static Future<String> downloadUpdate({
+    required void Function(double progress) onProgress,
+    int build = 0,
+    bool background = false,
+  }) async {
+    // A tap on Download takes over from a background prefetch (it resumes
+    // the same partial file).
+    if (!background) await _stopAndWait();
+    if (_downloading) throw UpdateDownloadStopped('another download is running');
+    _downloading = true;
+    _stopRequested = false;
+    try {
+      return await _download(onProgress, build, background);
+    } finally {
+      _downloading = false;
+      _stopRequested = false;
+    }
+  }
+
+  static Future<String> _download(
+      void Function(double progress) onProgress, int build, bool background) async {
+    final log = AppLogger.instance;
+    final ready = await findReady(build);
+    if (ready != null) {
+      onProgress(1.0);
+      return ready;
+    }
+    // Backend serves the artifact slots by platform name.
+    final String platform = Platform.isWindows
+        ? 'windows'
+        : Platform.isLinux
+            ? 'linux'
+            : Platform.isMacOS
+                ? 'macos'
+                : 'android';
+    final uri = Uri.parse('${ApiService.baseHost}/api/update/download/$platform');
+    final (filePath, notePath) = await _downloadTarget();
     final file = File(filePath);
+    final note = File(notePath);
+
+    // A partial file only resumes for the build it belongs to (the note
+    // beside it); a partial of an older build is thrown away. The size kept
+    // in memory belongs to one build too: a new build mid-session must not
+    // resume (append its bytes to) the old one's partial file.
+    if (build > 0 && build != _partialBuild) {
+      _partialTotal = 0;
+      _partialBuild = build;
+    }
+    if (_partialTotal == 0 && build > 0) {
+      try {
+        if (await note.exists()) {
+          final n = jsonDecode(await note.readAsString()) as Map<String, dynamic>;
+          if ((n['build'] as num?)?.toInt() == build) {
+            _partialTotal = (n['total'] as num?)?.toInt() ?? 0;
+          } else {
+            if (await file.exists()) await file.delete();
+            await note.delete();
+          }
+        }
+      } catch (_) {}
+    }
 
     // Android drops an app's connection when it goes to the background, so a
     // cut is normal, not fatal: resume with an HTTP Range request from what's
     // already on disk (the server answers 206), retrying for ~2 minutes. The
     // partial file survives a failure, so the banner's Retry resumes too.
-    const maxAttempts = 24;
+    // The quiet background prefetch gives up sooner: it tries again later.
+    final maxAttempts = background ? 3 : 24;
     Object? lastError;
     for (var attempt = 1; attempt <= maxAttempts; attempt++) {
       var have = (_partialTotal > 0 && await file.exists()) ? await file.length() : 0;
@@ -183,17 +327,53 @@ class UpdateService {
           continue;
         } else if (response.statusCode != 206) {
           throw Exception('HTTP ${response.statusCode}');
+        } else {
+          // Resuming: the file on the server must be the one we started
+          // (same total size), else the halves would be two different files
+          // (a rebuild can keep its build number).
+          final range = response.headers['content-range'] ?? '';
+          final serverTotal = int.tryParse(range.split('/').last) ?? 0;
+          if (serverTotal != _partialTotal) {
+            log.info('Update file changed on the server ($range, expected '
+                'total $_partialTotal): starting over');
+            await response.stream.drain<void>().catchError((_) {});
+            _partialTotal = 0;
+            if (await file.exists()) await file.delete();
+            continue;
+          }
         }
         final total = _partialTotal;
+        if (build > 0 && total > 0) {
+          await note.writeAsString(jsonEncode({'build': build, 'total': total}));
+        }
 
         final sink = file.openWrite(mode: have > 0 ? FileMode.append : FileMode.write);
         var received = have;
+        // Background speed check, off the home network only: bytes over the
+        // last ~5 s.
+        var windowStart = DateTime.now();
+        var windowBytes = 0;
         try {
           // A backgrounded app's socket can stall instead of erroring.
           await for (final chunk in response.stream.timeout(const Duration(seconds: 30))) {
             sink.add(chunk);
             received += chunk.length;
             if (total > 0) onProgress(received / total);
+            if (_stopRequested) throw UpdateDownloadStopped('cancelled');
+            if (background) {
+              if (CarActivity.recent) throw UpdateDownloadStopped('the car is in use');
+              windowBytes += chunk.length;
+              final secs = DateTime.now().difference(windowStart).inMilliseconds / 1000;
+              if (secs >= 5) {
+                final rate = windowBytes / secs;
+                if (!ApiService.isOnLan && rate < _minBackgroundRate) {
+                  throw UpdateDownloadStopped(
+                      'slow connection (${(rate / 1024).round()} KB/s)');
+                }
+                windowStart = DateTime.now();
+                windowBytes = 0;
+              }
+            }
           }
         } finally {
           await sink.close();
@@ -203,8 +383,16 @@ class UpdateService {
         }
 
         _partialTotal = 0;
-        log.info('Update downloaded: $filePath (${(received / 1024 / 1024).toStringAsFixed(1)} MB)');
+        log.info('Update downloaded${background ? ' in the background' : ''}: $filePath '
+            '(${(received / 1024 / 1024).toStringAsFixed(1)} MB)');
+        if (build > 0) {
+          _readyBuild = build;
+          readyPath.value = filePath;
+        }
         return filePath;
+      } on UpdateDownloadStopped catch (e) {
+        log.info('Update download stopped at ${await file.exists() ? await file.length() : 0} bytes: $e');
+        rethrow;
       } catch (e) {
         lastError = e;
         log.warning('Update download interrupted (attempt $attempt/$maxAttempts): $e');
@@ -220,6 +408,7 @@ class UpdateService {
   /// Size of the update file being downloaded; non-zero while a partial file
   /// on disk can be resumed.
   static int _partialTotal = 0;
+  static int _partialBuild = 0;
 
   /// Apply the downloaded update.
   /// - Android: opens the APK with the system installer

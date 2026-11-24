@@ -27,6 +27,7 @@ import 'package:audioplayers/audioplayers.dart' as audioplayers;
 import 'package:url_launcher/url_launcher.dart';
 import 'offline_settings.dart';
 import '../screens/held_songs_screen.dart';
+import '../screens/musicbrainz_gaps_screen.dart';
 
 class SettingsDialog extends StatefulWidget {
   final ApiService apiService;
@@ -1505,6 +1506,23 @@ class _SettingsDialogState extends State<SettingsDialog>
               ),
             );
           }, color: Colors.orange),
+          const SizedBox(height: 24),
+          _buildSectionHeader('MusicBrainz gaps'),
+          const SizedBox(height: 8),
+          const Text(
+            "Dolby Atmos and 5.1 albums you own that MusicBrainz doesn't list "
+            'in that format yet, with links to add them.',
+            style: TextStyle(fontSize: 13, color: Colors.grey),
+          ),
+          const SizedBox(height: 16),
+          _buildButton('Show MusicBrainz gaps', Icons.spatial_audio_off, () {
+            Navigator.pop(context);
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                  builder: (context) => const MusicBrainzGapsScreen()),
+            );
+          }, color: const Color(0xFFB388FF)),
         ],
       ),
     );

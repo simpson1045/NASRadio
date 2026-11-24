@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'auth_http_client.dart';
 import 'api_service.dart';
+import 'app_logger.dart';
 
 /// Owns the login state: the bearer token (in encrypted storage), the current
 /// user, and the login/logout flow. A ChangeNotifier so the root widget can
@@ -19,6 +20,33 @@ class AuthService extends ChangeNotifier {
     mOptions: MacOsOptions(useDataProtectionKeyChain: false),
   );
   static const String _tokenKey = 'nasradio_auth_token';
+
+  // Linux: values go into the keyring as "b64:<base64>". Nov 24, 2026: the
+  // stored item held raw newlines, and a no-password GNOME login keyring is a
+  // plaintext file that writes secret= values unescaped, so the next load
+  // rejected Matt's whole login keyring. The newlines came from the plugin's
+  // pretty-printed JSON (patched in third_party/); base64 also keeps any
+  // value we store to one line of [A-Za-z0-9+/=]. Older raw values still
+  // read, and init() rewrites them in this form.
+  static const String _b64Prefix = 'b64:';
+  static bool get _isLinux =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.linux;
+
+  Future<void> _writeToken(String token) {
+    final value =
+        _isLinux ? '$_b64Prefix${base64.encode(utf8.encode(token))}' : token;
+    return _storage.write(key: _tokenKey, value: value);
+  }
+
+  /// The stored token, and whether it is still in the old raw form (Linux).
+  Future<(String?, bool)> _readToken() async {
+    final raw = await _storage.read(key: _tokenKey);
+    if (raw == null || !_isLinux) return (raw, false);
+    if (raw.startsWith(_b64Prefix)) {
+      return (utf8.decode(base64.decode(raw.substring(_b64Prefix.length))), false);
+    }
+    return (raw, true);
+  }
 
   Map<String, dynamic>? _user;
   bool _initialized = false;
@@ -49,10 +77,21 @@ class AuthService extends ChangeNotifier {
   Future<void> init() async {
     appHttpClient.onUnauthorized = _handleUnauthorized;
     String? token;
+    var legacy = false;
     try {
-      token = await _storage.read(key: _tokenKey);
+      (token, legacy) = await _readToken();
     } catch (_) {
       token = null;
+    }
+    // Re-save an old raw value right away: the patched plugin writes the
+    // item as one line, and the keyring daemon then rewrites its file clean.
+    if (legacy && token != null && token.isNotEmpty) {
+      try {
+        await _writeToken(token);
+        AppLogger.instance.info('🔑 [auth] keyring token re-saved in safe form');
+      } catch (e) {
+        AppLogger.instance.warning('🔑 [auth] keyring migration failed: $e');
+      }
     }
     appHttpClient.setToken(token);
     if (token != null && token.isNotEmpty) {
@@ -157,7 +196,7 @@ class AuthService extends ChangeNotifier {
     final token = data['token'] as String;
     _user = data['user'] as Map<String, dynamic>;
     try {
-      await _storage.write(key: _tokenKey, value: token);
+      await _writeToken(token);
     } catch (_) {}
     appHttpClient.setToken(token);
     _sessionExpired = false;
@@ -196,7 +235,7 @@ class AuthService extends ChangeNotifier {
         notifyListeners();
       }
       try {
-        await _storage.write(key: _tokenKey, value: token);
+        await _writeToken(token);
       } catch (_) {}
       appHttpClient.setToken(token);
       _lastRefresh = now;

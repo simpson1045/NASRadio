@@ -1,5 +1,7 @@
 #include "my_application.h"
 
+#include <clocale>
+
 #include <flutter_linux/flutter_linux.h>
 #ifdef GDK_WINDOWING_X11
 #include <gdk/gdkx.h>
@@ -16,9 +18,32 @@ G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
 
 // Implements GApplication::activate.
 static void my_application_activate(GApplication* application) {
+  // libmpv (the audio engine, via media_kit) refuses to start unless numbers
+  // use the C locale ("Non-C locale detected ... Segmentation fault" on Mint,
+  // Nov 23, 2026: the v1.4.18 Linux release crashed at startup on any normal
+  // desktop locale). GTK has applied the user's locale by now; put only
+  // LC_NUMERIC back to "C" before the Dart code (and libmpv) starts. Text,
+  // dates and everything else keep the user's locale.
+  setlocale(LC_NUMERIC, "C");
+
   MyApplication* self = MY_APPLICATION(application);
   GtkWindow* window =
       GTK_WINDOW(gtk_application_window_new(GTK_APPLICATION(application)));
+
+  // Taskbar / Alt-Tab icon. Windows reads it from the .exe; on Linux the app
+  // sets its own (the taskbar showed a blank icon, Nov 23, 2026). CMake
+  // installs data/app_icon.png (the Windows icon's 256 px image) next to
+  // the binary.
+  g_autofree gchar* exe_path = g_file_read_link("/proc/self/exe", nullptr);
+  if (exe_path != nullptr) {
+    g_autofree gchar* exe_dir = g_path_get_dirname(exe_path);
+    g_autofree gchar* icon_path =
+        g_build_filename(exe_dir, "data", "app_icon.png", nullptr);
+    if (g_file_test(icon_path, G_FILE_TEST_EXISTS)) {
+      gtk_window_set_icon_from_file(window, icon_path, nullptr);
+      gtk_window_set_default_icon_from_file(icon_path, nullptr);
+    }
+  }
 
   // Use a header bar when running in GNOME as this is the common style used
   // by applications and is the setup most users will be using (e.g. Ubuntu

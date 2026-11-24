@@ -4,6 +4,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:window_manager/window_manager.dart';
 import 'dart:io' show Platform;
 import 'dart:ui' show ImageFilter;
+import '../services/app_visibility.dart';
 import '../services/audio_player_service.dart';
 import '../services/api_service.dart';
 import '../services/app_logger.dart';
@@ -190,6 +191,8 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
 
   // Smooth progress bar for immersive fullscreen
   Ticker? _smoothTicker;
+  Timer? _bgSmoothTimer; // 30 fps scrubber while the window isn't focused
+  bool _tickersEnabled = true;
   Duration _lastKnownPosition = Duration.zero;
   DateTime _lastPositionTime = DateTime.now();
   // 60fps-driven position notifier for the scrubber + time displays.
@@ -483,6 +486,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
     _genuinePlaybackStarted = _lastKnownPosition > Duration.zero;
     _isFullScreen = widget.startFullScreen;
     _startSmoothTicker();
+    AppVisibility.instance.focused.addListener(_syncSmoothTicker);
     if (widget.startFullScreen) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         await windowManager.setFullScreen(true);
@@ -683,7 +687,13 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
 
   void _startSmoothTicker() {
     _smoothTicker?.dispose();
-    _smoothTicker = createTicker((_) {
+    _smoothTicker = createTicker((_) => _emitSmoothPosition());
+    _syncSmoothTicker();
+  }
+
+  /// One step of the scrubber clock (the 60 fps ticker while the window has
+  /// focus, the 30 fps timer while it doesn't).
+  void _emitSmoothPosition() {
       if (!mounted) return;
       // Only emit position updates when playback is actually moving.
       // Previously this called setState on every vsync (60Hz) which
@@ -723,14 +733,19 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
             ? _interpolatedPosition
             : svc.position;
       }
-    });
-    _syncSmoothTicker();
   }
 
   /// The scrubber clock asks for a frame every vsync, and on Windows every
   /// frame redraws the whole window. Run it only while the position can
   /// actually move: playing and not buffering, or mirroring another device.
   /// Until Nov 9 it ran from open to close, paused included.
+  ///
+  /// Window not focused (Now Playing left open behind other windows):
+  /// 30 fps from a timer instead of every vsync. Nobody's watching it closely
+  /// then, and at 30 fps the bar still glides (a third of a pixel a frame on a
+  /// 4-minute song). Nov 23, 2026: 60 fps cost NASRadio ~10% GPU plus ~12% in
+  /// Mint's compositor on FRAMEWORK. Clicking back in = 60 fps again. A
+  /// minimized window or hidden section (TickerMode off) runs neither.
   void _syncSmoothTicker() {
     final t = _smoothTicker;
     if (t == null) return;
@@ -738,15 +753,38 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
     final moving = (svc.isControlling || (svc.isPlaying && !svc.isBuffering)) &&
         // A live station shows no scrubber or time: nothing to move.
         !(svc.currentSong?.isStation ?? false);
-    if (moving && !t.isActive) {
-      t.start();
-    } else if (!moving && t.isActive) {
-      t.stop();
+    final focused = AppVisibility.instance.focused.value;
+    if (moving && focused) {
+      _bgSmoothTimer?.cancel();
+      _bgSmoothTimer = null;
+      if (!t.isActive) t.start();
+    } else {
+      if (t.isActive) t.stop();
+      if (moving && _tickersEnabled) {
+        _bgSmoothTimer ??= Timer.periodic(
+            const Duration(milliseconds: 33), (_) => _emitSmoothPosition());
+      } else {
+        _bgSmoothTimer?.cancel();
+        _bgSmoothTimer = null;
+      }
     }
   }
 
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // TickerMode off = minimized window or hidden section. The ticker is
+    // muted by it on its own; the background timer isn't, so stop it here.
+    final enabled = TickerMode.valuesOf(context).enabled;
+    if (enabled != _tickersEnabled) {
+      _tickersEnabled = enabled;
+      _syncSmoothTicker();
+    }
+  }
 
   void _stopSmoothTicker() {
+    _bgSmoothTimer?.cancel();
+    _bgSmoothTimer = null;
     _smoothTicker?.stop();
     _smoothTicker?.dispose();
     _smoothTicker = null;
@@ -2103,6 +2141,7 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
     widget.audioPlayerService.onRemoteBlackScreenToggle = null;
     _waveformPollTimer?.cancel();
     _pendingSkipResetTimer?.cancel();
+    AppVisibility.instance.focused.removeListener(_syncSmoothTicker);
     _stopSmoothTicker();
     // Fire-and-forget async fullscreen teardown — scheduled so its
     // setState + windowManager calls run on the next event-loop
@@ -3386,6 +3425,16 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
     );
   }
 
+  // The desktop layout is fixed-size pieces (title, badges, waveform, the
+  // transport buttons, volume) around spacers; only the artwork follows the
+  // window height. In a short window the spacers hit zero and the bottom
+  // (the volume slider) went off the screen (Nov 23, 2026, Linux Mint).
+  // Below this height the whole column scales down evenly to fit instead,
+  // like the ELKO cast screen's zoom; taller windows are untouched. Measured
+  // below the toolbar (the top padding stays unscaled, or the content would
+  // slide under the AppBar).
+  static const double _desktopDesignHeight = 840;
+
   Widget _buildDesktopBody(
     Song song,
     double artworkSize,
@@ -3397,7 +3446,36 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
     final topPadding = MediaQuery.of(context).padding.top + kToolbarHeight;
     return Padding(
       padding: EdgeInsets.only(left: 20, right: 20, top: topPadding),
-      child: Column(
+      child: LayoutBuilder(
+        builder: (context, c) {
+          final column =
+              _buildDesktopColumn(song, artworkSize, isPlaying, position, duration);
+          if (!c.hasBoundedHeight || c.maxHeight >= _desktopDesignHeight) {
+            return column;
+          }
+          final s = c.maxHeight / _desktopDesignHeight;
+          return FittedBox(
+            fit: BoxFit.contain,
+            alignment: Alignment.topCenter,
+            child: SizedBox(
+              width: c.maxWidth / s,
+              height: _desktopDesignHeight,
+              child: column,
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildDesktopColumn(
+    Song song,
+    double artworkSize,
+    bool isPlaying,
+    Duration position,
+    Duration duration,
+  ) {
+    return Column(
         children: [
           // Remote-control badge in-flow at the top (no space when idle).
           RemoteControlBadge(
@@ -3637,7 +3715,6 @@ class _NowPlayingScreenState extends State<NowPlayingScreen>
           ),
           const Spacer(flex: 1),
         ],
-      ),
     );
   }
 

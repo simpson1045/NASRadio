@@ -14,12 +14,15 @@ Wake choreography (all dependency-free):
     audio reaches the Denon via the C2's eARC as "TV Audio"
 
 Endpoints (full-token gate, mirrors party host endpoints):
-  POST /api/cast/play   {query, type?, device?, wake?}  → resolve + cast
+  POST /api/cast/play   {query, type?, device?, wake?, with_album?}  → resolve + cast
+                        (type "song" = that one track; with_album adds its album tail)
   POST /api/cast/party  {wake?}                          → party + shuffle
   POST /api/cast/queue  {query, next?, by?, type?}  → add to live queue
   POST /api/cast/queue/remove {query | position | song_id, all?} → drop upcoming track(s)
   POST /api/cast/repeat {mode: off|one|all}   → repeat this song / the whole queue
   POST /api/cast/pause | /resume | /next | /previous
+  POST /api/cast/resume {previous: true|N} → put back what a later play replaced
+  GET  /api/cast/history                 → what 'previous' would bring back
   POST /api/cast/seek   {position}
   POST /api/cast/volume {level 0-85 | action up/down/mute/unmute} → Denon
   POST /api/cast/lyrics {show?}          → push synced lyrics + toggle view
@@ -37,6 +40,7 @@ a 15s NOW_PLAYING poll; queue casts get synced lyrics pushed per track
 Ambiguity rule (per simpson1045): albums win over songs — "5150" is the album.
 """
 
+from app.balanced_shuffle import balanced_shuffle
 import json
 import os
 import random
@@ -258,6 +262,8 @@ class HeadlessCastSession:
         self._heal_times = []
         self._healing = False
         self._heal_gave_up = False
+        self._heal_song = None        # song the last self-heal reloaded
+        self.capabilities = {}        # the receiver's CAPABILITIES message
         self.station_query = None
         self.position = 0.0          # media currentTime at position_at
         self.position_at = time.time()
@@ -510,6 +516,8 @@ class HeadlessCastSession:
             # What the TV's Cast runtime says it can play (Dolby Atmos /
             # DD+ passthrough), sent by the receiver on every connect.
             print(f"📺 [receiver] capabilities from {self.host}: {json.dumps(payload)}")
+            self.capabilities = payload
+            _capabilities_by_host[self.host] = payload
         elif ns == NASRADIO_NS and t == "WAVEFORM_REQUEST":
             # The receiver's waveform canvas IS its scrubber; no answer,
             # no scrubber (the EVH skin needs the floats too).
@@ -692,27 +700,35 @@ CAST_STATE_PATH = os.path.join(
 AUTO_RESUME_MAX_AGE_SEC = 900
 
 
+def _state_dict(s, stopped=False):
+    """Where a session is: queue, track, second (or station). None if idle."""
+    if s.kind == "station":
+        if not s.station_query:
+            return None
+        state = {"kind": "station", "station_query": s.station_query}
+    else:
+        if not s.queue:
+            return None
+        state = {"kind": s.kind or "songs",
+                 "queue": [q["id"] for q in s.queue],
+                 "current_song_id": s.current_song_id,
+                 "position": round(max(0.0, s.position_now()), 1)}
+    state.update({"host": s.host, "label": s.label,
+                  "source": s.source, "shuffled": bool(s.shuffled),
+                  "repeat": s.repeat,
+                  "player_state": s.player_state,
+                  "stopped": bool(stopped), "updated_at": time.time()})
+    return state
+
+
 def _save_state(s, stopped=False):
     """Persist a session we own. Guests and idle sessions write nothing."""
     try:
         if s.joined:
             return
-        if s.kind == "station":
-            if not s.station_query:
-                return
-            state = {"kind": "station", "station_query": s.station_query}
-        else:
-            if not s.queue:
-                return
-            state = {"kind": s.kind or "songs",
-                     "queue": [q["id"] for q in s.queue],
-                     "current_song_id": s.current_song_id,
-                     "position": round(max(0.0, s.position_now()), 1)}
-        state.update({"host": s.host, "label": s.label,
-                      "source": s.source, "shuffled": bool(s.shuffled),
-                      "repeat": s.repeat,
-                      "player_state": s.player_state,
-                      "stopped": bool(stopped), "updated_at": time.time()})
+        state = _state_dict(s, stopped)
+        if not state:
+            return
         if stopped:
             _write_state(state)  # explicit stop: resume must see it at once
         else:
@@ -778,6 +794,63 @@ def _load_state(host=None):
         return None
 
 
+# What was playing before a new play replaced it, newest first, per player.
+# Nov 14, 2026: testing a one-song play meant losing Matt's Mix (806 tracks,
+# shuffled) - the state file only remembers the current cast. Now anything
+# that throws a queue away stashes it here first, and /api/cast/resume
+# {"previous": true} puts it back: same queue, track and second. Kept to 5
+# so two test plays in a row don't push the real queue out.
+PREV_KEEP = 5
+
+
+def _prev_path(host=None):
+    return _state_path(host)[:-len(".json")] + "_prev.json"
+
+
+def _load_prev(host=None):
+    try:
+        with open(_prev_path(host)) as f:
+            stack = json.load(f)
+        return stack if isinstance(stack, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _write_prev(host, stack):
+    path = _prev_path(host)
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp, "w") as f:
+        json.dump(stack[:PREV_KEEP], f)
+    os.replace(tmp, path)
+
+
+def _stash_previous(host):
+    """Before something replaces what's on `host`, keep it for 'previous'.
+    The live session if we own it (freshest place), else the last cast we
+    owned from the state file. The same queue again only refreshes its place."""
+    try:
+        host = _resolve_host(host)
+        s = _sessions.get(host)
+        st = _state_dict(s) if (s and s.alive and not s.joined) else None
+        if st is None:
+            st = _load_state(host)
+        if not st:
+            return
+        st["stashed_at"] = time.time()
+        stack = _load_prev(host)
+        top = stack[0] if stack else None
+        if (top and top.get("queue") == st.get("queue")
+                and top.get("station_query") == st.get("station_query")):
+            stack[0] = st
+        else:
+            stack.insert(0, st)
+        import eventlet.tpool
+        eventlet.tpool.execute(_write_prev, host, stack)
+    except Exception as e:
+        print(f"📺 [cast-sender] previous-queue stash failed: {e}")
+
+
 def _songs_by_ids(ids):
     """Library rows for these ids, in THIS order; ids that are gone drop out."""
     if not ids:
@@ -797,11 +870,12 @@ def _songs_by_ids(ids):
     return [by_id[i] for i in ids if i in by_id]
 
 
-def _restore_cast(host, wake=True):
-    """Bring back the last cast we owned: same queue, same track, same
-    second. Returns a summary dict; raises RuntimeError when there is
-    nothing to restore or the TV can't be reached."""
-    st = _load_state(_resolve_host(host) if host else None)
+def _restore_cast(host, wake=True, state=None):
+    """Bring back the last cast we owned (or `state`, e.g. one from the
+    previous stack): same queue, same track, same second. Returns a summary
+    dict; raises RuntimeError when there is nothing to restore or the TV
+    can't be reached."""
+    st = state or _load_state(_resolve_host(host) if host else None)
     if not st:
         raise RuntimeError("nothing to resume — no saved cast")
     host = _resolve_host(host or st.get("host"))
@@ -1005,8 +1079,15 @@ def _reattach_loop(host, dead, tries=30, every=20):
 # user stop, a station, a guest session, the TV leaving the cast app, or
 # another sender taking over, and it re-checks the TV before acting.
 IDLE_HEAL_AFTER_SEC = 45
+# The receiver said ERROR: the track can't play (Nov 21, 2026: a Dolby Atmos
+# .m4a on ELKO, whose Chromium has no E-AC-3 decoder). No point waiting 45 s.
+IDLE_HEAL_AFTER_ERROR_SEC = 8
 HEAL_WINDOW_SEC = 600
-HEAL_MAX_IN_WINDOW = 1
+# Reloads + skips per window. Until Nov 21 it was 1 reload, then nothing:
+# an unplayable track sat in silence until someone noticed. More than this
+# many fixes in 10 min means something bigger is broken (server, network):
+# stop instead of running through the whole queue.
+HEAL_MAX_IN_WINDOW = 4
 
 
 def _legitimately_idle(s):
@@ -1026,9 +1107,10 @@ def _legitimately_idle(s):
 
 
 def _wedged(s):
-    return (s.player_state == "IDLE" and s.idle_since is not None
-            and time.time() - s.idle_since >= IDLE_HEAL_AFTER_SEC
-            and not _legitimately_idle(s))
+    if s.player_state != "IDLE" or s.idle_since is None:
+        return False
+    wait = IDLE_HEAL_AFTER_ERROR_SEC if s.idle_reason == "ERROR" else IDLE_HEAL_AFTER_SEC
+    return time.time() - s.idle_since >= wait and not _legitimately_idle(s)
 
 
 def _heal(s):
@@ -1048,12 +1130,31 @@ def _heal(s):
         if len(s._heal_times) >= HEAL_MAX_IN_WINDOW:
             if not s._heal_gave_up:
                 s._heal_gave_up = True
-                print(f"📺 [cast-sender] self-heal: already reloaded once in the last "
-                      f"{HEAL_WINDOW_SEC // 60} min on {s.host} and it is IDLE again - leaving it")
+                print(f"📺 [cast-sender] self-heal: {len(s._heal_times)} fixes in the last "
+                      f"{HEAL_WINDOW_SEC // 60} min on {s.host} and it is IDLE again - "
+                      f"leaving it (something bigger than one track is wrong)")
             return
         s._heal_times.append(now)
         ids = [q["id"] for q in s.queue]
         idx = ids.index(s.current_song_id) if s.current_song_id in ids else 0
+        if s._heal_song is not None and s._heal_song == s.current_song_id:
+            # This track was already reloaded and went IDLE again: it won't
+            # play on this player. Skip it instead of sitting in silence.
+            title = (s.queue[idx].get("title") if idx < len(s.queue) else None) or "?"
+            s._heal_song = None
+            if idx + 1 >= len(ids):
+                print(f"📺 [cast-sender] self-heal: last track \"{title}\" won't play on "
+                      f"{s.host} ({s.idle_reason}) - end of the queue")
+                return
+            print(f"📺 [cast-sender] self-heal: track {idx + 1} \"{title}\" won't play on "
+                  f"{s.host} (reloaded once, IDLE again: {s.idle_reason}) - "
+                  f"skipping to track {idx + 2} of {len(ids)}")
+            s.idle_since = None
+            _load_queue_index(s, idx + 1)
+            s.position, s.position_at = 0.0, time.time()
+            _save_state(s)
+            return
+        s._heal_song = s.current_song_id
         pos = max(0.0, s.position_now() - 2.0)
         print(f"📺 [cast-sender] self-heal: IDLE for {int(now - (s.idle_since or now))}s mid-queue "
               f"on {s.host} - reloading track {idx + 1} of {len(ids)} at {int(pos)}s")
@@ -1428,6 +1529,13 @@ def _special_waveform(artist, album, title):
     return None
 
 
+# The latest CAPABILITIES each player sent, by host. A receiver sends them
+# once per connect, but every cast makes a new session: ELKO's TrueHD Atmos
+# went out as the DD+ sidecar because the new session never heard ELKO say
+# 'passthrough: mpv' (Nov 21, 2026).
+_capabilities_by_host = {}
+
+
 def _song_media_message(song, token, session=None):
     tok = f"&token={token}"
     # Dolby bitstreams (eac3/ac3, incl. Atmos) stream as-is — the C2's eARC
@@ -1442,6 +1550,17 @@ def _song_media_message(song, token, session=None):
     _relay = session is not None and bool(_relay_host(session.host))
     _quality = ("cast" if (_multich and not _relay and _codec not in ("eac3", "ac3"))
                 else "lossless")
+    # Phase 3 (Nov 21, 2026): a relay player that plays through mpv (the
+    # NASRadio TV app on ELKO says passthrough "mpv") gets the untouched
+    # original for everything: Dolby (incl. Atmos, TrueHD) and DTS go to the
+    # Denon as bitstreams. "lossless" would swap TrueHD for the DD+ sidecar.
+    _caps = ((getattr(session, "capabilities", None) or None)
+             or (_capabilities_by_host.get(session.host) if session is not None else None)
+             or {})
+    _dev = _caps.get("deviceCapabilities") or {}
+    if _relay and _dev.get("passthrough") == "mpv":
+        _quality = "bitstream"
+    _badge = {"eac3": "DD+", "ac3": "DD", "truehd": "TrueHD", "dts": "DTS"}.get(_codec)
     stream = (f"{_public_base()}/api/stream/{song['id']}?quality={_quality}{tok}")
     artwork = f"{_public_base()}/api/artwork/{song['album_id']}?token={token}"
     artist_img = f"{_public_base()}/api/artist-image/{song['artist_id']}?token={token}"
@@ -1466,7 +1585,9 @@ def _song_media_message(song, token, session=None):
                 song["artist_name"], song["album_title"], song["title"]),
             # Describe what the TV actually receives: sidecar/eac3 casts play
             # DD+, not the library file's container.
-            "fileFormat": ("DD+" if (_quality == "cast" or _codec in ("eac3", "ac3"))
+            "fileFormat": ("DD+" if _quality == "cast"
+                           else _badge if (_badge and (_quality == "bitstream"
+                                                       or _codec in ("eac3", "ac3")))
                            else (song.get("file_path") or "").rsplit(".", 1)[-1].upper()),
             "isHdcd": bool(song.get("is_hdcd")),
             # The cast sidecar is plain DD+ 5.1 (no free encoder writes the
@@ -1502,6 +1623,49 @@ def _cast_gain(song):
         return 1.0  # not analysed yet, or digital silence
     gain_db = max(-12.0, min(0.0, CAST_RG_TARGET_LUFS - lufs))
     return round(10 ** (gain_db / 20), 4)
+
+
+def _song_with_artist(cur, q):
+    """'The Hunter Dokken' / 'Dokken - The Hunter' / 'The Hunter by Dokken':
+    when the query names an artist, find the title among THAT artist's songs.
+    Nov 14, 2026: title-only matching kept picking Red Hot Chili Peppers'
+    'The Hunter' over Dokken's. None when no artist is named or the rest of
+    the query isn't one of their songs (the caller falls back to title-only).
+    A query that is exactly a song title is left alone, so 'Caribbean Queen'
+    never turns into a search of Queen's songs for 'Caribbean'."""
+    cur.execute("""SELECT 1 FROM songs WHERE source_type = 'local'
+                   AND LOWER(title) = LOWER(%s) LIMIT 1""", (q,))
+    if cur.fetchone():
+        return None
+    low = q.lower()
+    cur.execute("""SELECT id, name FROM artists
+                   WHERE length(name) >= 2 AND strpos(%s, LOWER(name)) > 0
+                   ORDER BY length(name) DESC LIMIT 10""", (low,))
+    for art in cur.fetchall():
+        name = art["name"].lower()
+        m = re.search(r"(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])", low)
+        if not m:
+            continue
+        rest = (q[:m.start()] + " " + q[m.end():]).strip()
+        rest = re.sub(r"^(?:\s*(?:by\b|[-–—:,|]))+\s*", "", rest, flags=re.I)
+        rest = re.sub(r"\s*(?:(?:\bby|[-–—:,|])\s*)+$", "", rest,
+                      flags=re.I).strip(" \"'")
+        if not rest:
+            continue
+        cur.execute(
+            f"""SELECT {_SONG_COLS} FROM songs s
+                JOIN artists ar ON ar.id = s.artist_id
+                JOIN albums al ON al.id = s.album_id
+                WHERE s.source_type = 'local' AND s.artist_id = %s
+                  AND (s.title ILIKE %s
+                       OR similarity(LOWER(s.title), LOWER(%s)) > 0.4)
+                ORDER BY (LOWER(s.title) = LOWER(%s)) DESC,
+                         similarity(LOWER(s.title), LOWER(%s)) DESC, s.id
+                LIMIT 1""", (art["id"], f"%{rest}%", rest, rest, rest))
+        hit = cur.fetchone()
+        if hit:
+            return hit
+    return None
 
 
 def resolve_query(q, kind="auto"):
@@ -1565,16 +1729,18 @@ def resolve_query(q, kind="auto"):
                             "songs": songs}
 
         if kind in ("auto", "song"):
-            cur.execute(
-                f"""SELECT {_SONG_COLS} FROM songs s
-                    JOIN artists ar ON ar.id = s.artist_id
-                    JOIN albums al ON al.id = s.album_id
-                    WHERE s.source_type = 'local'
-                      AND (s.title ILIKE %s
-                           OR similarity(LOWER(s.title), LOWER(%s)) > 0.4)
-                    ORDER BY similarity(LOWER(s.title), LOWER(%s)) DESC
-                    LIMIT 1""", (f"%{q}%", q, q))
-            hit = cur.fetchone()
+            hit = _song_with_artist(cur, q)
+            if not hit:
+                cur.execute(
+                    f"""SELECT {_SONG_COLS} FROM songs s
+                        JOIN artists ar ON ar.id = s.artist_id
+                        JOIN albums al ON al.id = s.album_id
+                        WHERE s.source_type = 'local'
+                          AND (s.title ILIKE %s
+                               OR similarity(LOWER(s.title), LOWER(%s)) > 0.4)
+                        ORDER BY similarity(LOWER(s.title), LOWER(%s)) DESC
+                        LIMIT 1""", (f"%{q}%", q, q))
+                hit = cur.fetchone()
             if hit:
                 # The matched song, then the rest of its album after it.
                 cur.execute(
@@ -1696,7 +1862,7 @@ def _party_shuffle_songs(limit=25):
                 WHERE s.source_type = 'local'
                 ORDER BY random() LIMIT %s""", (limit * 3,))
         pool = _without_held([dict(r) for r in cur.fetchall()])
-        random.shuffle(pool)
+        pool = balanced_shuffle(pool)
         return pool[:limit]
     finally:
         conn.close()
@@ -1709,6 +1875,7 @@ def _cast_songs(session, songs, label=None, kind=None, source=None, shuffled=Fal
     session.label, session.kind, session.station_query = label, kind, None
     session.source, session.shuffled = source, bool(shuffled)
     session._heal_times, session._heal_gave_up = [], False
+    session._heal_song = None
     session._station_poll_gen += 1  # songs playing → any station poll dies
     song = _load_queue_index(session, start)
     _save_state(session)
@@ -1829,12 +1996,24 @@ def cast_play():
     if not resolved:
         return jsonify({"error": f"nothing in the library matches '{q}'"}), 404
 
+    # type:"song" means that one track (Nov 14, 2026: Caribbean Queen queued
+    # all 45 tracks of its album). with_album:true opts back into the album
+    # tail after it, like tapping a track on an album page. Same trim as
+    # /api/cast/queue. type:"auto" landing on a song keeps the album tail.
+    if (kind == "song" and resolved.get("kind") == "song"
+            and resolved.get("songs") and not data.get("with_album")):
+        hit = resolved["songs"][0]
+        resolved["songs"] = resolved["songs"][:1]
+        resolved["source"] = {"type": "song", "id": hit["id"],
+                              "name": hit.get("title"),
+                              "artist": hit.get("artist_name")}
+
     # shuffle:true randomizes the resolved track list (albums/playlists;
     # meaningless for stations, harmless for single-song resolves).
     if resolved.get("songs") and resolved.get("kind") != "song":
         resolved["songs"] = _without_held(resolved["songs"], _request_user_id())
     if data.get("shuffle") and resolved.get("songs"):
-        random.shuffle(resolved["songs"])
+        resolved["songs"] = balanced_shuffle(resolved["songs"])
 
     # start_at: begin at this song (title, exact else contains) with the
     # whole list queued around it, like tapping a track in a playlist.
@@ -1848,6 +2027,7 @@ def cast_play():
         if start is None:
             return jsonify({"error": f"'{data['start_at']}' isn't in {resolved['label']}"}), 404
 
+    _stash_previous(host)
     try:
         session = _get_session(host, wake=wake)
     except Exception as e:
@@ -1901,6 +2081,7 @@ def cast_party():
     finally:
         conn.close()
 
+    _stash_previous(host)
     try:
         session = _get_session(host, wake=wake)
     except Exception as e:
@@ -1987,6 +2168,7 @@ def cast_queue_clear():
                         "mode": "guest"}), 409
     if not s.queue:
         return jsonify({"error": "no song queue on this cast (station or idle?)"}), 409
+    _stash_previous(s.host)
     removed = _clear_upcoming(s)
     _save_state(s)
     print(f"📺 [cast-sender] {(g.user or {}).get('username') or 'someone'} cleared "
@@ -2033,7 +2215,7 @@ def cast_queue():
     shuffle = bool(data.get("shuffle"))
     replace = bool(data.get("replace"))
     if shuffle:
-        random.shuffle(songs)
+        songs = balanced_shuffle(songs)
 
     if s.joined:
         if replace:
@@ -2044,6 +2226,7 @@ def cast_queue():
 
     removed = 0
     if replace:
+        _stash_previous(s.host)
         removed = _clear_upcoming(s)
         # What follows is now this source - status/queue report it.
         s.source, s.shuffled = resolved.get("source"), shuffle
@@ -2297,9 +2480,31 @@ def cast_song_info(song_id):
 def cast_resume():
     """Unpause if there's something live to unpause; otherwise bring the
     last cast back from the state file — same queue, track and second —
-    whether it ended by stop, a dropped/killed receiver, or a restart."""
+    whether it ended by stop, a dropped/killed receiver, or a restart.
+    {"previous": true} (or N) instead puts back what was playing before the
+    last (Nth-last) play replaced it - see GET /api/cast/history."""
     data = request.get_json(silent=True) or {}
     host = _resolve_host(data.get("device"))
+    back = data.get("previous")
+    if back:
+        try:
+            n = 1 if back is True else int(back)
+        except (TypeError, ValueError):
+            return jsonify({"error": "previous must be true or a number"}), 400
+        stack = _load_prev(host)
+        if not 1 <= n <= len(stack):
+            return jsonify({"error": f"nothing that far back - {len(stack)} saved "
+                            "(GET /api/cast/history)"}), 409
+        try:
+            out = _restore_cast(host, wake=data.get("wake", True), state=stack[n - 1])
+        except RuntimeError as e:
+            return jsonify({"error": str(e)}), 409
+        except Exception as e:
+            return jsonify({"error": f"resume failed: {e}"}), 502
+        # Going back N drops the N newest; what was just replaced is not
+        # stashed, so repeated 'previous' keeps walking back, never ping-pongs.
+        _write_prev(host, stack[n:])
+        return jsonify(dict(out, ok=True, mode="previous", saved_left=len(stack) - n))
     s = _sessions.get(host)
     if not s or not s.alive:
         s = _guest_session(host)
@@ -2311,14 +2516,40 @@ def cast_resume():
     if (s and s.alive and s.media_session_id is not None
             and s.player_state in ("PAUSED", "PLAYING", "BUFFERING")):
         s.media_command("PLAY")
-        return jsonify({"ok": True, "mode": "unpaused"})
+        return jsonify(dict(_confirm_playing(s), ok=True, mode="unpaused"))
     try:
         out = _restore_cast(host, wake=data.get("wake", True))
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 409
     except Exception as e:
         return jsonify({"error": f"resume failed: {e}"}), 502
-    return jsonify(dict(out, ok=True, mode="restored"))
+    return jsonify(dict(out, **_confirm_playing(_sessions.get(host)), ok=True, mode="restored"))
+
+
+def _confirm_playing(s, wait=3.0):
+    """Ask the receiver itself, not our cached player_state, whether its
+    clock is moving. Nov 14, 2026: ELKO reported PLAYING after a resume
+    while the room was silent, and 'resume OK' sent Claude off thinking it
+    worked. confirmed: True (moving) / False (stuck) / None (can't tell:
+    no session, no reply, or a receiver too old to report currentTime)."""
+    if s is None or not s.alive:
+        return {"confirmed": None}
+    try:
+        eventlet.sleep(1.0)  # let PLAY land before the first reading
+        a = s.request_custom({"type": "STATE_REQUEST"}, timeout=3) or {}
+        eventlet.sleep(wait)
+        b = s.request_custom({"type": "STATE_REQUEST"}, timeout=3) or {}
+    except Exception as e:
+        return {"confirmed": None, "check_error": str(e)}
+    t0, t1 = a.get("currentTime"), b.get("currentTime")
+    if not isinstance(t0, (int, float)) or not isinstance(t1, (int, float)):
+        return {"confirmed": None, "receiver_state": b.get("playerState")}
+    np = b.get("nowPlaying") or {}
+    out = {"confirmed": t1 > t0 + 0.5, "receiver_state": b.get("playerState"),
+           "position": int(t1)}
+    if np.get("title"):
+        out.update({"now_playing": np.get("title"), "artist": np.get("artist")})
+    return out
 
 
 @cast_api.route("/api/cast/seek", methods=["POST"])
@@ -2459,6 +2690,31 @@ def cast_stop():
     _sessions.pop(host, None)
     print(f"📺 [cast-sender] Stopped cast on {host}")
     return jsonify({"ok": True})
+
+
+@cast_api.route("/api/cast/history", methods=["GET"])
+def cast_history():
+    """What 'previous' would bring back, newest first (?device=)."""
+    host = _resolve_host(request.args.get("device"))
+    stack = _load_prev(host)
+    ids = [st.get("current_song_id") for st in stack if st.get("current_song_id")]
+    titles = {t["id"]: t for t in _songs_by_ids(ids)}
+    out = []
+    for n, st in enumerate(stack, 1):
+        item = {"previous": n, "label": st.get("label"), "kind": st.get("kind"),
+                "saved_ago_min": int((time.time() - float(st.get("stashed_at") or 0)) // 60)}
+        if st.get("kind") == "station":
+            item["station"] = st.get("station_query")
+        else:
+            q = st.get("queue") or []
+            cur = titles.get(st.get("current_song_id"))
+            item.update({"tracks": len(q), "shuffled": bool(st.get("shuffled")),
+                         "track": (q.index(st["current_song_id"]) + 1
+                                   if st.get("current_song_id") in q else None),
+                         "song": cur and f"{cur['title']} - {cur['artist_name']}",
+                         "position": int(st.get("position") or 0)})
+        out.append(item)
+    return jsonify({"device": host, "previous": out})
 
 
 @cast_api.route("/api/cast/status", methods=["GET"])

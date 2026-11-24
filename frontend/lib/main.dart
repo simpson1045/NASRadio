@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'
     show LogicalKeyboardKey, MethodChannel, MissingPluginException;
 import 'package:media_kit/media_kit.dart';
-import 'dart:async' show runZonedGuarded;
+import 'dart:async' show Timer, runZonedGuarded, unawaited;
 import 'dart:io' show Platform;
 import 'dart:ui' show PlatformDispatcher;
 import 'package:smtc_windows/smtc_windows.dart';
@@ -12,6 +12,7 @@ import 'package:window_manager/window_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'services/api_service.dart';
 import 'services/app_visibility.dart';
+import 'services/linux_media_controls.dart';
 import 'services/frame_watchdog.dart';
 import 'services/stall_watch.dart';
 import 'layout_context.dart';
@@ -132,6 +133,9 @@ Future<void> _mainGuarded() async {
   // Initialize window manager for desktop platforms
   if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
     await windowManager.ensureInitialized();
+    // Linux: the close button goes through onWindowClose (stop the music,
+    // save, then exit) instead of tearing the app down around playing audio.
+    if (Platform.isLinux) await windowManager.setPreventClose(true);
 
     // Load saved window settings
     final prefs = await SharedPreferences.getInstance();
@@ -145,25 +149,27 @@ Future<void> _mainGuarded() async {
       size: Size(width, height),
       minimumSize: const Size(800, 600),
       center: x == null || y == null,
-      backgroundColor: Colors.transparent,
+      // The app's own background (scaffoldBackgroundColor), not transparent:
+      // a transparent window showed as a see-through white ghost.
+      backgroundColor: const Color(0xFF0a0e27),
       titleBarStyle: TitleBarStyle.normal,
       title: 'NASRadio',
     );
 
+    // Size and position go on now, while the window is still hidden. It is
+    // SHOWN only after the first frame (_showDesktopWindow below): showing
+    // it here, before the startup work (finding the server ~2-3 s, restore,
+    // services) and runApp, gave an empty, see-through window for those
+    // seconds (Nov 16, 2026, FRAMEWORK). maximize() also shows the window,
+    // so it moves there too.
     await windowManager.waitUntilReadyToShow(windowOptions, () async {
-      // Set position if saved
       if (x != null && y != null) {
         await windowManager.setPosition(Offset(x, y));
       }
-
-      // Restore maximized state
-      if (isMaximized) {
-        await windowManager.maximize();
-      }
-
-      await windowManager.show();
-      await windowManager.focus();
     });
+    _desktopWindowMaximized = isMaximized;
+    // Never leave the app invisible if startup stalls before the first frame.
+    Timer(const Duration(seconds: 15), _showDesktopWindow);
   }
 
   // Apply any user-configured server addresses, then detect the network
@@ -289,6 +295,24 @@ Future<void> _mainGuarded() async {
   globalWeatherService.initialize();
 
   runApp(const NASRadioApp());
+  if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+    WidgetsBinding.instance.addPostFrameCallback((_) => _showDesktopWindow());
+  }
+}
+
+bool _desktopWindowMaximized = false;
+bool _desktopWindowShown = false;
+
+/// Show the desktop window once there's something drawn in it (the first
+/// frame), restoring the saved maximized state. Also the 15 s fallback.
+Future<void> _showDesktopWindow() async {
+  if (_desktopWindowShown) return;
+  _desktopWindowShown = true;
+  if (_desktopWindowMaximized) {
+    await windowManager.maximize();
+  }
+  await windowManager.show();
+  await windowManager.focus();
 }
 
 class NASRadioApp extends StatefulWidget {
@@ -301,6 +325,8 @@ class NASRadioApp extends StatefulWidget {
 class _NASRadioAppState extends State<NASRadioApp>
     with WidgetsBindingObserver, WindowListener {
   SMTCWindows? _smtc;
+  // Linux media keys + sound menu (MPRIS), the Linux side of _smtc.
+  LinuxMediaControls? _mpris;
   bool _audioServiceInitialized = false;
 
   @override
@@ -512,6 +538,15 @@ class _NASRadioAppState extends State<NASRadioApp>
 
       // Setup taskbar thumbnail buttons
       _setupTaskbarButtons();
+    } else if (Platform.isLinux) {
+      _mpris = LinuxMediaControls(
+        globalAudioPlayerService,
+        onRaise: () async {
+          await windowManager.show();
+          await windowManager.focus();
+        },
+      );
+      unawaited(_mpris!.start());
     }
   }
 
@@ -609,6 +644,7 @@ class _NASRadioAppState extends State<NASRadioApp>
     }
     globalAudioPlayerService.removeListener(_updateSmtcState);
     _smtc?.dispose();
+    _mpris?.dispose();
     globalDeviceSyncService.dispose();
     globalAudioPlayerService.dispose();
     super.dispose();
@@ -642,12 +678,41 @@ class _NASRadioAppState extends State<NASRadioApp>
 
   // Minimize/restore drive AppVisibility (Windows only ever reports
   // `inactive` for a minimized window). Focus = definitely on screen; blur
-  // alone changes nothing: an unfocused window on a second monitor keeps
-  // animating.
+  // doesn't hide anything (an unfocused window on a second monitor keeps
+  // animating), it only lets Now Playing slow its scrubber to 30 fps.
   @override
-  void onWindowFocus() => AppVisibility.instance.setMinimized(false);
+  void onWindowFocus() {
+    AppVisibility.instance.setMinimized(false);
+    AppVisibility.instance.setFocused(true);
+  }
   @override
-  void onWindowBlur() {}
+  void onWindowBlur() => AppVisibility.instance.setFocused(false);
+
+  // Linux close (setPreventClose in main()). Until Nov 23, 2026 closing with
+  // music playing froze the window and stuttered the audio for a few seconds:
+  // the app was torn down around two running libmpv decks. Now: hide at once
+  // (feels instant), stop the music and save where we are while the app is
+  // still whole, write the log, then go. 3 s cap so a slow server can't hold
+  // the close.
+  bool _closing = false;
+  @override
+  void onWindowClose() async {
+    if (!Platform.isLinux || _closing) return;
+    _closing = true;
+    AppLogger.instance.info('👋 [App] closing: stopping playback, saving, exiting');
+    try {
+      await windowManager.hide();
+    } catch (_) {}
+    try {
+      await globalAudioPlayerService.shutdownForExit()
+          .timeout(const Duration(seconds: 3));
+    } catch (_) {}
+    try {
+      await AppLogger.instance.flushNow().timeout(const Duration(seconds: 1));
+    } catch (_) {}
+    await windowManager.setPreventClose(false);
+    await windowManager.destroy();
+  }
   @override
   void onWindowMinimize() => AppVisibility.instance.setMinimized(true);
   @override

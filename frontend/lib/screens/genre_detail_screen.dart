@@ -1,3 +1,4 @@
+import '../utils/balanced_shuffle.dart';
 import 'package:flutter/material.dart';
 import 'dart:io' show Platform;
 import '../models/song.dart';
@@ -130,7 +131,7 @@ class _GenreDetailScreenState extends State<GenreDetailScreen> {
 
   void _shuffleAll() {
     if (_songs.isEmpty) return;
-    final shuffled = List<Song>.from(_songs)..shuffle();
+    final shuffled = balancedShuffle(_songs, (s) => s.artistName);
     widget.audioPlayerService.setQueue(shuffled, 0, sourceType: 'genre');
     NowPlayingScreen.open(
       context,
